@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# commit-msg — append the author's two Co-Authored-By trailers, idempotently,
+# and strip any assistant/model co-author trailer.
+#
+# Installed by scripts/install-hooks.sh, which points each repo's
+# core.hooksPath at scripts/hooks/ in the root repo. Tracked in git so the
+# whole team gets the same behaviour; see AGENTS.md section 5.
+#
+# Scope: this covers LOCAL commit paths only — git commit, --amend, and merges.
+# It cannot cover commits created through the GitHub API (the MCP write tools
+# create_or_update_file / push_files) or the GitHub web UI, because no local
+# hook runs for those. Those paths still need the trailers written by hand.
+#
+# Note: git does NOT run commit-msg during a rebase, so commits replayed by
+# `git rebase` keep whatever trailers they already had. That is fine — they
+# were given trailers by this hook when first written.
+
+MSG_FILE="$1"
+
+TRAILER_NAME="Haroun Trabelsi"
+TRAILER_EMAIL_1="haroun@meetjourney.ai"
+TRAILER_EMAIL_2="fantasycrit20@gmail.com"
+
+# An empty message means the commit is being aborted; leave it alone so git
+# can bail out with its own error rather than us writing trailers into it.
+if ! grep -qE '^[[:space:]]*[^#[:space:]]' "$MSG_FILE"; then
+  exit 0
+fi
+
+# Drop assistant/model co-author trailers. Matched on the noreply address and
+# on the bare "Claude" name, case-insensitively, so both common forms go.
+sed -i -E '/^[[:space:]]*Co-authored-by:.*(noreply@anthropic\.com|<[^>]*anthropic[^>]*>)/Id' "$MSG_FILE"
+sed -i -E '/^[[:space:]]*Co-authored-by:[[:space:]]*Claude([[:space:]]|<)/Id' "$MSG_FILE"
+
+# Add ours. --if-exists addIfDifferent makes this idempotent per (token, value):
+# a trailer already present is left as-is rather than duplicated, while a
+# *different* Co-authored-by (a real human collaborator) is preserved.
+# interpret-trailers handles blank-line separation, trailing comment blocks,
+# and the `-v` scissors diff correctly, which hand-rolled appending does not.
+git interpret-trailers \
+  --in-place \
+  --if-exists addIfDifferent \
+  --trailer "Co-Authored-By: ${TRAILER_NAME} <${TRAILER_EMAIL_1}>" \
+  --trailer "Co-Authored-By: ${TRAILER_NAME} <${TRAILER_EMAIL_2}>" \
+  "$MSG_FILE"

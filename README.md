@@ -80,10 +80,21 @@ Two limits worth knowing:
 | `claude/agents/` | `explorer`, `implementer`, `plan-critic`, `scout`, `spec-auditor` |
 | `claude/AGENTS.md` | agent workflow rules — Linear, commits, quality gates, shipping |
 
-These are also tracked in the JourneyAI org repo, where the team uses them. The
-copies here are the portable ones: a fresh machine gets them from this repo
-without needing the org checkout first. When they diverge, the org repo wins for
-anything team-facing.
+**This repo is the only tracked home for the skills and agents.** They are
+gitignored in the JourneyAI org repo (`.claude/skills/`, `.claude/agents/`), so
+personal workflow changes never land there. Edit them here, commit here, push
+here.
+
+`claude/AGENTS.md` is the exception. It is team workflow and stays tracked in the
+org repo; the copy here is a portable mirror, and the org repo wins if they
+diverge.
+
+To use them in a checkout, symlink or copy them into that repo's `.claude/`:
+
+```bash
+ln -s ~/coder-packages/claude/skills ~/root-for-local/.claude/skills
+ln -s ~/coder-packages/claude/agents ~/root-for-local/.claude/agents
+```
 
 ## Adding a package
 

@@ -557,3 +557,76 @@ Say it even when the run stopped early, adjusted for what is actually left: if a
 work unit is blocked, name what remains and say that `/ship-work` should wait
 until it is resolved. A run that ends without pointing at the next step leaves the
 human guessing whether the work is shippable.
+
+## Headless mode (`--headless`)
+
+Shared vocabulary, `status.json` shape, the inbox contract, and the
+ask→fallback rule all live in `.claude/skills/autopilot-protocol.md` — read it
+first. This section only states what this skill's own ask points map to under
+that protocol.
+
+This skill's `NEEDS_HUMAN` inbox comments start with the line `Phase:
+implement`, per the protocol's ask→fallback rule.
+
+**Plan path is always explicit.** Step 1's "newest unarchived plan" inference
+and "confirm the choice with the human before building it" are interactive-only
+— autopilot always calls this skill with a concrete plan path. A headless
+invocation with no explicit plan path argument writes `status.json` with
+`status: FAILED` and `detail: "headless requires an explicit plan path"`, and
+ends without touching the inbox (there is nothing yet to attach the failure
+to).
+
+**Step 1's stop conditions**, mapped per the protocol's ask→fallback rule:
+
+- **Open question marked BLOCKING and unresolved** — no documented default
+  exists, so this is fallback case 2: post the question to the inbox issue,
+  set `status: NEEDS_HUMAN`, `question` the exact BLOCKING text.
+- **Design review section missing** — this is not an ask with a fallback; it
+  means the plan was never dry-run reviewed, and no headless run can perform
+  that review. `status: FAILED`, `detail: "plan was never dry-run reviewed; a
+  human must re-plan"`. Do not attempt the review yourself and do not fall
+  back to `NEEDS_HUMAN`: a missing Design review is a planning defect, not a
+  question a `go`/feedback comment can resolve.
+- **Uncommitted unrelated work in a target repo** — never work around it.
+  `status: NEEDS_HUMAN`, with the exact `git status -sb` output for that repo
+  quoted in the `question` posted to the inbox, so the owner sees precisely
+  what is in the way.
+
+**Step 3's escalation** — when an implementer report says the spec is wrong, a
+hook does not exist, or the change does not fit: do not redesign around it,
+headless or not. Stop that repo's chain, `status: NEEDS_HUMAN`, and post the
+report's finding verbatim as the `question` on the inbox issue. The plan is
+never amended headlessly; that judgement call stays with the human, same as it
+would be blocking in an interactive run.
+
+**Server policy (step 11).** Run the full QA described above, including the
+four-server comparison, exactly as interactive mode does — headless QA is not
+lighter QA. Once QA is done, stop only the **changed-pair** servers this run
+started (the worktree frontend's `vite` process and the worktree backend's
+`uvicorn`/`python -m app.main` process); the baseline pair (5173/8000) always
+stays running — whether it predates this run or this run started it, the
+baseline is a shared convention owned by no single run, and later cycles and
+the owner's morning review reuse it. Leave it up, since other runs and the
+human share it. Record in `status.json`'s `detail`, **and** as a comment on
+the inbox issue, the exact commands to bring the changed pair back up —
+worktree paths, ports, and the literal `vite`/`uvicorn` command lines used —
+so the owner's morning review can relaunch and test with a copy-paste. Verify
+the teardown actually happened with `ss -ltnp` (before/after, or immediately
+after stopping) and note the result in `detail`; a server left bound defeats
+the port-budget point of this whole step.
+
+**End state.** Commit exactly as interactive mode does (step 10: explicit
+paths, only the human's `Co-Authored-By` trailers), and run `roborev` exactly
+as interactive mode does. Then write `status.json` with `status: DONE`,
+`phase: "implement"`, and `plan_path` set to the plan file's absolute path.
+Do **not** change the inbox issue's label — it stays `building`; the ship
+phase that runs in the same cycle owns the next transition (`ready-to-test` or
+`failed`). Roborev findings never block a `DONE` write: record them in
+`detail` so the interactive morning review sees them, same as any other
+relaunch note.
+
+**The push rule is unchanged.** Step 12's "never push, never open or update a
+PR, never merge, never move the Linear status" applies identically in
+headless mode. Headless `/implement-plan` still stops at a committed,
+roborev-reviewed branch; pushing and PRs belong to `/ship-work`, headless or
+not.

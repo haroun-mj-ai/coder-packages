@@ -290,3 +290,51 @@ having been dropped by a force-push that raced the merge.
   (and where there was no gate at all), every conflict resolved automatically,
   every fix attempt spent, and what remains for a human. If anything stopped the
   run, lead with that.
+
+## Headless mode (--headless)
+
+Shared vocabulary, `status.json` shape, inbox contract, and the ask→fallback
+rule live in `.claude/skills/autopilot-protocol.md` — read it first; this
+section only states what maps to what for this skill.
+
+`--headless` **implies `--no-merge`, non-negotiable.** Step 8 (merge) is
+unreachable under `--headless` regardless of what the invocation otherwise
+says — there is no headless path into that step, even if a caller passes
+`--headless` without also passing `--no-merge`. Merging is always the human's
+interactive `/ship-work` run. (Defense in depth: the autopilot permission
+profile also denies the merge tool; this is a second, independent guarantee
+inside the skill's own text.)
+
+Pushing feature branches and opening PRs against `dev` **is** pre-approved
+under `--headless` — that standing authorization is precisely why this skill
+is part of the autopilot chain. Nothing else about the existing rules
+loosens: never `main`, never a direct push to `dev` itself, and the only
+force-push is the lease-guarded `git push --force-with-lease` in step 6's
+rebase, exactly as interactive.
+
+Each of the six **Hard stops** above, hit under `--headless`, ends the run as
+`NEEDS_HUMAN` per the protocol's ask→fallback rule: post the stop reason
+(which numbered hard stop, and the evidence — the review comment, the
+conflicting diff, the finding string, the out-of-plan file list, the second
+failed check, or the main/force-push/wrong-base attempt) as a comment on the
+inbox issue, prefixed with the line `Phase: ship` per the protocol's
+ask→fallback rule, set its label to `needs-input`, and write `status.json`
+with `status: NEEDS_HUMAN`, `phase: "ship"`, and `question` set to that same
+text.
+Never continue past a hard stop headlessly — the interactive rule ("stop,
+report, do not proceed to the next repo") holds unchanged; headless mode only
+changes where the stop is reported.
+
+**Success end state** (all gates clear, PRs open and green or gateless, no
+merge): PR URLs are posted as a comment on the inbox issue and the inbox
+label is swapped to `ready-to-test`. On Linear — the one public write beyond
+the claim — post one comment with the PR link(s) and add label
+`agent:ready-to-test`; Linear status stays `In Progress`. Never `Staging`
+headlessly (`Staging` means merged, and headless ship-work never merges) and
+never `Done` (a reviewer sets that, same as interactive). Write
+`status.json` with `status: "DONE"`, `phase: "ship"`, and `pr_urls` filled
+with every opened PR URL.
+
+Plan archiving (`docs/plans/` → `docs/plans/completed/`) does **not** happen
+under `--headless` — it stays exactly where step 9 leaves it today, performed
+only by the human's later interactive `/ship-work` run that actually merges.

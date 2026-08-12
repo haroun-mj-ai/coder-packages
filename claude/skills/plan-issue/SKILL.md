@@ -370,3 +370,59 @@ git -C <repo> branch -d haroun/eng-<id>-<slug>
 
 This tree already carries more than twenty worktrees, many stale. Planning a ticket
 that never gets built should not add to that.
+
+## Headless mode (`--headless`)
+
+Shared mechanics — the `status.json` shape, the inbox contract, the
+ask→fallback rule, the Linear footprint — are defined once in
+`.claude/skills/autopilot-protocol.md`. Read it first. This section only maps
+this skill's own ask points onto that protocol.
+
+**Input is always an existing issue id**, extracted by `autopilot-poll` from
+the title of the inbox issue the owner created to delegate the work — never
+free text: `/plan-issue <description> --headless` with no issue id is
+`FAILED`, `detail: "headless requires an issue id"`. Step 1b's create-a-ticket
+path is interactive-only; its own asks (duplicate-ticket confirmation, thin
+description) have no headless-safe default.
+
+This skill's `NEEDS_HUMAN` inbox comments start with the line `Phase: plan`,
+per the protocol's ask→fallback rule.
+
+**Ask-point mapping** (step 1a/1b, only reachable given an issue id):
+
+- **Duplicate-ticket match** (step 1b's existing-ticket check, reached only if
+  a companion free-text flow surfaces one against the given id): plan the
+  existing matching issue instead of the one passed in, and record that
+  choice as an inbox comment. Do not ask.
+- **Description too thin to write a title and problem statement** (step 1a):
+  `NEEDS_HUMAN` — post the specific question that resolves it to the inbox
+  issue, per the protocol's ask→fallback rule.
+- **Project-selection coin flip** (step 1b's numbered priority order): take
+  the **first matching rule** in that order and record the assumption — in
+  the plan's own text and as an inbox comment — instead of asking. The
+  priority order itself is the documented default the protocol requires.
+- **"agent type not found" dispatch failure** (Why this shape, subagent
+  dispatch): `FAILED` with that detail; there is no unattended remedy for a
+  session that predates the agent definitions.
+
+**`--feedback '<text>'`:** treat the text as new requirements from the
+requester, not a correction to apply mechanically. Revise the existing
+committed plan in place — same plan file, same branch, a new commit, not a
+new file. Post the revised plan markdown to the inbox as a comment, the same
+way a fresh plan is posted.
+
+**End state:** commit the plan exactly as step 4 already does in interactive
+mode. Then create or update the inbox issue with the **full** plan markdown
+(body on create, comment on update), prefixed with the line `Plan file:
+<absolute path>` per the protocol's inbox contract, label it `plan-review`,
+and write `status.json` with `status: DONE`, `phase: "plan"`, and `plan_path`
+set. Stop
+there — do not begin `/implement-plan`. Step 7's Linear plan-summary comment
+is interactive-only and is skipped headlessly; the Linear claim (`assignee:
+me`, `state: In Progress`) still happens, per the protocol's Linear
+footprint.
+
+**Blocking open question in the plan itself** (step 4's `BLOCKING` marker,
+survives the dry-run in step 5-6): still post the plan to the inbox, but
+label it `needs-input` instead of `plan-review`, and write `status.json` with
+`status: NEEDS_HUMAN` and `question` set to the blocking question's text.

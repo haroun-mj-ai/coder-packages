@@ -723,11 +723,29 @@ status_file="$AP_RUN_DIR/status.json"
 final_phase=""
 final_status=""
 
+# Model per act phase. MUST be pinned explicitly: without --model the act
+# inherits whatever ~/.claude/settings.json happens to say, so an interactive
+# `/model` change silently reprices (or downgrades) the whole pipeline. That is
+# how plan/implement/ship ran on fable-5 at 2x opus cost until 2026-08-12.
+# Design vs execution: planning is the judgement-heavy half and gets opus;
+# implement/ship execute an already-approved plan and get sonnet, matching the
+# sonnet subagents those skills dispatch.
+act_model() {
+  case "$1" in
+    plan|replan) echo "${AP_PLAN_MODEL:-opus}" ;;
+    implement)   echo "${AP_IMPLEMENT_MODEL:-sonnet}" ;;
+    ship)        echo "${AP_SHIP_MODEL:-sonnet}" ;;
+    *)           echo "${AP_ACT_MODEL:-sonnet}" ;;
+  esac
+}
+
 run_claude() {
   # run_claude <phase> <prompt-arg...>  -- appends ledger row for this call
   local phase="$1"; shift
   local rc=0
   local out
+  local model
+  model="$(act_model "$phase")"
   local stderr_file="$AP_RUN_DIR/$phase.stderr"
   local adhoc_status="$AP_HOME/runs/adhoc/status.json"
   # Remove any status.json left behind by a prior phase in this same run
@@ -743,8 +761,9 @@ run_claude() {
   # the session after its background-wait ceiling (default 10 min), which is
   # how a healthy 28-min implement died with no result record. Give acts a
   # 60-min ceiling (override via AP_BG_WAIT_CEILING_MS).
+  log "act: phase=$phase model=$model"
   out="$(CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="${AP_BG_WAIT_CEILING_MS:-3600000}" \
-    claude -p "$@" --settings "$SETTINGS_PATH" --output-format json 2>"$stderr_file")" || rc=$?
+    claude -p "$@" --model "$model" --settings "$SETTINGS_PATH" --output-format json 2>"$stderr_file")" || rc=$?
   cat "$stderr_file" >>"$AP_HOME/logs/cycle.log" 2>/dev/null || true
   local cost session_id st
   cost="$(json_field "$out" ".total_cost_usd")"

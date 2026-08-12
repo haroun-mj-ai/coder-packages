@@ -1084,6 +1084,47 @@ for f in "$CASE_STUB_DIR"/claude_calls/*.pwd; do
     [ "$(cat "$f")" = "$CASE_WORK_REPO" ]
 done
 
+# =============================================================================
+# Case 26: every claude invocation must pin --model explicitly. Without it the
+# act inherits ~/.claude/settings.json, so an interactive `/model` change
+# silently reprices or downgrades the whole pipeline. Planning gets opus;
+# implement/ship execute a settled plan and get sonnet; poll stays haiku.
+# =============================================================================
+
+# assert_model <desc> <args-file> <expected-model>
+# args files hold one argv entry per line, so --model must be followed by the
+# model on the next line.
+assert_model() {
+  local desc="$1" args="$2" want="$3"
+  if [[ ! -f "$args" ]]; then
+    fail "$desc (no args file $args)"
+    return
+  fi
+  local got
+  got="$(grep -A1 -x -- '--model' "$args" | sed -n '2p')"
+  assert "$desc (want --model $want, got '${got:-none}')" [ "$got" = "$want" ]
+}
+
+setup_case
+rc="$(AP_TEST_POLL_ACTION=plan AP_TEST_POLL_ISSUE=ENG-26 run_case)"
+assert "case26: exit 0" [ "$rc" -eq 0 ]
+assert_model "case26: poll" "$CASE_STUB_DIR/claude_calls/1.args" haiku
+assert_model "case26: plan" "$CASE_STUB_DIR/claude_calls/2.args" opus
+
+# implement + ship in one cycle -> both sonnet
+setup_case
+rc="$(AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-26 \
+  AP_TEST_POLL_PLANPATH=docs/plans/x.md AP_TEST_IMPLEMENT_STATUS=DONE run_case)"
+assert "case26: implement cycle exit 0" [ "$rc" -eq 0 ]
+assert_model "case26: implement" "$CASE_STUB_DIR/claude_calls/2.args" sonnet
+assert_model "case26: ship" "$CASE_STUB_DIR/claude_calls/3.args" sonnet
+
+# env override wins, so a hard ticket can be raised without changing the default
+setup_case
+rc="$(AP_PLAN_MODEL=fable AP_TEST_POLL_ACTION=plan AP_TEST_POLL_ISSUE=ENG-26 run_case)"
+assert "case26: override cycle exit 0" [ "$rc" -eq 0 ]
+assert_model "case26: plan honours AP_PLAN_MODEL" "$CASE_STUB_DIR/claude_calls/2.args" fable
+
 if [[ "$FAILURES" -eq 0 ]]; then
   echo "ALL PASS"
   exit 0

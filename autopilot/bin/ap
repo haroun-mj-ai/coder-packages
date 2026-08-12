@@ -101,16 +101,22 @@ cmd_down() {
   [[ "${1:-}" == "--force" ]] && force=true
 
   # Killing the session can take a running act down with it -- a build is tens
-  # of minutes and real money. Refuse while a lane is occupied unless forced;
+  # of minutes and real money (a standalone ship is cheaper, but still a live
+  # PR-open/CI-wait in flight). Refuse while a lane is occupied unless forced;
   # `ap pause` is the way to stop NEW work without touching what is in flight.
-  # Every build slot counts here, not just "all full": a single occupied slot
-  # is still an act in flight that killing the session would take down.
+  # Every build slot AND every ship slot counts here, not just "all full": a
+  # single occupied slot is still an act in flight that killing the session
+  # would take down.
   if [[ "$force" == false ]]; then
-    local busy="" build_busy=""
+    local busy="" build_busy="" ship_busy=""
     for ((n = 1; n <= AP_BUILD_SLOTS; n++)); do
       lane_free "$AP_HOME/lock.build.$n" || build_busy="${build_busy:+$build_busy,}build.$n"
     done
     [[ -n "$build_busy" ]] && busy="$build_busy"
+    for ((n = 1; n <= AP_SHIP_SLOTS; n++)); do
+      lane_free "$AP_HOME/lock.ship.$n" || ship_busy="${ship_busy:+$ship_busy,}ship.$n"
+    done
+    [[ -n "$ship_busy" ]] && busy="${busy:+$busy,}$ship_busy"
     lane_free "$AP_HOME/lock.plan" || busy="${busy:+$busy,}plan"
     if [[ -n "$busy" ]]; then
       echo "refusing: lane(s) busy ($busy) -- an act is running and would be killed." >&2
@@ -166,6 +172,26 @@ cmd_status() {
     fi
   done
   echo "build slots: $busy_slots/$AP_BUILD_SLOTS busy ($slot_detail)"
+
+  # Ship lane's own slot pool (see ap-env.sh's AP_SHIP_SLOTS comment) --
+  # capped higher than build because a standalone ship act is almost pure
+  # CI-wait, not a build.
+  local ship_busy_slots=0 ship_slot_detail=""
+  for ((n = 1; n <= AP_SHIP_SLOTS; n++)); do
+    if lane_free "$AP_HOME/lock.ship.$n"; then
+      ship_slot_detail="${ship_slot_detail:+$ship_slot_detail }slot$n=free"
+    else
+      ship_slot_detail="${ship_slot_detail:+$ship_slot_detail }slot$n=busy"
+      ship_busy_slots=$((ship_busy_slots + 1))
+    fi
+  done
+  echo "ship slots:  $ship_busy_slots/$AP_SHIP_SLOTS busy ($ship_slot_detail)"
+
+  if lane_free "$AP_HOME/lock.plan"; then
+    echo "plan lane:   free"
+  else
+    echo "plan lane:   busy"
+  fi
 
   local today ledger_file
   today="$(TZ="$AP_TZ" date +%F)"

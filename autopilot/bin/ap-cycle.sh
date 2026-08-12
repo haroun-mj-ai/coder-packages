@@ -342,12 +342,17 @@ PYEOF
 
 # --- Stage 0: pause / lock.poll / budget ------------------------------------
 # Locks, not one: lock.poll serializes the decision path (at most one cycle
-# deciding at a time); lock.plan and the AP_BUILD_SLOTS build slots
-# (lock.build.1 .. lock.build.N) are held only for the duration of an actual
-# act (implement's ship chain counts as part of the build lane it claimed;
-# plan/replan is the plan lane). This lets a plan keep flowing while builds
-# run -- up to AP_BUILD_SLOTS builds AND one plan concurrently, plus the one
-# cycle currently deciding. See autopilot/README.md's concurrency section.
+# deciding at a time); lock.plan, the AP_BUILD_SLOTS build slots
+# (lock.build.1 .. lock.build.N), and the AP_SHIP_SLOTS ship slots
+# (lock.ship.1 .. lock.ship.N) are held only for the duration of an actual
+# act. Three lanes: plan (plan/replan), build (implement, and the ship half
+# of an implement->ship CHAIN -- that chain keeps the SAME build slot for
+# both halves, see the implement case arm below for why), and ship (a
+# STANDALONE ship-only retry, i.e. action=ship from a ship-pending issue --
+# never the chained ship above). This lets a plan, a build, and a standalone
+# ship all keep flowing concurrently -- up to AP_BUILD_SLOTS builds, up to
+# AP_SHIP_SLOTS standalone ships, and one plan, plus the one cycle currently
+# deciding. See autopilot/README.md's concurrency section.
 
 # A usage-limit failure (a rate/quota trip, not a real bug) auto-pauses the
 # pipeline exactly like a real failure would, and then would otherwise wait
@@ -400,12 +405,17 @@ lane_free() {
 
 # Build lane = AP_BUILD_SLOTS independent slots (lock.build.1 .. lock.build.N),
 # so several implement->ship chains can run at once (see ap-env.sh for why
-# that's safe here: mongomock per-test + per-build worktrees). The lane counts
-# as busy to the poll ONLY when every slot is occupied; probing lowest-first
-# so the same slot number is reused preferentially over higher ones.
+# that's safe here: mongomock per-test + per-build worktrees). Ship lane =
+# AP_SHIP_SLOTS independent slots (lock.ship.1 .. lock.ship.N) for STANDALONE
+# ship-only retries (never the ship half of an implement->ship chain -- that
+# stays on its build slot). Both lanes count as busy to the poll ONLY when
+# every slot in that lane is occupied; probing lowest-first so the same slot
+# number is reused preferentially over higher ones.
 busy_build=false
 busy_plan=false
+busy_ship=false
 free_build_slot=""
+free_ship_slot=""
 for ((build_slot_n = 1; build_slot_n <= AP_BUILD_SLOTS; build_slot_n++)); do
   if lane_free "$AP_HOME/lock.build.$build_slot_n"; then
     free_build_slot="$build_slot_n"
@@ -413,10 +423,18 @@ for ((build_slot_n = 1; build_slot_n <= AP_BUILD_SLOTS; build_slot_n++)); do
   fi
 done
 [[ -z "$free_build_slot" ]] && busy_build=true
+for ((ship_slot_n = 1; ship_slot_n <= AP_SHIP_SLOTS; ship_slot_n++)); do
+  if lane_free "$AP_HOME/lock.ship.$ship_slot_n"; then
+    free_ship_slot="$ship_slot_n"
+    break
+  fi
+done
+[[ -z "$free_ship_slot" ]] && busy_ship=true
 lane_free "$AP_HOME/lock.plan" || busy_plan=true
 
 busy_lanes=""
 [[ "$busy_build" == true ]] && busy_lanes="build"
+[[ "$busy_ship" == true ]] && busy_lanes="${busy_lanes:+$busy_lanes,}ship"
 if [[ "$busy_plan" == true ]]; then
   busy_lanes="${busy_lanes:+$busy_lanes,}plan"
 fi
@@ -633,16 +651,19 @@ fi
 # ship still owed (Change 2: a ship-only retry after a ship phase failed
 # externally, or a human relabelled by hand). A wake signal like the two
 # above, tracked in scan-state (ship_pending_seen) the same way new-intake
-# is, so a non-actionable one does not re-wake every minute. Claims the BUILD
-# lane -- ship-work may run gates/servers, so it needs a slot just like
-# implement.
+# is, so a non-actionable one does not re-wake every minute. Claims the SHIP
+# lane -- its own slot pool, separate from build (a standalone ship act is
+# almost pure CI-wait, so it must never queue behind a build slot; see
+# ap-env.sh's AP_SHIP_SLOTS comment for why). NOT the same lane the
+# implement->ship chain uses for its trailing ship call -- that chain never
+# reaches this leg at all, since it isn't a scan signal.
 inbox_list_ship_pending="$(gh issue list --repo "$AP_INBOX_REPO" --state open --label ship-pending --json number 2>>"$AP_HOME/logs/cycle.log")"
 ship_pending_numbers="$(extract_issue_numbers "${inbox_list_ship_pending:-[]}" | sort -un)"
 if [[ -n "$ship_pending_numbers" ]]; then
   while IFS= read -r num; do
     [[ -z "$num" ]] && continue
     if ! list_contains "$ship_pending_seen_json" "$num"; then
-      if [[ "$busy_build" == true ]]; then
+      if [[ "$busy_ship" == true ]]; then
         continue
       fi
       wake=true
@@ -780,11 +801,12 @@ log "poll: action=$action issue=${issue:-} plan=${plan_path:-} inbox=${inbox_iss
 act_lane=""
 act_lock_file=""
 build_slot=""
+ship_slot=""
 fe_port=""
 be_port=""
 case "$action" in
   plan|replan) act_lane="plan"; act_lock_file="$AP_HOME/lock.plan" ;;
-  implement|ship)
+  implement)
     act_lane="build"
     build_slot="$free_build_slot"
     if [[ -n "$build_slot" ]]; then
@@ -792,10 +814,39 @@ case "$action" in
       # Port pair for this slot, so two concurrent builds never bind the same
       # port. 5173/8000 are the human's baseline pair (README's four-server
       # comparison) and must never be handed to a slot, hence n starting at 1.
-      # A standalone `ship` action needs one too -- ship-work may run
-      # gates/servers, same as implement's own trailing ship call.
+      # This same fe_port/be_port pair is reused below, unchanged, for the
+      # trailing `ship` call of an implement->ship CHAIN in this same
+      # process -- that chain keeps its build slot for both halves; it never
+      # goes through the standalone `ship)` arm below.
       fe_port=$((5173 + build_slot))
       be_port=$((8000 + build_slot))
+    fi
+    ;;
+  ship)
+    # STANDALONE ship-only retry ONLY (poll emitted action=ship for a
+    # ship-pending issue -- see autopilot-poll's tier 4). This is the
+    # non-obvious part: this arm is NOT how the implement->ship chain ships.
+    # That chain's action is "implement", handled above; when its status
+    # comes back DONE, the SAME process makes a second run_claude("ship", ...)
+    # call further down using the build_slot/fe_port/be_port already
+    # acquired for the implement half -- it never re-enters this case
+    # statement, so it never touches the ship lane at all. Only a fresh cycle
+    # whose poll action is literally "ship" lands here, and gets its own
+    # lane/slot/ports instead.
+    act_lane="ship"
+    ship_slot="$free_ship_slot"
+    if [[ -n "$ship_slot" ]]; then
+      act_lock_file="$AP_HOME/lock.ship.$ship_slot"
+      # Ship base (5180/8010) is deliberately non-overlapping with both the
+      # build base (5173/8000, slots land at 5174..5177/8001..8004 for
+      # AP_BUILD_SLOTS<=4) and the human's own 5173/8000 -- so a standalone
+      # ship's local gates can never collide with a running build or the
+      # human's baseline. ship-work serves no UI, so these ports only matter
+      # for gate isolation; the frontend CORS allowlist is irrelevant here for
+      # the same reason (see implement-plan's headless section for where CORS
+      # actually matters, for the build lane).
+      fe_port=$((5180 + ship_slot))
+      be_port=$((8010 + ship_slot))
     fi
     ;;
 esac
@@ -806,8 +857,8 @@ if [[ -z "$act_lane" ]]; then
   exit 0
 fi
 
-if [[ "$act_lane" == "build" && -z "$act_lock_file" ]]; then
-  log "act: no free build slot right after a free probe under lock.poll -- not acting this cycle; the poll's own label swap will be caught by the stale-claim sweep"
+if [[ ( "$act_lane" == "build" || "$act_lane" == "ship" ) && -z "$act_lock_file" ]]; then
+  log "act: no free $act_lane slot right after a free probe under lock.poll -- not acting this cycle; the poll's own label swap will be caught by the stale-claim sweep"
   flock -u 9
   exit 0
 fi

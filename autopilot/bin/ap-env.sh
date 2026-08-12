@@ -70,6 +70,24 @@ elif [[ "$AP_BUILD_SLOTS" -gt 4 ]]; then
 fi
 export AP_BUILD_SLOTS
 
+# Ship lane concurrency: N standalone ship-only retries (see ap-cycle.sh's
+# action=ship arm) can run at once, capped HIGHER than the build lane
+# specifically because a ship act is almost pure waiting on GitHub CI -- it
+# starts no dev servers and barely touches the machine, so many can be in
+# flight with negligible added load. Clamped to 1..6. The implement->ship
+# CHAIN inside one cycle does NOT use this lane -- it keeps the build slot it
+# already holds for the whole chain (see ap-cycle.sh's comment at the
+# implement action for why).
+export AP_SHIP_SLOTS="${AP_SHIP_SLOTS:-3}"
+if ! [[ "$AP_SHIP_SLOTS" =~ ^[0-9]+$ ]]; then
+  AP_SHIP_SLOTS=3
+elif [[ "$AP_SHIP_SLOTS" -lt 1 ]]; then
+  AP_SHIP_SLOTS=1
+elif [[ "$AP_SHIP_SLOTS" -gt 6 ]]; then
+  AP_SHIP_SLOTS=6
+fi
+export AP_SHIP_SLOTS
+
 # Minutes the pipeline stays auto-paused after a usage-limit failure before
 # clearing itself (see ap-cycle.sh's pause-reason handling). A real-bug pause
 # (reason "failures") or a manual pause (reason "manual") never auto-clears,

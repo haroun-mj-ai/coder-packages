@@ -227,7 +227,7 @@ setup_case() {
   # pre-existing case below already assumes (claude poll always runs).
   unset AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_ISSUES_NEEDS_INPUT \
     AP_TEST_GH_ISSUES_ALL_OPEN AP_TEST_GH_ISSUES_SHIP_PENDING AP_TEST_POLL_CRASH \
-    AP_FULL_POLL_INTERVAL_MIN AP_BUILD_SLOTS AP_LIMIT_COOLDOWN_MIN
+    AP_FULL_POLL_INTERVAL_MIN AP_BUILD_SLOTS AP_SHIP_SLOTS AP_LIMIT_COOLDOWN_MIN
 }
 
 run_case() {
@@ -1418,19 +1418,18 @@ assert "external(d): notify title does NOT say requeued" bash -c \
   "! grep -rl 'requeued' '$CASE_STUB_DIR/notify_calls' >/dev/null 2>&1"
 
 # =============================================================================
-# Ship-only action (Change 2): poll can emit action=ship for a ship-pending
-# issue; dispatched as /ship-work --headless --no-merge --ports, in a build
-# slot, same slot mechanics as implement.
+# Ship-only action, ship lane (Change: ship gets its OWN lane, not build).
+# poll can emit action=ship for a ship-pending issue; dispatched as
+# /ship-work --headless --no-merge --ports, on its own slot pool
+# (lock.ship.1 .. lock.ship.N) and its own port base (5180+n/8010+n) --
+# never the build lane's ports, never the human's baseline.
 # =============================================================================
 
-# --- (e) action=ship dispatches /ship-work with --no-merge and --ports, in a
-# build slot (slot 2, since slot 1 is held).
+# --- (e) action=ship dispatches /ship-work with --no-merge and --ports from
+# the ship base, slot 1 (fe=5181,be=8011).
 setup_case
-hold_lane_lock "$CASE_AP_HOME/lock.build.1" 3; ship_slot1_holder="$LANE_HOLDER_PID"
-sleep 0.4
-rc="$(AP_BUILD_SLOTS=2 AP_TEST_POLL_ACTION=ship AP_TEST_POLL_ISSUE=ENG-SHIP-ONLY \
+rc="$(AP_TEST_POLL_ACTION=ship AP_TEST_POLL_ISSUE=ENG-SHIP-ONLY \
   AP_TEST_POLL_PLANPATH=docs/plans/x.md AP_TEST_SHIP_STATUS=DONE run_case)"
-wait "$ship_slot1_holder" 2>/dev/null
 assert "shipOnly(e): exit 0" [ "$rc" -eq 0 ]
 act_args="$CASE_STUB_DIR/claude_calls/2.args"
 assert "shipOnly(e): act call recorded" [ -f "$act_args" ]
@@ -1438,8 +1437,10 @@ assert "shipOnly(e): dispatches /ship-work" bash -c \
   "[ -f '$act_args' ] && grep -q 'ship-work' '$act_args'"
 assert "shipOnly(e): includes --no-merge" bash -c \
   "[ -f '$act_args' ] && grep -q -- '--no-merge' '$act_args'"
-assert "shipOnly(e): includes --ports for slot 2 (slot 1 held)" bash -c \
-  "[ -f '$act_args' ] && grep -q -- '--ports fe=5175,be=8002' '$act_args'"
+assert "shipOnly(e): --ports from the ship base, slot 1 (fe=5181,be=8011)" bash -c \
+  "[ -f '$act_args' ] && grep -q -- '--ports fe=5181,be=8011' '$act_args'"
+assert "shipOnly(e): never assigns fe=5173 nor be=8000 (human baseline)" bash -c \
+  "[ -f '$act_args' ] && ! grep -q 'fe=5173' '$act_args' && ! grep -q 'be=8000' '$act_args'"
 assert "shipOnly(e): ledger has a ship phase row" bash -c \
   "python3 -c \"
 import json
@@ -1447,8 +1448,114 @@ rows = [json.loads(l) for l in open('$(today_ledger)') if l.strip()]
 assert any(r['phase'] == 'ship' for r in rows), rows
 \""
 
+# --- (h) ship lane slot mechanics: ship slot 1 held -> a second standalone
+# ship takes slot 2 (fe=5182,be=8012), still never a build slot's pair or the
+# human baseline.
+setup_case
+hold_lane_lock "$CASE_AP_HOME/lock.ship.1" 3; ship1_holder="$LANE_HOLDER_PID"
+sleep 0.4
+rc="$(AP_SHIP_SLOTS=2 AP_TEST_POLL_ACTION=ship AP_TEST_POLL_ISSUE=ENG-SHIP-SLOT2 \
+  AP_TEST_POLL_PLANPATH=docs/plans/x.md AP_TEST_SHIP_STATUS=DONE run_case)"
+wait "$ship1_holder" 2>/dev/null
+assert "shipOnly(h): exit 0" [ "$rc" -eq 0 ]
+act_args="$CASE_STUB_DIR/claude_calls/2.args"
+assert "shipOnly(h): took ship slot 2 (fe=5182,be=8012)" bash -c \
+  "[ -f '$act_args' ] && grep -q -- '--ports fe=5182,be=8012' '$act_args'"
+assert "shipOnly(h): never assigns fe=5173" bash -c "[ -f '$act_args' ] && ! grep -q 'fe=5173' '$act_args'"
+assert "shipOnly(h): never assigns be=8000" bash -c "[ -f '$act_args' ] && ! grep -q 'be=8000' '$act_args'"
+
+# --- (i) implement->ship CHAIN regression: an implement whose status comes
+# back DONE still chains into ship in the SAME cycle, and that trailing ship
+# call KEEPS the build slot's own ports (fe=5174,be=8001 for slot 1) --
+# NEVER the ship lane's base. This is the non-obvious part of the feature:
+# only a STANDALONE ship (action=ship, from a ship-pending issue) uses the
+# ship lane; the chain never re-enters the case statement that assigns it.
+setup_case
+rc="$(AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-CHAIN \
+  AP_TEST_POLL_PLANPATH=docs/plans/x.md AP_TEST_IMPLEMENT_STATUS=DONE \
+  AP_TEST_SHIP_STATUS=DONE run_case)"
+assert "chain(i): exit 0" [ "$rc" -eq 0 ]
+assert "chain(i): 3 claude calls (poll+implement+ship)" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 3 ]
+implement_args="$CASE_STUB_DIR/claude_calls/2.args"
+ship_args="$CASE_STUB_DIR/claude_calls/3.args"
+assert "chain(i): implement call carries build slot 1 ports" bash -c \
+  "[ -f '$implement_args' ] && grep -q -- '--ports fe=5174,be=8001' '$implement_args'"
+assert "chain(i): chained ship call carries the SAME build slot ports, not the ship base" bash -c \
+  "[ -f '$ship_args' ] && grep -q -- '--ports fe=5174,be=8001' '$ship_args' && ! grep -q 'fe=5181' '$ship_args'"
+
 # =============================================================================
-# Ship-pending wake + intake exclusion (Change 2).
+# Ship-pending wake now belongs to the SHIP lane, not build (the bug this
+# feature fixes -- ship-pending must not queue behind a full build lane).
+# =============================================================================
+
+# --- (a) all build slots busy + a ship-pending signal -> poll still runs and
+# dispatches ship (proves ship no longer blocks on build).
+setup_case
+now_ts="$(date -u +%FT%TZ)"
+printf '{"inbox":{},"new_intake_seen":[],"ship_pending_seen":[],"last_poll_ts":"%s"}' "$now_ts" >"$CASE_AP_HOME/scan-state.json"
+export AP_TEST_GH_ISSUES_SHIP_PENDING='[{"number":704}]'
+hold_lane_lock "$CASE_AP_HOME/lock.build.1" 3; a_build_holder="$LANE_HOLDER_PID"
+sleep 0.4
+rc="$(AP_BUILD_SLOTS=1 AP_TEST_POLL_ACTION=ship AP_TEST_POLL_ISSUE=ENG-704 \
+  AP_TEST_POLL_PLANPATH=docs/plans/x.md AP_TEST_SHIP_STATUS=DONE run_case)"
+wait "$a_build_holder" 2>/dev/null
+assert "shipLane(a): exit 0" [ "$rc" -eq 0 ]
+assert "shipLane(a): poll ran despite build lane full" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -ge 1 ]
+act_args="$CASE_STUB_DIR/claude_calls/2.args"
+assert "shipLane(a): dispatched ship" bash -c \
+  "[ -f '$act_args' ] && grep -q 'ship-work' '$act_args'"
+unset AP_TEST_GH_ISSUES_SHIP_PENDING
+
+# --- (b) all ship slots busy + a ship-pending signal -> the signal is
+# skipped (not actionable, not marked seen); --busy-lanes reports ship when
+# something else (a plan-lane signal) independently wakes the poll.
+setup_case
+now_ts="$(date -u +%FT%TZ)"
+printf '{"inbox":{},"new_intake_seen":[],"ship_pending_seen":[],"last_poll_ts":"%s"}' "$now_ts" >"$CASE_AP_HOME/scan-state.json"
+export AP_TEST_GH_ISSUES_SHIP_PENDING='[{"number":705}]'
+export AP_TEST_GH_ISSUES_ALL_OPEN='[{"number":706,"labels":[{"name":"Queued"}]}]'
+hold_lane_lock "$CASE_AP_HOME/lock.ship.1" 3; b_ship_holder="$LANE_HOLDER_PID"
+sleep 0.4
+rc="$(AP_SHIP_SLOTS=1 AP_TEST_POLL_ACTION=plan AP_TEST_POLL_ISSUE=ENG-706 run_case)"
+wait "$b_ship_holder" 2>/dev/null
+assert "shipLane(b): exit 0" [ "$rc" -eq 0 ]
+poll_args="$CASE_STUB_DIR/claude_calls/1.args"
+assert "shipLane(b): poll invoked with --busy-lanes ship" bash -c \
+  "[ -f '$poll_args' ] && grep -q -- '--busy-lanes ship' '$poll_args'"
+act_args="$CASE_STUB_DIR/claude_calls/2.args"
+assert "shipLane(b): plan act proceeded (plan lane free, ship-pending skipped)" bash -c \
+  "[ -f '$act_args' ] && grep -q 'plan-issue ENG-706' '$act_args'"
+assert "shipLane(b): ship-pending item NOT marked seen (re-fires once free)" bash -c \
+  "[ ! -f '$CASE_AP_HOME/scan-state.json' ] || python3 -c \"
+import json
+with open('$CASE_AP_HOME/scan-state.json') as f:
+    d = json.load(f)
+assert '705' not in d.get('ship_pending_seen', []), d
+\""
+unset AP_TEST_GH_ISSUES_SHIP_PENDING AP_TEST_GH_ISSUES_ALL_OPEN
+
+# --- (busy_lanes all three) fallback wake (stale ts, never lane-gated) with
+# plan, build and ship all busy -> poll still runs, and --busy-lanes carries
+# all three names.
+setup_case
+printf '{"inbox":{},"new_intake_seen":[],"ship_pending_seen":[],"last_poll_ts":"2020-01-01T00:00:00Z"}' >"$CASE_AP_HOME/scan-state.json"
+hold_lane_lock "$CASE_AP_HOME/lock.build.1" 3; abc_build_holder="$LANE_HOLDER_PID"
+hold_lane_lock "$CASE_AP_HOME/lock.ship.1" 3; abc_ship_holder="$LANE_HOLDER_PID"
+hold_lane_lock "$CASE_AP_HOME/lock.plan" 3; abc_plan_holder="$LANE_HOLDER_PID"
+sleep 0.4
+rc="$(AP_BUILD_SLOTS=1 AP_SHIP_SLOTS=1 AP_TEST_POLL_ACTION=none run_case)"
+wait "$abc_build_holder" "$abc_ship_holder" "$abc_plan_holder" 2>/dev/null
+assert "busyLanes(all-three): exit 0" [ "$rc" -eq 0 ]
+poll_args="$CASE_STUB_DIR/claude_calls/1.args"
+assert "busyLanes(all-three): poll invoked (fallback isn't lane-gated)" [ -f "$poll_args" ]
+assert "busyLanes(all-three): --busy-lanes carries build,ship,plan" bash -c \
+  "[ -f '$poll_args' ] && grep -q -- '--busy-lanes build,ship,plan' '$poll_args'"
+
+# =============================================================================
+# Ship-pending wake + seen-tracking, unaffected by these changes (same pattern
+# as the new-intake leg's case20).
 # =============================================================================
 
 # --- (f) a ship-pending issue wakes the scan (poll runs); a non-actionable
@@ -1472,14 +1579,14 @@ setup_case
 now_ts="$(date -u +%FT%TZ)"
 printf '{"inbox":{},"new_intake_seen":[],"ship_pending_seen":[],"last_poll_ts":"%s"}' "$now_ts" >"$CASE_AP_HOME/scan-state.json"
 export AP_TEST_GH_ISSUES_SHIP_PENDING='[{"number":702}]'
-hold_lane_lock "$CASE_AP_HOME/lock.build.1" 3; sp_build_holder="$LANE_HOLDER_PID"
+hold_lane_lock "$CASE_AP_HOME/lock.ship.1" 3; sp_ship_holder="$LANE_HOLDER_PID"
 sleep 0.4
-rc="$(AP_BUILD_SLOTS=1 AP_TEST_POLL_ACTION=none run_case)"
-wait "$sp_build_holder" 2>/dev/null
-assert "shipPending(f): build-lane-full -> exit 0" [ "$rc" -eq 0 ]
-assert "shipPending(f): build-lane-full -> claude NOT called" \
+rc="$(AP_SHIP_SLOTS=1 AP_TEST_POLL_ACTION=none run_case)"
+wait "$sp_ship_holder" 2>/dev/null
+assert "shipPending(f): ship-lane-full -> exit 0" [ "$rc" -eq 0 ]
+assert "shipPending(f): ship-lane-full -> claude NOT called" \
   [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 0 ]
-assert "shipPending(f): build-lane-full -> NOT marked seen (re-fires once free)" bash -c \
+assert "shipPending(f): ship-lane-full -> NOT marked seen (re-fires once free)" bash -c \
   "[ ! -f '$CASE_AP_HOME/scan-state.json' ] || python3 -c \"
 import json
 with open('$CASE_AP_HOME/scan-state.json') as f:

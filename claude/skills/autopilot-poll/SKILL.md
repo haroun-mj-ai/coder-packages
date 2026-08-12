@@ -23,7 +23,7 @@ fence, nothing else on stdout.
 
 ```json
 {
-  "action": "plan|implement|replan|none",
+  "action": "plan|implement|ship|replan|none",
   "issue": "ENG-123",
   "planPath": "<abs path>",
   "inboxIssue": 42,
@@ -53,18 +53,21 @@ this per the protocol's approval rule).
 The orchestrator appends these to `/autopilot-poll` for this cycle. Read them
 before the scan — they gate which tiers you're even allowed to act on.
 
-- `--busy-lanes <names>` — a comma-separated subset of `build` and `plan`
-  (e.g. `--busy-lanes build`, `--busy-lanes build,plan`), omitted entirely
-  when no lane is busy. A lane listed here is owned by a still-running act in
-  a different cycle. **Skip that lane's tiers entirely for this invocation:
-  do not emit an action for it, and do not touch its labels.** Tiers 1 and 4
-  (`go`/auto-approve → `implement`; `ship-pending` → `ship`) are the BUILD
-  lane. Tiers 2, 3, and 5 (feedback replan, needs-input answers, Queued
-  intake → `replan`/`plan`) are the PLAN lane. If every candidate item you
-  find belongs to a busy lane, emit `{"action":"none"}`. The wrapper
-  deliberately does not mark a busy-lane signal as "seen" so it re-fires once
-  the lane frees — you must not consume it either: no label swap, no
-  comment, no claim for an item whose lane you're skipping.
+- `--busy-lanes <names>` — a comma-separated subset of `build`, `ship`, and
+  `plan` (e.g. `--busy-lanes build`, `--busy-lanes build,ship,plan`), omitted
+  entirely when no lane is busy. A lane listed here is owned by a
+  still-running act in a different cycle. **Skip that lane's tiers entirely
+  for this invocation: do not emit an action for it, and do not touch its
+  labels.** Tier 1 (`go`/auto-approve → `implement`) is the BUILD lane. Tier 4
+  (`ship-pending` → `ship`) is its own, separate SHIP lane — a standalone
+  ship-only retry must never wait on a busy build lane, since it barely
+  touches the machine (almost pure CI-wait) compared to a build. Tiers 2, 3,
+  and 5 (feedback replan, needs-input answers, Queued intake →
+  `replan`/`plan`) are the PLAN lane. If every candidate item you find
+  belongs to a busy lane, emit `{"action":"none"}`. The wrapper deliberately
+  does not mark a busy-lane signal as "seen" so it re-fires once the lane
+  frees — you must not consume it either: no label swap, no comment, no
+  claim for an item whose lane you're skipping.
 - `--auto-approve` — present when the global env flag `AP_AUTO_APPROVE=1` is
   set. One of three independent auto-approve switches; see tier 1 below.
 
@@ -154,7 +157,9 @@ those markers, or the next cycle will read it as the owner talking.
    finished and committed, ship still owed — either a prior ship phase
    failed for an external cause and got re-queued here by the wrapper, or a
    human relabelled by hand) → a ship-only retry, oldest first. Skip this
-   tier entirely if `build` is in `--busy-lanes`.
+   tier entirely if `ship` is in `--busy-lanes` — note this is the SHIP lane,
+   not `build`: a standalone ship-only retry never queues behind a busy build
+   lane.
    - Extract the Linear id from the issue title (`ENG-<id>`), exactly as
      tier 5 does below.
    - Extract `planPath` the same way tier 1 does: the newest `Plan file:

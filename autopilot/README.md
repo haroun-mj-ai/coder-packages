@@ -55,6 +55,13 @@ what you need:
   implement→ship chains. Safe here specifically because backend tests run on
   mongomock (in-memory, per-test, never shared) and every build works in its
   own git worktree. See "Concurrent builds" below.
+- `AP_SHIP_SLOTS` (default `3`, clamped to `1`-`6`) — concurrent *standalone*
+  ship-only retries (its own lane, separate from `AP_BUILD_SLOTS`). Capped
+  higher than the build lane deliberately: a ship act is almost pure waiting
+  on GitHub CI — it starts no dev servers and barely touches the machine — so
+  many can be in flight with negligible added load. Does not affect the ship
+  half of an implement→ship chain, which stays on its build slot. See
+  "Concurrent builds" below.
 - `AP_LIMIT_COOLDOWN_MIN` (default `60`) — minutes a usage-limit auto-pause
   (see "Two consecutive failures" below) waits before clearing itself. `0`
   disables auto-resume entirely, so every pause then waits for a human,
@@ -133,43 +140,68 @@ set by the orchestrator when a ship phase fails for an external cause (see
 "Two consecutive failures" below), or reachable by relabelling an issue by
 hand. The next cycle claims it (`ship-pending` → `shipping`) and dispatches
 `/ship-work --headless --no-merge` directly, with no plan or implement step
-first. It claims a build slot, same as `implement` — `ship-work` may run
-gates/servers.
+first. It claims its own **ship lane** slot (`AP_SHIP_SLOTS`, default `3`) —
+deliberately *not* a build slot: a standalone ship is almost pure CI-wait, so
+it must never queue behind a busy build lane. This is distinct from the ship
+half of an implement→ship chain, which stays on the build slot it already
+holds for the whole chain. See "Concurrent builds" below.
 
-## Concurrent builds
+## Concurrent builds (and ships)
 
-The build lane is `AP_BUILD_SLOTS` independent slots (`lock.build.1` ..
-`lock.build.N` under `~/.autopilot`), not one — so several
-implement→ship chains can run at once. This is safe in this repo
-specifically, not in general: backend tests run on mongomock (in-memory,
-created fresh per test), so concurrent `pytest` runs never share a database,
-and every build works in its own git worktree, so concurrent implementers
-never touch the same checkout. The lane is reported busy to the poll only
-when every slot is full (lowest-numbered free slot wins). Each slot gets a
-dedicated frontend/backend port pair, `5173+n`/`8000+n` for slot `n`
-(`n` starts at `1`, so the human's own `5173`/`8000` baseline pair is never
-handed to a slot) — the orchestrator tells the headless session its ports as
-literal prompt text, `--ports fe=<port>,be=<port>`, the same mechanism as
-`--run-dir`.
+Three lanes, each its own mutual-exclusion mechanism under `~/.autopilot`:
+
+| lane  | slots                          | default cap    | what runs there |
+|-------|---------------------------------|----------------|------------------|
+| plan  | `lock.plan` (single)             | 1              | `plan`/`replan` |
+| build | `lock.build.1` .. `lock.build.N` | `AP_BUILD_SLOTS`, default `2`, clamped `1`-`4` | `implement`, plus the ship half of an implement→ship *chain* |
+| ship  | `lock.ship.1` .. `lock.ship.N`   | `AP_SHIP_SLOTS`, default `3`, clamped `1`-`6` | a *standalone* ship-only retry (`action:ship` from a `ship-pending` issue) |
+
+The build lane lets several implement→ship chains run at once — safe in this
+repo specifically, not in general: backend tests run on mongomock
+(in-memory, created fresh per test), so concurrent `pytest` runs never share
+a database, and every build works in its own git worktree, so concurrent
+implementers never touch the same checkout. Each build slot gets a dedicated
+frontend/backend port pair, `5173+n`/`8000+n` for slot `n` (`n` starts at
+`1`, so the human's own `5173`/`8000` baseline pair is never handed to a
+slot).
+
+The ship lane is capped *higher* than the build lane deliberately: a
+standalone ship act is almost pure waiting on GitHub CI — it starts no dev
+servers and barely touches the machine — so many can be in flight with
+negligible added load, and it must never queue behind a full build lane (that
+was the bug this lane exists to fix). Each ship slot gets its own port pair
+too, `5180+n`/`8010+n` for slot `n`, deliberately non-overlapping with both
+the build base and the human's baseline — `ship-work` serves no UI, so these
+ports exist only to keep its local gates from colliding with a concurrently
+running build; the frontend CORS allowlist is irrelevant here for the same
+reason. This does **not** apply to the ship half of an implement→ship
+*chain* run in the same cycle: that chain keeps the build slot (and its
+build-lane ports) it already holds for both halves — it never touches the
+ship lane at all.
+
+Every lane is reported busy to the poll only when every slot in it is full
+(lowest-numbered free slot wins, per lane); the orchestrator tells the
+headless session its assigned ports as literal prompt text, `--ports
+fe=<port>,be=<port>`, the same mechanism as `--run-dir`.
 
 ## Controls
 
 ```bash
 ap up        # start the tmux session running supercronic (idempotent)
 ap down      # stop it
-ap status    # tmux liveness, pause state (+ reason), build slot occupancy,
-             # last 3 ledger lines, gap warning
+ap status    # tmux liveness, pause state (+ reason), build/ship slot
+             # occupancy and plan lane state, last 3 ledger lines, gap warning
 ap pause     # writes ~/.autopilot/pause (reason "manual", never auto-clears)
 ap resume    # rm the pause file, reset the consecutive-failure counter
 ```
 
 The pause file (`~/.autopilot/pause`) is the one-command override for
-anything invasive you're about to do by hand — it does not touch a build
+anything invasive you're about to do by hand — it does not touch an act
 already in flight (the flock is per-slot), but no new cycle starts while it
 exists. Autopilot also auto-pauses itself (with a ping) after 2 consecutive
-`FAILED` cycles. `ap down` refuses (unless `--force`d) while any build slot
-or the plan lane is occupied, for the same "would kill a build in flight"
-reason.
+`FAILED` cycles. `ap down` refuses (unless `--force`d) while any build slot,
+any ship slot, or the plan lane is occupied, for the same "would kill an act
+in flight" reason.
 
 Budgets are the other brake: `AP_MAX_ISSUES_PER_DAY` and
 `AP_MAX_DAY_COST_USD` in `~/.autopilot/env`, checked against the day's ledger
@@ -236,10 +268,13 @@ this repo to re-symlink and re-skip-worktree it.
 
 `ap up` starts supercronic with `-overlapping`. This is required, not a
 preference: a cycle stays alive for the whole act it dispatched (tens of
-minutes for a build), and without the flag supercronic skips every tick while
-the previous one runs — which serializes the pipeline and leaves free lanes
-idle no matter how many issues are waiting. Overlap is safe because
-`ap-cycle.sh` owns its own mutual exclusion: `lock.poll` allows one decider at
-a time, `lock.plan` caps the plan lane at one occupant, `lock.build.1` ..
+minutes for a build, though a standalone ship is much cheaper — mostly
+CI-wait), and without the flag supercronic skips every tick while the
+previous one runs — which serializes the pipeline and leaves free lanes idle
+no matter how many issues are waiting. Overlap is safe because `ap-cycle.sh`
+owns its own mutual exclusion: `lock.poll` allows one decider at a time,
+`lock.plan` caps the plan lane at one occupant, `lock.build.1` ..
 `lock.build.N` (`AP_BUILD_SLOTS`) cap the build lane at N concurrent
-occupants, and a cycle with nothing to do exits in seconds.
+occupants, `lock.ship.1` .. `lock.ship.N` (`AP_SHIP_SLOTS`) cap the ship lane
+at N concurrent standalone ship retries, and a cycle with nothing to do exits
+in seconds.

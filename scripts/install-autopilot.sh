@@ -202,6 +202,14 @@ else
 # worktree, so concurrent builds never share a database or a checkout.
 # AP_BUILD_SLOTS=2
 
+# Concurrent ship slots -- how many STANDALONE ship-only retries (see
+# "Ship-only retry" below) can run at once. Its own lane, separate from
+# AP_BUILD_SLOTS: a ship act is almost pure waiting on GitHub CI (no dev
+# servers, barely touches the machine), so this cap can safely run higher
+# than the build lane's. Clamped to 1-6. Does NOT affect the ship half of an
+# implement->ship chain -- that stays on its build slot.
+# AP_SHIP_SLOTS=3
+
 # Minutes a usage/rate/session-limit auto-pause (as opposed to a real-bug or
 # manual pause) waits before clearing itself. 0 disables auto-resume entirely.
 # AP_LIMIT_COOLDOWN_MIN=60

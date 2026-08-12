@@ -136,7 +136,10 @@ team-visible.
   tier 4 claims it (`ship-pending` → `shipping`) and emits `action:ship`,
   which the orchestrator dispatches as `/ship-work --headless --no-merge`
   with no `/plan-issue` or `/implement-plan` step first — the plan is
-  already committed.
+  already committed. This `action:ship` claims the orchestrator's SHIP lane
+  (its own slot pool, `AP_SHIP_SLOTS`), not the BUILD lane `implement` uses —
+  see "Orchestrator guarantees" below for the port-pair mechanics, and
+  `autopilot/README.md`'s concurrency section for why the cap differs.
 - **External failures are re-queued, not dead-ended.** When an act's own
   stderr/stdout matches a signature that names a cause outside the plan or
   the code — a rate/usage/session limit trip, or the provider itself
@@ -224,11 +227,16 @@ The wrapper (`ap-cycle.sh`), not the skill, guarantees:
   appended to the invocation as literal prompt text, `--run-dir <path>` — the
   `dontAsk` profile is path-scoped, so the session usually cannot read
   `$AP_RUN_DIR` from its environment.
-- For `implement`/`ship` acts, the assigned build slot's port pair is
-  appended the same way: `--ports fe=<port>,be=<port>`. Under this flag,
-  bind exactly those two ports for the changed pair (never the human's
-  baseline 5173/8000) — see `implement-plan`'s headless section for the CORS
-  implication.
+- For an `implement` act, and for the trailing `ship` call of the SAME
+  implement→ship chain (still the build lane, same slot, both halves), the
+  assigned build slot's port pair is appended the same way: `--ports
+  fe=<port>,be=<port>`. For a STANDALONE `ship` act (a ship-only retry, tier
+  4 above), the ports instead come from the SHIP lane's own base — a
+  different, non-overlapping range, since ship-work runs no UI server and
+  these ports only isolate its local gates from a concurrently running build.
+  Either way, bind exactly the two ports given (never the human's baseline
+  5173/8000) — see `implement-plan`'s headless section for the CORS
+  implication, which only applies to the build-lane case.
 - The `building` → `shipping` inbox-label swap happens before the ship phase
   is invoked (see "State labels" above) and the "shipping: `<issue>`" phone
   ping fires at the same time — both wrapper-side, not skill-side, so they

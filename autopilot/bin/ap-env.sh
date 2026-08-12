@@ -76,3 +76,16 @@ export AP_BUILD_SLOTS
 # regardless of this value. 0 disables auto-resume entirely -- every pause
 # then waits for a human, same as before this feature existed.
 export AP_LIMIT_COOLDOWN_MIN="${AP_LIMIT_COOLDOWN_MIN:-60}"
+
+# Native-extension libraries this workspace does not have on the default loader
+# path. Without them `import numpy` dies with "libz.so.1: cannot open shared
+# object file", which cascades through qdrant_client -> grpc and makes the whole
+# backend unimportable: no pytest, no local API, no e2e. Two separate autopilot
+# runs each burned ~$5 rediscovering this and both misdiagnosed it as libstdc++.
+# Exported here so every act inherits it.
+_AP_ZLIB="$(echo /nix/store/*zlib*/lib | tr ' ' '\n' | while read -r d; do [ -e "$d/libz.so.1" ] && { echo "$d"; break; }; done)"
+_AP_GCCLIB="$(echo /nix/store/*gcc*-lib/lib | tr ' ' '\n' | while read -r d; do [ -e "$d/libstdc++.so.6" ] && { echo "$d"; break; }; done)"
+if [[ -n "${_AP_ZLIB:-}" || -n "${_AP_GCCLIB:-}" ]]; then
+  export LD_LIBRARY_PATH="${_AP_ZLIB:+$_AP_ZLIB:}${_AP_GCCLIB:+$_AP_GCCLIB:}${LD_LIBRARY_PATH:-}"
+fi
+unset _AP_ZLIB _AP_GCCLIB

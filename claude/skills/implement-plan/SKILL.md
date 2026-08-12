@@ -558,6 +558,32 @@ work unit is blocked, name what remains and say that `/ship-work` should wait
 until it is resolved. A run that ends without pointing at the next step leaves the
 human guessing whether the work is shippable.
 
+### Local environment facts for this workspace (autopilot and interactive)
+
+These cost two runs ~$10 to rediscover and were both misdiagnosed; do not
+re-derive them.
+
+- **Databases are not on `localhost`.** The docker daemon belongs to the host,
+  so published container ports are reachable via `host.docker.internal` (the
+  bridge gateway), never `localhost`. The populated stack is
+  **mongo `host.docker.internal:27018`** and **redis `:6380`** — the plain
+  `mongodb`/`redis` containers on 27017/6379 hold an EMPTY `journeyai` db.
+  `backend/.env.local` points at the right ones as of 2026-08-12.
+- **Native libs need `LD_LIBRARY_PATH`.** `import numpy` fails with
+  `libz.so.1: cannot open shared object file` (it is zlib, NOT libstdc++),
+  which cascades through `qdrant_client` → `grpc` and makes `app.main`
+  unimportable. `autopilot/bin/ap-env.sh` exports the discovered zlib and
+  gcc-lib paths, so autopilot acts already have it.
+- **Export the env file, don't just rely on it.** `OPENAI_API_KEY` is read from
+  the raw environment rather than pydantic settings, so a local run needs
+  `set -a; . ./.env.local; set +a` — and the file must be LF, not CRLF.
+- **Verified working recipe** (from the backend dir): export the env file,
+  ensure `LD_LIBRARY_PATH`, then `poetry run pytest <paths> -q --no-cov`. A
+  single-file run otherwise trips the repo-wide 40% coverage gate, which is the
+  threshold talking, not your change.
+- **Playwright is available** — chromium is installed and `mcp__playwright__*`
+  is allowed in the autopilot profile. Browser QA is expected, not optional.
+
 ## Headless mode (`--headless`)
 
 Shared vocabulary, `status.json` shape, the inbox contract, and the

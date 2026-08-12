@@ -46,6 +46,11 @@
           # scripts/install-autopilot.sh.
           inherit (pkgs) tmux;
           inherit (pkgs) supercronic;
+
+          # JSON workhorse for the autopilot scripts and any gh pipelines the
+          # headless skills compose; the scripts fall back to python3 without
+          # it, but jq is the primary branch.
+          inherit (pkgs) jq;
         };
 
         extras = builtins.attrValues extraAttrs;

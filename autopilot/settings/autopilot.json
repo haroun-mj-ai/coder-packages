@@ -33,6 +33,7 @@
       "Bash(grep *)",
       "Bash(find *)",
       "Bash(mkdir *)",
+      "Bash(jq *)",
       "Bash(roborev *)",
       "Read",
       "Edit",

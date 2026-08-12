@@ -509,15 +509,27 @@ run_claude() {
   local rc=0
   local out
   local stderr_file="$AP_RUN_DIR/$phase.stderr"
+  local adhoc_status="$AP_HOME/runs/adhoc/status.json"
   # Remove any status.json left behind by a prior phase in this same run
   # (e.g. implement's DONE) so a crash that skips this phase's own write is
   # correctly seen as FAILED for THIS phase, not a stale leftover status.
-  rm -f "$status_file"
+  # Same for a stale adhoc fallback from an earlier run.
+  rm -f "$status_file" "$adhoc_status"
+  # The dontAsk profile is path-scoped to the project, so the session cannot
+  # read $AP_RUN_DIR from its environment; --run-dir hands it the path as
+  # literal prompt text (see autopilot-protocol.md).
+  set -- "$1 --run-dir $AP_RUN_DIR" "${@:2}"
   out="$(claude -p "$@" --settings "$SETTINGS_PATH" --output-format json 2>"$stderr_file")" || rc=$?
   cat "$stderr_file" >>"$AP_HOME/logs/cycle.log" 2>/dev/null || true
   local cost session_id st
   cost="$(json_field "$out" ".total_cost_usd")"
   session_id="$(json_field "$out" ".session_id")"
+  if [[ ! -f "$status_file" && -f "$adhoc_status" ]]; then
+    # Session fell back to the documented adhoc path (could not resolve the
+    # run dir). Freshly cleared above, so if present it is this phase's own.
+    mv "$adhoc_status" "$status_file" 2>/dev/null || cp "$adhoc_status" "$status_file"
+    log "act: adopted adhoc status.json for phase=$phase"
+  fi
   if [[ -f "$status_file" ]]; then
     st="$(json_field "$(cat "$status_file")" ".status")"
   fi

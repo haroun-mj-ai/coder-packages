@@ -43,9 +43,13 @@ is denied unless every segment is allowed**. So:
 
 ## `status.json`
 
-Written at the **end of every headless run**, success or not, to
-`$AP_RUN_DIR/status.json`. If `AP_RUN_DIR` is unset, fall back to
-`~/.autopilot/runs/adhoc/status.json` (create the directory if needed).
+Written at the **end of every headless run**, success or not. Location, in
+order of authority: the directory named by the `--run-dir <path>` argument
+the orchestrator appends to every invocation (use this — the dontAsk profile
+is path-scoped, so the session usually cannot read `$AP_RUN_DIR` from its
+environment); else `$AP_RUN_DIR` if readable; else the fallback
+`~/.autopilot/runs/adhoc/status.json` (create the directory if needed — the
+orchestrator also checks there).
 Exact shape, every key present on every write:
 
 ```json

@@ -96,9 +96,16 @@ if [[ -z "$exit_code" && "${AP_TEST_ACT_MODE:-normal}" == "exit_nonzero" ]]; the
   exit_code=1
 fi
 
+status_dest="$AP_RUN_DIR/status.json"
+if [[ "${AP_TEST_STATUS_TO_ADHOC:-}" == "1" ]]; then
+  # Simulate a session that could not resolve the run dir and used the
+  # documented adhoc fallback instead.
+  mkdir -p "$AP_HOME/runs/adhoc"
+  status_dest="$AP_HOME/runs/adhoc/status.json"
+fi
 if [[ "$skip_status" != "1" && -n "${AP_RUN_DIR:-}" ]]; then
   mkdir -p "$AP_RUN_DIR"
-  python3 - "$status" "${AP_TEST_QUESTION:-what should I do}" "${AP_TEST_PR_URL:-https://github.com/x/y/pull/1}" <<'PY' >"$AP_RUN_DIR/status.json"
+  python3 - "$status" "${AP_TEST_QUESTION:-what should I do}" "${AP_TEST_PR_URL:-https://github.com/x/y/pull/1}" <<'PY' >"$status_dest"
 import json, sys
 status, question, pr_url = sys.argv[1:4]
 d = {"status": status}
@@ -184,7 +191,7 @@ AP_TEST_VARS=(
   AP_TEST_SHIP_STATUS AP_TEST_ACT_MODE AP_TEST_QUESTION AP_TEST_PR_URL
   AP_TEST_ACT_STDERR
   AP_TEST_SKIP_STATUS_IMPLEMENT AP_TEST_SKIP_STATUS_SHIP AP_TEST_SKIP_STATUS_PLAN
-  AP_TEST_SKIP_STATUS_REPLAN
+  AP_TEST_SKIP_STATUS_REPLAN AP_TEST_STATUS_TO_ADHOC
   AP_TEST_EXIT_CODE_IMPLEMENT AP_TEST_EXIT_CODE_SHIP AP_TEST_EXIT_CODE_PLAN
   AP_TEST_EXIT_CODE_REPLAN
 )
@@ -301,6 +308,7 @@ if [[ -f "$act_args" ]]; then
   assert "case4: act call has --settings" bash -c "grep -qx -- '--settings' '$act_args'"
   assert "case4: act call settings path is absolute autopilot.json" bash -c "grep -q '/autopilot/settings/autopilot.json$' '$act_args'"
   assert "case4: act call prompt has --headless" bash -c "grep -q -- '--headless' '$act_args'"
+  assert "case4: act call prompt has --run-dir with the run path" bash -c "grep -q -- '--run-dir /' '$act_args'"
   assert "case4: act call prompt targets plan-issue ENG-4" bash -c "grep -q 'plan-issue ENG-4' '$act_args'"
 else
   fail "case4: act call has --settings (no 2.args file)"
@@ -766,6 +774,20 @@ assert d.get('inbox', {}).get('303') is None, d
 unset AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_COMMENT_303 AP_TEST_POLL_CRASH
 
 # =============================================================================
+
+# =============================================================================
+# Case 23: session writes status.json to the adhoc fallback (could not resolve
+# the run dir) -> wrapper adopts it instead of declaring FAILED
+# =============================================================================
+setup_case
+rc="$(AP_TEST_POLL_ACTION=plan AP_TEST_POLL_ISSUE=ENG-23 AP_TEST_STATUS_TO_ADHOC=1 run_case)"
+assert "case23: exit 0" [ "$rc" -eq 0 ]
+assert "case23: ledger plan row adopted DONE from adhoc" bash -c \
+  "cat '$CASE_AP_HOME/runs/'*.jsonl | python3 -c 'import json,sys; rows=[json.loads(l) for l in sys.stdin if l.strip()]; sys.exit(0 if any(r[\"phase\"]==\"plan\" and r[\"status\"]==\"DONE\" for r in rows) else 1)'"
+assert "case23: no failed-label gh call" bash -c \
+  "! grep -rl 'add-label failed' '$CASE_STUB_DIR/gh_calls' >/dev/null 2>&1"
+assert "case23: adhoc file consumed (moved, not left stale)" bash -c \
+  "[ ! -f '$CASE_AP_HOME/runs/adhoc/status.json' ]"
 
 if [[ "$FAILURES" -eq 0 ]]; then
   echo "ALL PASS"

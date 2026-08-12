@@ -91,7 +91,7 @@ team-visible.
   context, not machine-parsed.
 - **`Queued` label = new delegation.** An open inbox issue carrying the
   `Queued` label (case-insensitive match on the label name) and none of the
-  seven state labels below is unclaimed work waiting for `autopilot-poll` to
+  eight state labels below is unclaimed work waiting for `autopilot-poll` to
   pick it up. An open issue WITHOUT `Queued` is a **draft** — the pipeline
   ignores it entirely, whether or not it carries a state label. On claiming
   it, the poll removes `Queued` and adds the target state label
@@ -117,7 +117,7 @@ team-visible.
 - **State labels** — exactly one held at a time, swapped rather than
   accumulated:
   `planning`, `plan-review`, `building`, `shipping`, `ready-to-test`,
-  `needs-input`, `failed`. State machine:
+  `needs-input`, `failed`, `ship-pending`. State machine:
   `planning → plan-review → building → shipping → ready-to-test`, with
   `needs-input`/`failed` reachable from any state. `shipping` is the odd one
   out: it is set by the **orchestrator** (`ap-cycle.sh`), not by a skill,
@@ -129,6 +129,40 @@ team-visible.
   ```bash
   gh issue edit <n> --repo "$AP_INBOX_REPO" --add-label <new> --remove-label <old>
   ```
+  `ship-pending` means implement finished and committed, ship still owed —
+  reachable from `shipping` (the orchestrator sets it when a ship phase
+  fails for an external cause, see "External failures are re-queued, not
+  dead-ended" below) or by a human relabelling by hand. `autopilot-poll`'s
+  tier 4 claims it (`ship-pending` → `shipping`) and emits `action:ship`,
+  which the orchestrator dispatches as `/ship-work --headless --no-merge`
+  with no `/plan-issue` or `/implement-plan` step first — the plan is
+  already committed.
+- **External failures are re-queued, not dead-ended.** When an act's own
+  stderr/stdout matches a signature that names a cause outside the plan or
+  the code — a rate/usage/session limit trip, or the provider itself
+  erroring (`overloaded`, `529`, `API Error`) — the orchestrator does not
+  label the inbox issue `failed`. Instead it restores the state the failed
+  phase started from, so the same work is picked up again once things clear:
+  `plan`/`replan` → `Queued`, `implement` → `plan-review`,
+  `ship` → `ship-pending`. It comments on the inbox issue naming the
+  external cause and the matched signature line, and pings with a title
+  like `requeued after external failure: <issue>` rather than the usual
+  `FAILED` wording. This is entirely orchestrator-side reconciliation, not a
+  skill behavior — no skill needs to detect or act on it. The consecutive-
+  failure counter (and the usage-limit auto-pause it can trigger) still
+  increments for an external failure exactly as it does for any other one —
+  that backoff is what stops a re-queue from thrashing.
+- **Every comment the pipeline writes is marked.** The inbox is operated with
+  the owner's own `gh` credentials, so a pipeline comment and a human comment
+  have the same author — the first line is the only distinguishing signal, and
+  `autopilot-poll` relies on it to decide whether new owner input exists. Every
+  comment written by any headless skill or by the orchestrator MUST begin with
+  one of: `Plan file: <abs path>` (a plan post), `Phase: plan|implement|ship`
+  (a `NEEDS_HUMAN` question or a phase-scoped informational note), or
+  `Autopilot:` (orchestrator-written failure/re-queue notices). An unmarked
+  comment is read as the owner speaking and starts an unbounded re-plan loop:
+  each re-plan posts another comment that triggers the next. Do not post an
+  unmarked "FYI" — there is no such thing as a free comment here.
 - **Plan content:** the full plan markdown is the issue **body** on create
   (`gh issue create --body-file`), or a new **comment** on update
   (`gh issue comment --body-file`). Never truncate it. The post MUST begin

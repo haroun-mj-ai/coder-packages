@@ -165,6 +165,7 @@ if [[ "${1:-}" == "issue" && "${2:-}" == "list" ]]; then
   case "$label" in
     plan-review) echo "${AP_TEST_GH_ISSUES_PLAN_REVIEW:-[]}" ;;
     needs-input) echo "${AP_TEST_GH_ISSUES_NEEDS_INPUT:-[]}" ;;
+    ship-pending) echo "${AP_TEST_GH_ISSUES_SHIP_PENDING:-[]}" ;;
     *) echo "[]" ;;
   esac
   exit 0
@@ -225,8 +226,8 @@ setup_case() {
   # scan-state -> stale -> wake), matching the pre-gate behavior every
   # pre-existing case below already assumes (claude poll always runs).
   unset AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_ISSUES_NEEDS_INPUT \
-    AP_TEST_GH_ISSUES_ALL_OPEN AP_TEST_POLL_CRASH AP_FULL_POLL_INTERVAL_MIN \
-    AP_BUILD_SLOTS AP_LIMIT_COOLDOWN_MIN
+    AP_TEST_GH_ISSUES_ALL_OPEN AP_TEST_GH_ISSUES_SHIP_PENDING AP_TEST_POLL_CRASH \
+    AP_FULL_POLL_INTERVAL_MIN AP_BUILD_SLOTS AP_LIMIT_COOLDOWN_MIN
 }
 
 run_case() {
@@ -1346,6 +1347,189 @@ assert "ship-label(b): exit 0" [ "$rc" -eq 0 ]
 assert "ship-label(b): claude never called (shipping excludes it from intake)" \
   [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 0 ]
 unset AP_TEST_GH_ISSUES_ALL_OPEN
+
+# =============================================================================
+# External-cause failures (Change 1): a FAILED act whose stderr matches the
+# EXTERNAL signature is re-queued to the state its phase started from instead
+# of dead-ending at `failed` -- see ap-cycle.sh's FAILED reconcile branch.
+# =============================================================================
+
+# --- (a) implement act, session-limit stderr -> plan-review (not failed),
+# notify title says requeued.
+setup_case
+rc="$(AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-EXT-A AP_TEST_POLL_PLANPATH=docs/plans/x.md \
+  AP_TEST_POLL_INBOX=601 AP_TEST_ACT_STATUS=FAILED \
+  AP_TEST_ACT_STDERR="You've hit your session limit" run_case)"
+assert "external(a): exit 0" [ "$rc" -eq 0 ]
+assert "external(a): gh issue edit adds plan-review" bash -c \
+  "grep -rl 'plan-review' '$CASE_STUB_DIR/gh_calls' >/dev/null"
+assert "external(a): gh issue edit removes building" bash -c \
+  "grep -rl '^building\$' '$CASE_STUB_DIR/gh_calls' >/dev/null"
+assert "external(a): NOT labeled failed" bash -c \
+  "! grep -rl '^failed\$' '$CASE_STUB_DIR/gh_calls' >/dev/null 2>&1"
+assert "external(a): notify title says requeued after external failure" bash -c \
+  "grep -rl '^requeued after external failure: ENG-EXT-A\$' '$CASE_STUB_DIR/notify_calls' >/dev/null"
+assert "external(a): notify does NOT use the old FAILED title" bash -c \
+  "! grep -rl '^autopilot FAILED' '$CASE_STUB_DIR/notify_calls' >/dev/null 2>&1"
+assert "external(a): inbox comment includes the matched signature line" bash -c \
+  "grep -rl 'session limit' '$CASE_STUB_DIR/gh_calls' >/dev/null"
+
+# --- (b) same, for a plan act -> Queued.
+setup_case
+rc="$(AP_TEST_POLL_ACTION=plan AP_TEST_POLL_ISSUE=ENG-EXT-B AP_TEST_POLL_INBOX=602 \
+  AP_TEST_ACT_STATUS=FAILED AP_TEST_ACT_STDERR="You've hit your session limit" run_case)"
+assert "external(b): exit 0" [ "$rc" -eq 0 ]
+assert "external(b): gh issue edit adds Queued" bash -c \
+  "grep -rl '^Queued\$' '$CASE_STUB_DIR/gh_calls' >/dev/null"
+assert "external(b): gh issue edit removes planning" bash -c \
+  "grep -rl '^planning\$' '$CASE_STUB_DIR/gh_calls' >/dev/null"
+assert "external(b): NOT labeled failed" bash -c \
+  "! grep -rl '^failed\$' '$CASE_STUB_DIR/gh_calls' >/dev/null 2>&1"
+assert "external(b): notify title says requeued" bash -c \
+  "grep -rl '^requeued after external failure: ENG-EXT-B\$' '$CASE_STUB_DIR/notify_calls' >/dev/null"
+
+# --- (c) same, for a standalone ship act -> ship-pending.
+setup_case
+rc="$(AP_TEST_POLL_ACTION=ship AP_TEST_POLL_ISSUE=ENG-EXT-C AP_TEST_POLL_PLANPATH=docs/plans/x.md \
+  AP_TEST_POLL_INBOX=603 AP_TEST_ACT_STATUS=FAILED \
+  AP_TEST_ACT_STDERR="You've hit your session limit" run_case)"
+assert "external(c): exit 0" [ "$rc" -eq 0 ]
+assert "external(c): gh issue edit adds ship-pending" bash -c \
+  "grep -rl '^ship-pending\$' '$CASE_STUB_DIR/gh_calls' >/dev/null"
+assert "external(c): gh issue edit removes shipping" bash -c \
+  "grep -rl '^shipping\$' '$CASE_STUB_DIR/gh_calls' >/dev/null"
+assert "external(c): NOT labeled failed" bash -c \
+  "! grep -rl '^failed\$' '$CASE_STUB_DIR/gh_calls' >/dev/null 2>&1"
+assert "external(c): notify title says requeued" bash -c \
+  "grep -rl '^requeued after external failure: ENG-EXT-C\$' '$CASE_STUB_DIR/notify_calls' >/dev/null"
+
+# --- (d) regression: a non-external failure still gets `failed` + the old
+# FAILED notify title, no requeue.
+setup_case
+rc="$(AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-EXT-D AP_TEST_POLL_PLANPATH=docs/plans/x.md \
+  AP_TEST_POLL_INBOX=604 AP_TEST_ACT_STATUS=FAILED \
+  AP_TEST_ACT_STDERR="assertion error: unexpected None" run_case)"
+assert "external(d): exit 0" [ "$rc" -eq 0 ]
+assert "external(d): gh issue edit adds failed" bash -c \
+  "grep -rl '^failed\$' '$CASE_STUB_DIR/gh_calls' >/dev/null"
+assert "external(d): notify title is the old FAILED wording" bash -c \
+  "grep -rl '^autopilot FAILED: ENG-EXT-D\$' '$CASE_STUB_DIR/notify_calls' >/dev/null"
+assert "external(d): notify title does NOT say requeued" bash -c \
+  "! grep -rl 'requeued' '$CASE_STUB_DIR/notify_calls' >/dev/null 2>&1"
+
+# =============================================================================
+# Ship-only action (Change 2): poll can emit action=ship for a ship-pending
+# issue; dispatched as /ship-work --headless --no-merge --ports, in a build
+# slot, same slot mechanics as implement.
+# =============================================================================
+
+# --- (e) action=ship dispatches /ship-work with --no-merge and --ports, in a
+# build slot (slot 2, since slot 1 is held).
+setup_case
+hold_lane_lock "$CASE_AP_HOME/lock.build.1" 3; ship_slot1_holder="$LANE_HOLDER_PID"
+sleep 0.4
+rc="$(AP_BUILD_SLOTS=2 AP_TEST_POLL_ACTION=ship AP_TEST_POLL_ISSUE=ENG-SHIP-ONLY \
+  AP_TEST_POLL_PLANPATH=docs/plans/x.md AP_TEST_SHIP_STATUS=DONE run_case)"
+wait "$ship_slot1_holder" 2>/dev/null
+assert "shipOnly(e): exit 0" [ "$rc" -eq 0 ]
+act_args="$CASE_STUB_DIR/claude_calls/2.args"
+assert "shipOnly(e): act call recorded" [ -f "$act_args" ]
+assert "shipOnly(e): dispatches /ship-work" bash -c \
+  "[ -f '$act_args' ] && grep -q 'ship-work' '$act_args'"
+assert "shipOnly(e): includes --no-merge" bash -c \
+  "[ -f '$act_args' ] && grep -q -- '--no-merge' '$act_args'"
+assert "shipOnly(e): includes --ports for slot 2 (slot 1 held)" bash -c \
+  "[ -f '$act_args' ] && grep -q -- '--ports fe=5175,be=8002' '$act_args'"
+assert "shipOnly(e): ledger has a ship phase row" bash -c \
+  "python3 -c \"
+import json
+rows = [json.loads(l) for l in open('$(today_ledger)') if l.strip()]
+assert any(r['phase'] == 'ship' for r in rows), rows
+\""
+
+# =============================================================================
+# Ship-pending wake + intake exclusion (Change 2).
+# =============================================================================
+
+# --- (f) a ship-pending issue wakes the scan (poll runs); a non-actionable
+# poll (action:none, e.g. it's not the oldest item) commits it as seen so it
+# stops re-waking every minute -- same pattern as the new-intake leg's case20.
+setup_case
+now_ts="$(date -u +%FT%TZ)"
+printf '{"inbox":{},"new_intake_seen":[],"ship_pending_seen":[],"last_poll_ts":"%s"}' "$now_ts" >"$CASE_AP_HOME/scan-state.json"
+export AP_TEST_GH_ISSUES_SHIP_PENDING='[{"number":701}]'
+rc="$(AP_TEST_POLL_ACTION=none run_case)"
+assert "shipPending(f): wake -> exit 0" [ "$rc" -eq 0 ]
+assert "shipPending(f): wake -> claude called (poll woke)" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 1 ]
+assert "shipPending(f): scan-state records 701 as seen" bash -c \
+  "python3 -c \"import json; d=json.load(open('$CASE_AP_HOME/scan-state.json')); assert '701' in d.get('ship_pending_seen', []), d\""
+rc2="$(AP_TEST_POLL_ACTION=none run_case)"
+assert "shipPending(f): second identical cycle -> claude NOT called again" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 1 ]
+
+setup_case
+now_ts="$(date -u +%FT%TZ)"
+printf '{"inbox":{},"new_intake_seen":[],"ship_pending_seen":[],"last_poll_ts":"%s"}' "$now_ts" >"$CASE_AP_HOME/scan-state.json"
+export AP_TEST_GH_ISSUES_SHIP_PENDING='[{"number":702}]'
+hold_lane_lock "$CASE_AP_HOME/lock.build.1" 3; sp_build_holder="$LANE_HOLDER_PID"
+sleep 0.4
+rc="$(AP_BUILD_SLOTS=1 AP_TEST_POLL_ACTION=none run_case)"
+wait "$sp_build_holder" 2>/dev/null
+assert "shipPending(f): build-lane-full -> exit 0" [ "$rc" -eq 0 ]
+assert "shipPending(f): build-lane-full -> claude NOT called" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 0 ]
+assert "shipPending(f): build-lane-full -> NOT marked seen (re-fires once free)" bash -c \
+  "[ ! -f '$CASE_AP_HOME/scan-state.json' ] || python3 -c \"
+import json
+with open('$CASE_AP_HOME/scan-state.json') as f:
+    d = json.load(f)
+assert '702' not in d.get('ship_pending_seen', []), d
+\""
+unset AP_TEST_GH_ISSUES_SHIP_PENDING
+
+# --- (g) a ship-pending issue is not treated as new intake even with a
+# Queued label.
+setup_case
+now_ts="$(date -u +%FT%TZ)"
+printf '{"inbox":{},"new_intake_seen":[],"ship_pending_seen":[],"last_poll_ts":"%s"}' "$now_ts" >"$CASE_AP_HOME/scan-state.json"
+export AP_TEST_GH_ISSUES_ALL_OPEN='[{"number":703,"labels":[{"name":"Queued"},{"name":"ship-pending"}]}]'
+rc="$(AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-703 run_case)"
+assert "shipPending(g): exit 0" [ "$rc" -eq 0 ]
+assert "shipPending(g): claude never called (ship-pending excludes it from intake)" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 0 ]
+unset AP_TEST_GH_ISSUES_ALL_OPEN
+
+# =============================================================================
+# Case: marker discipline -- an agent-authored comment must never be read as
+# owner input. The pipeline comments with the owner's own gh credentials, so
+# author.login cannot distinguish them; the first-line marker is the only
+# defence. Regression for the live loop on ENG-1137, where the wrapper's own
+# unmarked failure comment ("STDERR (last 20 lines):") was read as feedback and
+# re-triggered a re-plan whose comment re-triggered the next.
+# =============================================================================
+for marker in "Plan file: /x/p.md" "Phase: plan -- re-plan complete (FYI)" "Autopilot: run failed."; do
+  setup_case
+  now_ts="$(date -u +%FT%TZ)"
+  printf '{"inbox":{},"new_intake_seen":[],"last_poll_ts":"%s"}' "$now_ts" >"$CASE_AP_HOME/scan-state.json"
+  export AP_TEST_GH_ISSUES_PLAN_REVIEW='[{"number":770}]'
+  export AP_TEST_GH_COMMENT_770="[{\"id\":900,\"user\":{\"login\":\"haroun\"},\"body\":\"$marker\"}]"
+  rc="$(AP_TEST_POLL_ACTION=none run_case)"
+  assert "marker(${marker:0:11}): exit 0" [ "$rc" -eq 0 ]
+  assert "marker(${marker:0:11}): agent comment did NOT wake the poll" \
+    [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 0 ]
+  unset AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_COMMENT_770
+done
+# Control: a genuinely unmarked human comment MUST still wake it.
+setup_case
+now_ts="$(date -u +%FT%TZ)"
+printf '{"inbox":{},"new_intake_seen":[],"last_poll_ts":"%s"}' "$now_ts" >"$CASE_AP_HOME/scan-state.json"
+export AP_TEST_GH_ISSUES_PLAN_REVIEW='[{"number":771}]'
+export AP_TEST_GH_COMMENT_771='[{"id":901,"user":{"login":"haroun"},"body":"use a different table name"}]'
+rc="$(AP_TEST_POLL_ACTION=none run_case)"
+assert "marker(control): a real owner comment still wakes the poll" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 1 ]
+unset AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_COMMENT_771
 
 if [[ "$FAILURES" -eq 0 ]]; then
   echo "ALL PASS"

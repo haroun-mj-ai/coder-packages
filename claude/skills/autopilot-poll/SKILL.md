@@ -57,14 +57,14 @@ before the scan — they gate which tiers you're even allowed to act on.
   (e.g. `--busy-lanes build`, `--busy-lanes build,plan`), omitted entirely
   when no lane is busy. A lane listed here is owned by a still-running act in
   a different cycle. **Skip that lane's tiers entirely for this invocation:
-  do not emit an action for it, and do not touch its labels.** Tier 1
-  (`go`/auto-approve → `implement`) is the BUILD lane. Tiers 2, 3, and 4
-  (feedback replan, needs-input answers, Queued intake → `replan`/`plan`)
-  are the PLAN lane. If every candidate item you find belongs to a busy
-  lane, emit `{"action":"none"}`. The wrapper deliberately does not mark a
-  busy-lane signal as "seen" so it re-fires once the lane frees — you must
-  not consume it either: no label swap, no comment, no claim for an item
-  whose lane you're skipping.
+  do not emit an action for it, and do not touch its labels.** Tiers 1 and 4
+  (`go`/auto-approve → `implement`; `ship-pending` → `ship`) are the BUILD
+  lane. Tiers 2, 3, and 5 (feedback replan, needs-input answers, Queued
+  intake → `replan`/`plan`) are the PLAN lane. If every candidate item you
+  find belongs to a busy lane, emit `{"action":"none"}`. The wrapper
+  deliberately does not mark a busy-lane signal as "seen" so it re-fires once
+  the lane frees — you must not consume it either: no label swap, no
+  comment, no claim for an item whose lane you're skipping.
 - `--auto-approve` — present when the global env flag `AP_AUTO_APPROVE=1` is
   set. One of three independent auto-approve switches; see tier 1 below.
 
@@ -74,6 +74,26 @@ Stop at the first hit. Process **oldest-first** within a tier (`gh issue
 list --repo "$AP_INBOX_REPO" ... --json number,title,labels,createdAt`,
 sort ascending). Touch **at most one** actionable item per invocation — one
 poll, one claim, one JSON object.
+
+## Agent-authored comments are never owner input
+
+The pipeline comments with the owner's own `gh` credentials, so `author.login`
+is identical for a pipeline comment and a human one — it is **not** a usable
+signal. The only thing that distinguishes them is a marker on the comment's
+first line. A comment whose first line starts with any of:
+
+- `Plan file:` — a plan post (also the machine-readable `planPath` source)
+- `Phase:` — a `NEEDS_HUMAN` question, or a phase-scoped informational post
+- `Autopilot:` — anything the orchestrator wrote (failures, re-queues)
+
+is **agent-authored**: ignore it completely when deciding whether new owner
+input exists (tiers 1, 2 and 3). Treating one as feedback starts an unbounded
+re-plan loop — each re-plan posts a comment that triggers the next. This was
+observed live on ENG-1137: two re-plans in seven minutes off the wrapper's own
+unmarked failure comment.
+
+Corollary when YOU post: any comment you write must itself begin with one of
+those markers, or the next cycle will read it as the owner talking.
 
 1. **`plan-review` inbox issues that are approved** → approval. Skip this
    tier entirely if `build` is in `--busy-lanes`.
@@ -130,8 +150,25 @@ poll, one claim, one JSON object.
      - Missing `Phase:` line (legacy or malformed comment) → treat as
        `Phase: plan`.
 
-4. **Open inbox issues carrying the `Queued` label** (case-insensitive) **and
-   none of the seven state labels** (including `shipping` — the orchestrator
+4. **Open inbox issues carrying the `ship-pending` label** (implement
+   finished and committed, ship still owed — either a prior ship phase
+   failed for an external cause and got re-queued here by the wrapper, or a
+   human relabelled by hand) → a ship-only retry, oldest first. Skip this
+   tier entirely if `build` is in `--busy-lanes`.
+   - Extract the Linear id from the issue title (`ENG-<id>`), exactly as
+     tier 5 does below.
+   - Extract `planPath` the same way tier 1 does: the newest `Plan file:
+     <absolute path>` line on the issue (body or comments), falling back to
+     listing `docs/plans/*<eng-id-lowercase>*.md` in the root worktrees and
+     the main checkout, newest first, if that line is missing or stale. If
+     neither yields a path that exists on disk, do not emit `ship`: swap the
+     label to `needs-input`, comment that the plan path could not be
+     resolved, and continue the scan.
+   - Swap the inbox label `ship-pending` → `shipping` **before** emitting.
+   - Emit `{"action":"ship","issue":"ENG-<id>","planPath":"<path>","inboxIssue":<n>}`.
+
+5. **Open inbox issues carrying the `Queued` label** (case-insensitive) **and
+   none of the eight state labels** (including `shipping` — the orchestrator
    sets that one, not this skill, but a stale `Queued` label must not
    re-enter intake while it's set) → a new owner delegation, oldest first.
    Skip this tier entirely if `plan` is in `--busy-lanes`. An open issue
@@ -154,7 +191,7 @@ poll, one claim, one JSON object.
      as `"feedback":"<note text>"` in the same emit so `/plan-issue` sees it
      as context.
 
-5. **Otherwise** → emit `{"action":"none"}`.
+6. **Otherwise** → emit `{"action":"none"}`.
 
 ## Stale-claim sweep
 

@@ -58,11 +58,12 @@ items** — except Spend and Health, which are always printed, so a fully
 quiet day still reports something.
 
 - **Queued** — `inbox` entries carrying the `Queued` label (case-insensitive)
-  and none of the seven state labels
+  and none of the eight state labels
   (`planning`/`plan-review`/`building`/`shipping`/`ready-to-test`/
-  `needs-input`/`failed`): one line each, issue title + URL. These are delegations the
-  owner created and labeled since the last cycle picked them up; the section
-  clears once `autopilot-poll` claims them into `planning`.
+  `needs-input`/`failed`/`ship-pending`): one line each, issue title + URL.
+  These are delegations the owner created and labeled since the last cycle
+  picked them up; the section clears once `autopilot-poll` claims them into
+  `planning`.
   - **Drafts (unlabeled — add the Queued label to delegate)** — a separate
     one-liner, not a per-item list: `inbox` entries with no state label AND
     no `Queued` label are drafts the pipeline ignores entirely. Count them
@@ -84,6 +85,10 @@ quiet day still reports something.
   CI) — a build already implemented and QA'd, not yet a PR to review. The
   input has no started-at time (that lives only in the ledger's `ship` rows,
   which this section does not cross-reference), so just list them.
+- **Ship pending** — `inbox` entries labeled `ship-pending`: one line each,
+  issue title + URL. These implemented and committed but a ship phase either
+  failed for an external cause and got re-queued here, or a human relabelled
+  by hand — the next cycle retries just the ship, not the whole build.
 - **Ready to test** — `inbox` entries labeled `ready-to-test`: one line each,
   issue title + URL. The input has no PR links or relaunch commands (those
   live in the inbox issue's own comments, which this skill cannot read) — say

@@ -109,15 +109,32 @@ Linear polling): intake happens by opening a new inbox issue titled with the
 Linear id (e.g. `ENG-1234`) from the GitHub mobile app to delegate work, or
 by commenting on an existing `plan-review` / `needs-input` inbox issue.
 Concretely, the gate wakes the poll when it finds: an open inbox issue with
-none of the seven state labels (`planning`/`plan-review`/`building`/
-`shipping`/`ready-to-test`/`needs-input`/`failed`) — a fresh delegation; an unseen human
-comment (not one of autopilot's own `Plan file:` / `Phase:`-stamped posts) on
-a `plan-review` or `needs-input` inbox issue; or — as pure insurance against
-a misclassified comment or a crash-stranded claim, not a queue-pickup
-mechanism — more than `AP_FULL_POLL_INTERVAL_MIN` minutes (default `360`,
-i.e. 6h; `0` disables this leg entirely) since the last poll. The
-gate is deliberately biased toward waking: a wrong "maybe" costs one idle
-haiku poll, which is what the old `*/20` cadence spent on every single fire.
+none of the eight state labels (`planning`/`plan-review`/`building`/
+`shipping`/`ready-to-test`/`needs-input`/`failed`/`ship-pending`) — a fresh
+delegation; an unseen human comment (not one of autopilot's own `Plan file:`
+/ `Phase:`-stamped posts) on a `plan-review` or `needs-input` inbox issue; an
+open inbox issue labeled `ship-pending` (implement finished and committed,
+ship still owed — see "Ship-only retry" below); or — as pure insurance
+against a misclassified comment or a crash-stranded claim, not a
+queue-pickup mechanism — more than `AP_FULL_POLL_INTERVAL_MIN` minutes
+(default `360`, i.e. 6h; `0` disables this leg entirely) since the last
+poll. The gate is deliberately biased toward waking: a wrong "maybe" costs
+one idle haiku poll, which is what the old `*/20` cadence spent on every
+single fire.
+
+### Ship-only retry
+
+Sometimes `implement` succeeds — the code is committed — and only the ship
+phase fails (an external cause such as a session/rate limit trip, or a hard
+CI stop). Re-running the whole `implement → ship` chain would be wasteful and
+risk re-doing already-good work, so the pipeline retries just the ship: the
+inbox label `ship-pending` means "implement committed, ship still owed" —
+set by the orchestrator when a ship phase fails for an external cause (see
+"Two consecutive failures" below), or reachable by relabelling an issue by
+hand. The next cycle claims it (`ship-pending` → `shipping`) and dispatches
+`/ship-work --headless --no-merge` directly, with no plan or implement step
+first. It claims a build slot, same as `implement` — `ship-work` may run
+gates/servers.
 
 ## Concurrent builds
 
@@ -164,20 +181,36 @@ before every acting cycle.
   and the denial string lands both in the inbox issue's comment and in the
   day's ledger line. This is the expected tightening loop — extend the allow
   list in `autopilot/settings/autopilot.json` once you've seen what was
-  denied, rather than pre-approving broadly up front.
+  denied, rather than pre-approving broadly up front. `ship-work` can also
+  retry a flaky CI job once, per its own retry budget, now that `gh run *`
+  (`list`/`view`/`rerun`/`watch`) is on the allow list — no more stopping to
+  ask a human to re-run a hung Actions job by hand.
 - **A claim looks stuck** (inbox issue stuck at `planning`/`building`): the
   stale-claim sweep flags anything with no ledger entry in 3 hours and no
   held lock as `failed`, with a comment. This covers both a workspace restart
   mid-run and a legitimate crash.
+- **A failure was caused by something outside the plan/code** (a
+  rate/usage/session limit trip, or the provider itself erroring —
+  `overloaded`, `529`, `API Error`): the orchestrator does not dead-end this
+  at `failed`. It restores the state the failed phase started from
+  (`plan`/`replan` → `Queued`, `implement` → `plan-review`, `ship` →
+  `ship-pending`) and comments on the inbox issue naming the matched
+  signature, so the next cycle picks the same work back up once things
+  clear. The notify title says `requeued after external failure: <issue>`
+  instead of `FAILED`. This still counts toward the two-consecutive-failure
+  counter below — that backoff is what stops a re-queue from thrashing.
 - **Two consecutive failures:** autopilot auto-pauses and pings; `rm
   ~/.autopilot/pause` or `ap resume` once you've fixed the cause. Exception:
-  if the failing run's own stderr/stdout matched a usage/rate-limit
-  signature (`usage limit`, `rate limit`, `429`, or `quota`, case-insensitive)
-  the pause is tagged reason `usage-limit` and clears **itself** once it's
-  older than `AP_LIMIT_COOLDOWN_MIN` (default `60`) minutes — a real bug
-  (reason `failures`) or a pause you set by hand (`ap pause`, reason
-  `manual`) never auto-clears. `ap status` shows the reason and, for a
-  usage-limit pause, when it will auto-resume.
+  if the failing run's own stderr/stdout matched a usage/rate/session-limit
+  signature (`usage limit`, `rate limit`, `429`, `quota`, or `session limit`,
+  case-insensitive — the narrower slice of the external-cause signature
+  above; a provider outage tagged `overloaded`/`529` still gets reason
+  `failures` and waits for a human, since it doesn't clear on a fixed
+  cooldown) the pause is tagged reason `usage-limit` and clears **itself**
+  once it's older than `AP_LIMIT_COOLDOWN_MIN` (default `60`) minutes — a
+  real bug (reason `failures`) or a pause you set by hand (`ap pause`,
+  reason `manual`) never auto-clears. `ap status` shows the reason and, for
+  a usage-limit pause, when it will auto-resume.
 - **No cycles for a while:** `ap status` and the daily brief both surface a
   ledger gap over an hour as a warning — check the tmux session
   (`tmux attach -t autopilot`) and `~/.autopilot/logs/cycle.log`.

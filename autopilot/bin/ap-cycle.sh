@@ -199,10 +199,10 @@ sys.exit(0 if 'auto' in names else 1)
 
 # extract_new_intake_issues <gh-issue-list-json (number,labels)> -> issue
 # numbers, one per line, for open issues carrying the `Queued` label
-# (case-insensitive; the repo label is "Queued") and NONE of the seven state
+# (case-insensitive; the repo label is "Queued") and NONE of the eight state
 # labels below -- i.e. an owner delegation (create the inbox issue, add
 # Queued), not an unlabeled draft, which the pipeline ignores entirely.
-NEW_INTAKE_STATE_LABELS='["planning","plan-review","building","shipping","ready-to-test","needs-input","failed"]'
+NEW_INTAKE_STATE_LABELS='["planning","plan-review","building","shipping","ready-to-test","needs-input","failed","ship-pending"]'
 extract_new_intake_issues() {
   local json="$1"
   if command -v jq >/dev/null 2>&1; then
@@ -239,20 +239,21 @@ for item in d:
 " 2>/dev/null
 }
 
-# commit_scan_state <state-path> <pending-inbox-tsv> <pending-new-intake-txt> <now-ts>
-# Merges pending inbox-comment / new-intake updates recorded during the scan
-# into the on-disk scan-state.json, refreshing last_poll_ts. Called only
-# after the claude poll stage has actually run (so a crashed poll leaves
+# commit_scan_state <state-path> <pending-inbox-tsv> <pending-new-intake-txt> <now-ts> [<pending-ship-pending-txt>]
+# Merges pending inbox-comment / new-intake / ship-pending updates recorded
+# during the scan into the on-disk scan-state.json, refreshing last_poll_ts.
+# ship-pending defaults to /dev/null (empty) for callers that don't track it.
+# Called only after the claude poll stage has actually run (so a crashed poll leaves
 # state untouched and retries next cycle).
 commit_scan_state() {
-  local state_path="$1" inbox_tsv="$2" new_intake_txt="$3" now_ts="$4"
+  local state_path="$1" inbox_tsv="$2" new_intake_txt="$3" now_ts="$4" ship_pending_txt="${5:-/dev/null}"
   local old_json='{}'
   [[ -f "$state_path" ]] && old_json="$(cat "$state_path")"
   [[ -z "$old_json" ]] && old_json='{}'
   local tmp="$state_path.tmp.$$"
-  python3 - "$old_json" "$inbox_tsv" "$new_intake_txt" "$now_ts" >"$tmp" <<'PYEOF'
+  python3 - "$old_json" "$inbox_tsv" "$new_intake_txt" "$now_ts" "$ship_pending_txt" >"$tmp" <<'PYEOF'
 import json, sys
-old_json, inbox_tsv, new_intake_txt, now_ts = sys.argv[1:5]
+old_json, inbox_tsv, new_intake_txt, now_ts, ship_pending_txt = sys.argv[1:6]
 try:
     old = json.loads(old_json)
 except Exception:
@@ -276,7 +277,14 @@ with open(new_intake_txt) as f:
         line = line.strip()
         if line and line not in new_intake_seen:
             new_intake_seen.append(line)
-new_state = {"inbox": inbox, "new_intake_seen": new_intake_seen, "last_poll_ts": now_ts}
+ship_pending_seen = list(old.get("ship_pending_seen") or [])
+with open(ship_pending_txt) as f:
+    for line in f:
+        line = line.strip()
+        if line and line not in ship_pending_seen:
+            ship_pending_seen.append(line)
+new_state = {"inbox": inbox, "new_intake_seen": new_intake_seen,
+             "ship_pending_seen": ship_pending_seen, "last_poll_ts": now_ts}
 print(json.dumps(new_state))
 PYEOF
   mv "$tmp" "$state_path"
@@ -480,13 +488,17 @@ inbox_state_json="$(json_field "$old_state_json" ".inbox")"
 [[ -z "$inbox_state_json" || "$inbox_state_json" == "null" ]] && inbox_state_json='{}'
 new_intake_seen_json="$(json_field "$old_state_json" ".new_intake_seen")"
 [[ -z "$new_intake_seen_json" || "$new_intake_seen_json" == "null" ]] && new_intake_seen_json='[]'
+ship_pending_seen_json="$(json_field "$old_state_json" ".ship_pending_seen")"
+[[ -z "$ship_pending_seen_json" || "$ship_pending_seen_json" == "null" ]] && ship_pending_seen_json='[]'
 last_poll_ts="$(json_field "$old_state_json" ".last_poll_ts")"
 
 scan_pending_dir="$(mktemp -d "$AP_HOME/.scan-pending.XXXXXX")"
 pending_inbox_tsv="$scan_pending_dir/inbox.tsv"
 pending_new_intake_txt="$scan_pending_dir/new-intake.txt"
+pending_ship_pending_txt="$scan_pending_dir/ship-pending.txt"
 : >"$pending_inbox_tsv"
 : >"$pending_new_intake_txt"
+: >"$pending_ship_pending_txt"
 # shellcheck disable=SC2317,SC2329 # invoked via trap, not directly
 cleanup_scan_pending() { rm -rf "$scan_pending_dir"; }
 trap cleanup_scan_pending EXIT
@@ -525,8 +537,19 @@ scan_inbox_comments() {
     comment_id="${comment_line%%$'\t'*}"
     comment_first_line="${comment_line#*$'\t'}"
     # Agent-authored posts are always stamped with one of these markers; a
-    # human reply never starts a comment this way.
-    if [[ "$comment_first_line" == "Plan file:"* || "$comment_first_line" == "Phase:"* ]]; then
+    # human reply never starts a comment this way. The marker is the ONLY
+    # defence: the pipeline comments with the owner's own gh credentials, so
+    # `author.login` is identical for both and useless as a signal. An unmarked
+    # agent comment is therefore read as owner feedback and triggers a re-plan,
+    # whose own comment triggers the next -- an unbounded, money-burning loop
+    # observed on ENG-1137 (two re-plans in seven minutes). Every comment any
+    # part of this pipeline writes MUST begin with one of these markers:
+    #   Plan file:  a plan post (also the machine-readable planPath source)
+    #   Phase:      a NEEDS_HUMAN question or a phase-scoped informational post
+    #   Autopilot:  anything the wrapper itself writes (failures, re-queues)
+    if [[ "$comment_first_line" == "Plan file:"* \
+       || "$comment_first_line" == "Phase:"* \
+       || "$comment_first_line" == "Autopilot:"* ]]; then
       continue
     fi
     recorded_id="$(dict_get "$inbox_state_json" "$num")"
@@ -606,8 +629,31 @@ for item in d if isinstance(d, list) else []:
   fi
 fi
 
-# --- Inbox leg, trigger 3: new intake -- an open issue carrying the `Queued`
-# label (case-insensitive) and none of the seven state labels is an owner
+# --- Inbox leg, trigger 3: ship-pending -- implement finished and committed,
+# ship still owed (Change 2: a ship-only retry after a ship phase failed
+# externally, or a human relabelled by hand). A wake signal like the two
+# above, tracked in scan-state (ship_pending_seen) the same way new-intake
+# is, so a non-actionable one does not re-wake every minute. Claims the BUILD
+# lane -- ship-work may run gates/servers, so it needs a slot just like
+# implement.
+inbox_list_ship_pending="$(gh issue list --repo "$AP_INBOX_REPO" --state open --label ship-pending --json number 2>>"$AP_HOME/logs/cycle.log")"
+ship_pending_numbers="$(extract_issue_numbers "${inbox_list_ship_pending:-[]}" | sort -un)"
+if [[ -n "$ship_pending_numbers" ]]; then
+  while IFS= read -r num; do
+    [[ -z "$num" ]] && continue
+    if ! list_contains "$ship_pending_seen_json" "$num"; then
+      if [[ "$busy_build" == true ]]; then
+        continue
+      fi
+      wake=true
+      wake_reason="${wake_reason:+$wake_reason,}ship-pending:$num"
+      printf '%s\n' "$num" >>"$pending_ship_pending_txt"
+    fi
+  done <<<"$ship_pending_numbers"
+fi
+
+# --- Inbox leg, trigger 4: new intake -- an open issue carrying the `Queued`
+# label (case-insensitive) and none of the eight state labels is an owner
 # delegation (titled with the Linear id, e.g. "ENG-1234"); an unlabeled open
 # issue is a draft the pipeline ignores entirely.
 inbox_list_all_open="$(gh issue list --repo "$AP_INBOX_REPO" --state open --json number,labels --limit 100 2>>"$AP_HOME/logs/cycle.log")"
@@ -664,7 +710,7 @@ log "scan: waking poll ($wake_reason) busy-lanes=${busy_lanes:-none}"
 
 # --- Stage 1: poll (haiku) --------------------------------------------------
 
-POLL_SCHEMA='{"type":"object","properties":{"action":{"type":"string","enum":["plan","implement","replan","none"]},"issue":{"type":"string"},"planPath":{"type":"string"},"inboxIssue":{"type":"number"},"feedback":{"type":"string"}},"required":["action"]}'
+POLL_SCHEMA='{"type":"object","properties":{"action":{"type":"string","enum":["plan","implement","replan","ship","none"]},"issue":{"type":"string"},"planPath":{"type":"string"},"inboxIssue":{"type":"number"},"feedback":{"type":"string"}},"required":["action"]}'
 
 # Tells the poll skill which lanes are currently occupied by an act in a
 # DIFFERENT, still-running cycle, so it skips tiers whose action would target
@@ -702,9 +748,9 @@ action_peek="$(json_field "$poll_json" ".action")"
 # commit everything so non-actionable signals stop re-waking us every
 # minute. Either way last_poll_ts refreshes.
 if [[ "$action_peek" == "none" ]]; then
-  commit_scan_state "$scan_state_path" "$pending_inbox_tsv" "$pending_new_intake_txt" "$(date -u +%FT%TZ)"
+  commit_scan_state "$scan_state_path" "$pending_inbox_tsv" "$pending_new_intake_txt" "$(date -u +%FT%TZ)" "$pending_ship_pending_txt"
 else
-  commit_scan_state "$scan_state_path" /dev/null /dev/null "$(date -u +%FT%TZ)"
+  commit_scan_state "$scan_state_path" /dev/null /dev/null "$(date -u +%FT%TZ)" /dev/null
 fi
 
 action="$(json_field "$poll_json" ".action")"
@@ -738,7 +784,7 @@ fe_port=""
 be_port=""
 case "$action" in
   plan|replan) act_lane="plan"; act_lock_file="$AP_HOME/lock.plan" ;;
-  implement)
+  implement|ship)
     act_lane="build"
     build_slot="$free_build_slot"
     if [[ -n "$build_slot" ]]; then
@@ -746,6 +792,8 @@ case "$action" in
       # Port pair for this slot, so two concurrent builds never bind the same
       # port. 5173/8000 are the human's baseline pair (README's four-server
       # comparison) and must never be handed to a slot, hence n starting at 1.
+      # A standalone `ship` action needs one too -- ship-work may run
+      # gates/servers, same as implement's own trailing ship call.
       fe_port=$((5173 + build_slot))
       be_port=$((8000 + build_slot))
     fi
@@ -900,6 +948,15 @@ case "$action" in
       run_claude "ship" "/ship-work $plan_path --headless --no-merge --ports fe=$fe_port,be=$be_port"
     fi
     ;;
+  ship)
+    # A ship-only retry (Change 2): implement already committed, ship still
+    # owed -- either a prior ship phase failed externally and got re-queued
+    # to `ship-pending` (Change 1), or a human relabelled by hand. The poll
+    # skill already swapped ship-pending -> shipping before emitting this
+    # action, so there's no wrapper-side label swap to do here (unlike the
+    # implement->ship chain above, which swaps building -> shipping itself).
+    run_claude "ship" "/ship-work $plan_path --headless --no-merge --ports fe=$fe_port,be=$be_port"
+    ;;
   *)
     log "poll: unknown action '$action'"
     popd >/dev/null 2>&1 || true
@@ -933,15 +990,66 @@ ${stderr_tail:-<empty>}
 
 STDOUT (tail):
 ${stdout_tail:-no output captured}"
-    if [[ -n "$inbox_issue" && "$inbox_issue" != "null" ]]; then
-      gh issue edit "$inbox_issue" --repo "$AP_INBOX_REPO" \
-        --add-label failed --remove-label planning --remove-label building \
-        >>"$AP_HOME/logs/cycle.log" 2>&1 || true
-      gh issue comment "$inbox_issue" --repo "$AP_INBOX_REPO" \
-        --body "$failure_body" \
-        >>"$AP_HOME/logs/cycle.log" 2>&1 || true
+
+    # failure_signature: the full stderr+stdout of the failing run, used to
+    # classify EVERY failure below -- both "was this caused by something
+    # outside our control" (EXTERNAL_SIGNATURE_REGEX, this reconcile branch)
+    # and "should the auto-pause tag itself usage-limit" (further down). One
+    # classifier, two consumers -- a session/rate/quota trip that looks
+    # external here should also be the thing that makes the pause
+    # self-clearing.
+    failure_signature="${stderr_tail:-} ${LAST_ACT_OUTPUT:-}"
+    if [[ -n "${LAST_ACT_STDERR_FILE:-}" && -f "$LAST_ACT_STDERR_FILE" ]]; then
+      failure_signature="$(cat "$LAST_ACT_STDERR_FILE" 2>/dev/null) ${LAST_ACT_OUTPUT:-}"
     fi
-    ap-notify.sh "autopilot FAILED: ${issue:-$action}" "$failure_body" "$inbox_url" || true
+    # EXTERNAL_SIGNATURE_REGEX: causes that are not a bug in the plan or the
+    # code -- the owner's own usage/session limit, a provider-side rate/quota
+    # trip, or the provider itself erroring out (overloaded/529/"API
+    # Error"). The night five acts died mid-run to the owner's session limit
+    # and every one of them dead-ended at `failed` -- a label nothing ever
+    # wakes on -- stalling the whole queue until a human relabelled seven
+    # issues by hand. A failure matching this signature is re-queued instead
+    # (see below); anything else keeps today's `failed` behavior unchanged.
+    EXTERNAL_SIGNATURE_REGEX='usage limit|rate limit|429|quota|overloaded|529|api error|session limit'
+    external_failure_line=""
+    if printf '%s' "$failure_signature" | grep -qiE "$EXTERNAL_SIGNATURE_REGEX"; then
+      external_failure_line="$(printf '%s\n' "$failure_signature" | grep -iE "$EXTERNAL_SIGNATURE_REGEX" | head -n1)"
+    fi
+
+    if [[ -n "$external_failure_line" ]]; then
+      # Restore the state this phase started from, so the SAME work is
+      # picked up again once the cooldown/pause clears -- never `failed`,
+      # which is a dead end no wake signal ever fires on.
+      requeue_label="" requeue_remove=""
+      case "$final_phase" in
+        plan|replan) requeue_label="Queued";     requeue_remove="planning" ;;
+        implement)   requeue_label="plan-review"; requeue_remove="building" ;;
+        ship)        requeue_label="ship-pending"; requeue_remove="shipping" ;;
+      esac
+      if [[ -n "$inbox_issue" && "$inbox_issue" != "null" && -n "$requeue_label" ]]; then
+        gh issue edit "$inbox_issue" --repo "$AP_INBOX_REPO" \
+          --add-label "$requeue_label" --remove-label "$requeue_remove" \
+          >>"$AP_HOME/logs/cycle.log" 2>&1 || true
+        gh issue comment "$inbox_issue" --repo "$AP_INBOX_REPO" \
+          --body "Autopilot: external failure, re-queued (matched: \`$external_failure_line\`).
+
+$failure_body" \
+          >>"$AP_HOME/logs/cycle.log" 2>&1 || true
+      fi
+      ap-notify.sh "requeued after external failure: ${issue:-$action}" "$failure_body" "$inbox_url" || true
+    else
+      if [[ -n "$inbox_issue" && "$inbox_issue" != "null" ]]; then
+        gh issue edit "$inbox_issue" --repo "$AP_INBOX_REPO" \
+          --add-label failed --remove-label planning --remove-label building \
+          >>"$AP_HOME/logs/cycle.log" 2>&1 || true
+        gh issue comment "$inbox_issue" --repo "$AP_INBOX_REPO" \
+          --body "Autopilot: run failed.
+
+$failure_body" \
+          >>"$AP_HOME/logs/cycle.log" 2>&1 || true
+      fi
+      ap-notify.sh "autopilot FAILED: ${issue:-$action}" "$failure_body" "$inbox_url" || true
+    fi
 
     # Two-lane concurrency: a plan-lane FAILED and a build-lane FAILED can
     # read-increment-write this file at the same moment -- an unguarded
@@ -952,6 +1060,15 @@ ${stdout_tail:-no output captured}"
     # eventually, since each lane's own next failure re-reads and increments
     # again), and a lock here would fight the very concurrency this feature
     # exists for.
+    #
+    # fail_count++ happens for BOTH external and non-external causes,
+    # deliberately -- an external failure is exempt from the `failed` label
+    # and its dead-end comment, but NOT from this counter. The existing
+    # 2-consecutive-failure auto-pause, plus the usage-limit cooldown that
+    # tags it self-clearing, IS the backoff that stops a re-queue from
+    # thrashing (act, fail externally, re-queue, act again, fail again,
+    # ...); carving external causes out of the counter would defeat the
+    # reason it exists. Do not "fix" this later.
     fail_count=0
     [[ -f "$AP_HOME/fail_count" ]] && fail_count="$(cat "$AP_HOME/fail_count")"
     fail_count=$(( fail_count + 1 ))
@@ -960,15 +1077,12 @@ ${stdout_tail:-no output captured}"
       # A usage/rate-limit trip is not a real bug -- it clears itself, so tag
       # the pause with a reason the top-of-cycle check can act on (see Stage
       # 0's pause handling). Any other failure gets "failures", which never
-      # auto-clears. Signature is deliberately loose (case-insensitive
-      # substring match on the failing run's own stderr+stdout) since the
-      # exact wording of a limit message isn't a documented, stable contract.
+      # auto-clears. Reuses the narrower slice of EXTERNAL_SIGNATURE_REGEX
+      # that is specifically a limit/quota trip (not every external cause --
+      # a provider outage tagged "overloaded" clears on its own timeline, not
+      # a fixed cooldown, so it still gets "failures" and waits for a human).
       pause_reason="failures"
-      failure_signature="${stderr_tail:-} ${LAST_ACT_OUTPUT:-}"
-      if [[ -n "${LAST_ACT_STDERR_FILE:-}" && -f "$LAST_ACT_STDERR_FILE" ]]; then
-        failure_signature="$(cat "$LAST_ACT_STDERR_FILE" 2>/dev/null) ${LAST_ACT_OUTPUT:-}"
-      fi
-      if printf '%s' "$failure_signature" | grep -qiE 'usage limit|rate limit|429|quota'; then
+      if printf '%s' "$failure_signature" | grep -qiE 'usage limit|rate limit|429|quota|session limit'; then
         pause_reason="usage-limit"
       fi
       echo "$pause_reason" >"$AP_HOME/pause"

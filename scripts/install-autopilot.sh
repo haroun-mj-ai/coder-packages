@@ -202,8 +202,8 @@ else
 # worktree, so concurrent builds never share a database or a checkout.
 # AP_BUILD_SLOTS=2
 
-# Minutes a usage-limit auto-pause (as opposed to a real-bug or manual pause)
-# waits before clearing itself. 0 disables auto-resume entirely.
+# Minutes a usage/rate/session-limit auto-pause (as opposed to a real-bug or
+# manual pause) waits before clearing itself. 0 disables auto-resume entirely.
 # AP_LIMIT_COOLDOWN_MIN=60
 ENVEOF
     report DID "seeded $ENV_FILE"

@@ -136,11 +136,13 @@ if isinstance(d, list):
 }
 
 # extract_newest_comment <gh-api-comments-json (array)> -> "<id>\t<first body line>"
-# for element 0, or empty if the array is empty/unparseable.
+# for the LAST element, or empty if the array is empty/unparseable. The
+# per-issue comments endpoint ignores sort/direction and returns ascending
+# order, so the newest comment is the last element, never element 0.
 extract_newest_comment() {
   local json="$1"
   if command -v jq >/dev/null 2>&1; then
-    printf '%s' "$json" | jq -r '.[0] | select(.) | [(.id|tostring), ((.body // "") | split("\n")[0])] | @tsv' 2>/dev/null
+    printf '%s' "$json" | jq -r '.[-1] | select(.) | [(.id|tostring), ((.body // "") | split("\n")[0])] | @tsv' 2>/dev/null
     return
   fi
   printf '%s' "$json" | python3 -c "
@@ -151,7 +153,7 @@ except Exception:
     sys.exit(0)
 if not isinstance(d, list) or not d:
     sys.exit(0)
-c = d[0]
+c = d[-1]
 if not isinstance(c, dict):
     sys.exit(0)
 cid = c.get('id')
@@ -383,7 +385,10 @@ inbox_issue_numbers="$(
 if [[ -n "$inbox_issue_numbers" ]]; then
   while IFS= read -r num; do
     [[ -z "$num" ]] && continue
-    comment_json="$(gh api "repos/$AP_INBOX_REPO/issues/$num/comments?sort=created&direction=desc&per_page=1" 2>>"$AP_HOME/logs/cycle.log")"
+    # Ascending order (sort/direction are ignored on this endpoint); fetch a
+    # full page and let extract_newest_comment take the last element. Inbox
+    # threads are short; >100 comments would need pagination we skip for now.
+    comment_json="$(gh api "repos/$AP_INBOX_REPO/issues/$num/comments?per_page=100" 2>>"$AP_HOME/logs/cycle.log")"
     [[ -z "$comment_json" ]] && continue
     comment_line="$(extract_newest_comment "$comment_json")"
     [[ -z "$comment_line" ]] && continue

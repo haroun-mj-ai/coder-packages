@@ -661,8 +661,12 @@ assert "case17: idle -> no ledger file written" [ ! -f "$(today_ledger)" ]
 # always ran on every cycle.
 # =============================================================================
 setup_case
+# Ascending order, as the real per-issue comments endpoint returns (it
+# ignores sort/direction): the agent's plan post first, the owner's go LAST.
+# Regression for the live bug where element 0 (the marker post) was read as
+# "newest" and suppressed the wake forever.
 export AP_TEST_GH_ISSUES_PLAN_REVIEW='[{"number":101}]'
-export AP_TEST_GH_COMMENT_101='[{"id":555,"user":{"login":"haroun"},"body":"go"}]'
+export AP_TEST_GH_COMMENT_101='[{"id":550,"user":{"login":"haroun"},"body":"Plan file: /x/plan.md\nthe plan"},{"id":555,"user":{"login":"haroun"},"body":"go"}]'
 rc="$(AP_TEST_POLL_ACTION=none run_case)"
 assert "case18: inbox wake -> exit 0" [ "$rc" -eq 0 ]
 assert "case18: inbox wake -> claude called once (poll)" [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 1 ]

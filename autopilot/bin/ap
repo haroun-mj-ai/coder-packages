@@ -40,7 +40,14 @@ cmd_up() {
     return 0
   fi
 
-  tmux new-session -d -s "$TMUX_SESSION" "supercronic '$CRONTAB_RENDERED'"
+  # -overlapping is REQUIRED, not a tuning knob: without it supercronic skips
+  # every tick while the previous ap-cycle.sh is still alive ("not starting:
+  # job is still running"), and a cycle lives as long as its act -- 30+ min
+  # for a build. That serializes the whole pipeline no matter how many lanes
+  # are free. Overlap is safe because ap-cycle.sh owns its own mutual
+  # exclusion: lock.poll serializes deciding, lock.plan/lock.build cap each
+  # lane at one occupant, and a cycle with nothing to do exits in seconds.
+  tmux new-session -d -s "$TMUX_SESSION" "supercronic -overlapping '$CRONTAB_RENDERED'"
   [[ "$quiet" == true ]] || echo "autopilot started (tmux session '$TMUX_SESSION')"
 }
 
@@ -54,7 +61,39 @@ cmd_print_paths() {
   echo "CRONTAB_RENDERED=$CRONTAB_RENDERED"
 }
 
+# lane_free <lock-file> -- non-destructive probe, same helper ap-cycle.sh uses:
+# open on a spare fd, flock -n, release immediately. rc 0 = free, 1 = busy.
+lane_free() {
+  local lock_file="$1"
+  local fd
+  exec {fd}>"$lock_file" || return 1
+  if flock -n "$fd"; then
+    flock -u "$fd"
+    exec {fd}>&-
+    return 0
+  fi
+  exec {fd}>&-
+  return 1
+}
+
 cmd_down() {
+  local force=false
+  [[ "${1:-}" == "--force" ]] && force=true
+
+  # Killing the session can take a running act down with it -- a build is tens
+  # of minutes and real money. Refuse while a lane is occupied unless forced;
+  # `ap pause` is the way to stop NEW work without touching what is in flight.
+  if [[ "$force" == false ]]; then
+    local busy=""
+    lane_free "$AP_HOME/lock.build" || busy="build"
+    lane_free "$AP_HOME/lock.plan" || busy="${busy:+$busy,}plan"
+    if [[ -n "$busy" ]]; then
+      echo "refusing: lane(s) busy ($busy) -- an act is running and would be killed." >&2
+      echo "use 'ap pause' to stop new work, or 'ap down --force' to kill anyway." >&2
+      return 1
+    fi
+  fi
+
   if session_alive; then
     tmux kill-session -t "$TMUX_SESSION"
     echo "autopilot stopped"

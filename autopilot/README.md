@@ -158,3 +158,14 @@ installer re-converges all of this; it's idempotent.
 skip-worktree'd path, run `git update-index --no-skip-worktree <file> && git
 checkout -- <file>` there, then re-run `./scripts/install-autopilot.sh` from
 this repo to re-symlink and re-skip-worktree it.
+
+## Why `supercronic -overlapping`
+
+`ap up` starts supercronic with `-overlapping`. This is required, not a
+preference: a cycle stays alive for the whole act it dispatched (tens of
+minutes for a build), and without the flag supercronic skips every tick while
+the previous one runs — which serializes the pipeline and leaves free lanes
+idle no matter how many issues are waiting. Overlap is safe because
+`ap-cycle.sh` owns its own mutual exclusion: `lock.poll` allows one decider at
+a time, `lock.plan` and `lock.build` cap each lane at one occupant, and a
+cycle with nothing to do exits in seconds.

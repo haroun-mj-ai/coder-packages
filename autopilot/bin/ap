@@ -103,9 +103,14 @@ cmd_down() {
   # Killing the session can take a running act down with it -- a build is tens
   # of minutes and real money. Refuse while a lane is occupied unless forced;
   # `ap pause` is the way to stop NEW work without touching what is in flight.
+  # Every build slot counts here, not just "all full": a single occupied slot
+  # is still an act in flight that killing the session would take down.
   if [[ "$force" == false ]]; then
-    local busy=""
-    lane_free "$AP_HOME/lock.build" || busy="build"
+    local busy="" build_busy=""
+    for ((n = 1; n <= AP_BUILD_SLOTS; n++)); do
+      lane_free "$AP_HOME/lock.build.$n" || build_busy="${build_busy:+$build_busy,}build.$n"
+    done
+    [[ -n "$build_busy" ]] && busy="$build_busy"
     lane_free "$AP_HOME/lock.plan" || busy="${busy:+$busy,}plan"
     if [[ -n "$busy" ]]; then
       echo "refusing: lane(s) busy ($busy) -- an act is running and would be killed." >&2
@@ -130,10 +135,37 @@ cmd_status() {
   fi
 
   if [[ -e "$AP_HOME/pause" ]]; then
-    echo "pause:    PAUSED ($AP_HOME/pause exists)"
+    local pause_reason
+    pause_reason="$(head -n1 "$AP_HOME/pause" 2>/dev/null)"
+    if [[ -z "$pause_reason" ]]; then
+      echo "pause:    PAUSED ($AP_HOME/pause exists)"
+    elif [[ "$pause_reason" == "usage-limit" ]]; then
+      if [[ "${AP_LIMIT_COOLDOWN_MIN:-60}" -le 0 ]]; then
+        echo "pause:    PAUSED (reason: usage-limit; auto-resume disabled, AP_LIMIT_COOLDOWN_MIN=0)"
+      else
+        local pause_mtime resume_epoch resume_time
+        pause_mtime="$(stat -c %Y "$AP_HOME/pause" 2>/dev/null || echo 0)"
+        resume_epoch=$(( pause_mtime + AP_LIMIT_COOLDOWN_MIN * 60 ))
+        resume_time="$(date -u -d "@$resume_epoch" +%FT%TZ 2>/dev/null || echo unknown)"
+        echo "pause:    PAUSED (reason: usage-limit; auto-resumes at $resume_time UTC or the next cycle after)"
+      fi
+    else
+      echo "pause:    PAUSED (reason: $pause_reason)"
+    fi
   else
     echo "pause:    running"
   fi
+
+  local busy_slots=0 slot_detail=""
+  for ((n = 1; n <= AP_BUILD_SLOTS; n++)); do
+    if lane_free "$AP_HOME/lock.build.$n"; then
+      slot_detail="${slot_detail:+$slot_detail }slot$n=free"
+    else
+      slot_detail="${slot_detail:+$slot_detail }slot$n=busy"
+      busy_slots=$((busy_slots + 1))
+    fi
+  done
+  echo "build slots: $busy_slots/$AP_BUILD_SLOTS busy ($slot_detail)"
 
   local today ledger_file
   today="$(TZ="$AP_TZ" date +%F)"
@@ -167,7 +199,10 @@ except Exception:
 
 cmd_pause() {
   mkdir -p "$AP_HOME"
-  touch "$AP_HOME/pause"
+  # Reason "manual" never auto-clears (see ap-cycle.sh's pause-reason
+  # handling) -- only a pause the wrapper itself wrote for a usage-limit
+  # failure does.
+  echo "manual" >"$AP_HOME/pause"
   echo "paused (rm $AP_HOME/pause, or 'ap resume', to resume)"
 }
 

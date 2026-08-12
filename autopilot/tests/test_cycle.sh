@@ -225,7 +225,8 @@ setup_case() {
   # scan-state -> stale -> wake), matching the pre-gate behavior every
   # pre-existing case below already assumes (claude poll always runs).
   unset AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_ISSUES_NEEDS_INPUT \
-    AP_TEST_GH_ISSUES_ALL_OPEN AP_TEST_POLL_CRASH AP_FULL_POLL_INTERVAL_MIN
+    AP_TEST_GH_ISSUES_ALL_OPEN AP_TEST_POLL_CRASH AP_FULL_POLL_INTERVAL_MIN \
+    AP_BUILD_SLOTS AP_LIMIT_COOLDOWN_MIN
 }
 
 run_case() {
@@ -899,13 +900,16 @@ assert "case23b: mismatched adhoc file left in place (not consumed)" bash -c \
 
 # --- (i) build lane held + Queued intake present -> poll runs with
 # "--busy-lanes build" in argv, and a plan act proceeds (plan lane is free).
+# AP_BUILD_SLOTS=1 here: this exercises the "lane busy" boundary itself
+# (single-slot semantics), not slot-count behavior -- that's covered
+# separately below (build slot concurrency, Feature 1).
 setup_case
 now_ts="$(date -u +%FT%TZ)"
 printf '{"inbox":{},"new_intake_seen":[],"last_poll_ts":"%s"}' "$now_ts" >"$CASE_AP_HOME/scan-state.json"
 export AP_TEST_GH_ISSUES_ALL_OPEN='[{"number":2001,"labels":[{"name":"Queued"}]}]'
-hold_lane_lock "$CASE_AP_HOME/lock.build" 3; build_holder="$LANE_HOLDER_PID"
+hold_lane_lock "$CASE_AP_HOME/lock.build.1" 3; build_holder="$LANE_HOLDER_PID"
 sleep 0.4
-rc="$(AP_TEST_POLL_ACTION=plan AP_TEST_POLL_ISSUE=ENG-2001 run_case)"
+rc="$(AP_BUILD_SLOTS=1 AP_TEST_POLL_ACTION=plan AP_TEST_POLL_ISSUE=ENG-2001 run_case)"
 wait "$build_holder" 2>/dev/null
 assert "laneB(i): exit 0" [ "$rc" -eq 0 ]
 poll_args="$CASE_STUB_DIR/claude_calls/1.args"
@@ -936,16 +940,17 @@ assert "laneB(ii): implement act proceeded (build lane free)" bash -c \
 unset AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_COMMENT_2002
 
 # --- (iii) BOTH lanes held -> no claude call at all (not even the poll).
+# AP_BUILD_SLOTS=1 (single-slot boundary, not slot-count behavior).
 setup_case
 now_ts="$(date -u +%FT%TZ)"
 printf '{"inbox":{},"new_intake_seen":[],"last_poll_ts":"%s"}' "$now_ts" >"$CASE_AP_HOME/scan-state.json"
 export AP_TEST_GH_ISSUES_ALL_OPEN='[{"number":2003,"labels":[{"name":"Queued"}]}]'
 export AP_TEST_GH_ISSUES_PLAN_REVIEW='[{"number":2004}]'
 export AP_TEST_GH_COMMENT_2004='[{"id":901,"user":{"login":"haroun"},"body":"go"}]'
-hold_lane_lock "$CASE_AP_HOME/lock.build" 3; build_holder="$LANE_HOLDER_PID"
+hold_lane_lock "$CASE_AP_HOME/lock.build.1" 3; build_holder="$LANE_HOLDER_PID"
 hold_lane_lock "$CASE_AP_HOME/lock.plan" 3; plan_holder="$LANE_HOLDER_PID"
 sleep 0.4
-rc="$(AP_TEST_POLL_ACTION=none run_case)"
+rc="$(AP_BUILD_SLOTS=1 AP_TEST_POLL_ACTION=none run_case)"
 wait "$build_holder" "$plan_holder" 2>/dev/null
 assert "laneB(iii): exit 0" [ "$rc" -eq 0 ]
 assert "laneB(iii): no claude call at all (both lanes busy)" \
@@ -953,15 +958,15 @@ assert "laneB(iii): no claude call at all (both lanes busy)" \
 unset AP_TEST_GH_ISSUES_ALL_OPEN AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_COMMENT_2004
 
 # --- (iv) go-approval present while build lane held -> NOT marked seen
-# (re-fires once the lane frees).
+# (re-fires once the lane frees). AP_BUILD_SLOTS=1 (single-slot boundary).
 setup_case
 now_ts="$(date -u +%FT%TZ)"
 printf '{"inbox":{},"new_intake_seen":[],"last_poll_ts":"%s"}' "$now_ts" >"$CASE_AP_HOME/scan-state.json"
 export AP_TEST_GH_ISSUES_PLAN_REVIEW='[{"number":2005}]'
 export AP_TEST_GH_COMMENT_2005='[{"id":902,"user":{"login":"haroun"},"body":"go"}]'
-hold_lane_lock "$CASE_AP_HOME/lock.build" 3; build_holder="$LANE_HOLDER_PID"
+hold_lane_lock "$CASE_AP_HOME/lock.build.1" 3; build_holder="$LANE_HOLDER_PID"
 sleep 0.4
-rc="$(AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-2005 AP_TEST_POLL_PLANPATH=docs/plans/x.md run_case)"
+rc="$(AP_BUILD_SLOTS=1 AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-2005 AP_TEST_POLL_PLANPATH=docs/plans/x.md run_case)"
 wait "$build_holder" 2>/dev/null
 assert "laneB(iv): exit 0 (build busy -> no free-lane signal, poll not woken)" [ "$rc" -eq 0 ]
 assert "laneB(iv): claude NOT called (signal's lane busy)" [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 0 ]
@@ -972,7 +977,7 @@ with open('$CASE_AP_HOME/scan-state.json') as f:
     d = json.load(f)
 assert d.get('inbox', {}).get('2005') is None, d
 \""
-rc2="$(AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-2005 AP_TEST_POLL_PLANPATH=docs/plans/x.md run_case)"
+rc2="$(AP_BUILD_SLOTS=1 AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-2005 AP_TEST_POLL_PLANPATH=docs/plans/x.md run_case)"
 assert "laneB(iv): second cycle (lane free) exit 0" [ "$rc2" -eq 0 ]
 assert "laneB(iv): second cycle -> claude called (re-fired)" \
   [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -ge 1 ]
@@ -1157,6 +1162,190 @@ rows = [json.loads(l) for l in open('$ledger') if l.strip()]
 plan = [r for r in rows if r['phase'] == 'plan']
 assert plan and plan[0]['model'] == 'fable', plan
 \""
+
+# =============================================================================
+# Feature: N concurrent build slots. AP_BUILD_SLOTS=2 unless stated. Port
+# formula: fe=5173+slot, be=8000+slot, slot 1..N -- so slot 1 never collides
+# with the human's baseline pair (5173/8000).
+# =============================================================================
+
+PORTS_SEEN_FILE="$(mktemp)"
+: >"$PORTS_SEEN_FILE"
+
+# --- (1) slot 1 held -> implement proceeds and takes slot 2; its prompt
+# carries --ports fe=5175,be=8002.
+setup_case
+hold_lane_lock "$CASE_AP_HOME/lock.build.1" 3; slot1_holder="$LANE_HOLDER_PID"
+sleep 0.4
+rc="$(AP_BUILD_SLOTS=2 AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-SLOTS1 \
+  AP_TEST_POLL_PLANPATH=docs/plans/x.md run_case)"
+wait "$slot1_holder" 2>/dev/null
+assert "slots(1): exit 0" [ "$rc" -eq 0 ]
+act_args="$CASE_STUB_DIR/claude_calls/2.args"
+assert "slots(1): implement act proceeded (slot 1 busy, slot 2 free)" bash -c \
+  "[ -f '$act_args' ] && grep -q 'implement-plan' '$act_args'"
+assert "slots(1): prompt carries --ports fe=5175,be=8002 (slot 2)" bash -c \
+  "[ -f '$act_args' ] && grep -q -- '--ports fe=5175,be=8002' '$act_args'"
+[[ -f "$act_args" ]] && grep -h -- '--ports fe=' "$act_args" >>"$PORTS_SEEN_FILE"
+
+# --- (2) both slots held: an approval signal (build lane) does NOT reach the
+# poll as actionable -- reported busy in --busy-lanes -- while a plan-lane
+# signal (Queued intake) still wakes it and proceeds.
+setup_case
+now_ts="$(date -u +%FT%TZ)"
+printf '{"inbox":{},"new_intake_seen":[],"last_poll_ts":"%s"}' "$now_ts" >"$CASE_AP_HOME/scan-state.json"
+export AP_TEST_GH_ISSUES_ALL_OPEN='[{"number":2101,"labels":[{"name":"Queued"}]}]'
+export AP_TEST_GH_ISSUES_PLAN_REVIEW='[{"number":2102}]'
+export AP_TEST_GH_COMMENT_2102='[{"id":950,"user":{"login":"haroun"},"body":"go"}]'
+hold_lane_lock "$CASE_AP_HOME/lock.build.1" 3; b1_holder="$LANE_HOLDER_PID"
+hold_lane_lock "$CASE_AP_HOME/lock.build.2" 3; b2_holder="$LANE_HOLDER_PID"
+sleep 0.4
+rc="$(AP_BUILD_SLOTS=2 AP_TEST_POLL_ACTION=plan AP_TEST_POLL_ISSUE=ENG-2101 run_case)"
+wait "$b1_holder" "$b2_holder" 2>/dev/null
+assert "slots(2): exit 0" [ "$rc" -eq 0 ]
+poll_args="$CASE_STUB_DIR/claude_calls/1.args"
+assert "slots(2): poll invoked with --busy-lanes build (all slots full)" bash -c \
+  "[ -f '$poll_args' ] && grep -q -- '--busy-lanes build' '$poll_args'"
+assert "slots(2): busy-lanes does NOT report plan (plan lane free)" bash -c \
+  "[ -f '$poll_args' ] && ! grep -q -- '--busy-lanes build,plan' '$poll_args'"
+act_args="$CASE_STUB_DIR/claude_calls/2.args"
+assert "slots(2): plan act proceeded (plan lane free, build's go-approval skipped)" bash -c \
+  "[ -f '$act_args' ] && grep -q 'plan-issue ENG-2101' '$act_args'"
+unset AP_TEST_GH_ISSUES_ALL_OPEN AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_COMMENT_2102
+
+# --- (3) neither slot held -> lowest free wins (slot 1); prompt carries
+# --ports fe=5174,be=8001.
+setup_case
+rc="$(AP_BUILD_SLOTS=2 AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-SLOTS3 \
+  AP_TEST_POLL_PLANPATH=docs/plans/x.md run_case)"
+assert "slots(3): exit 0" [ "$rc" -eq 0 ]
+act_args="$CASE_STUB_DIR/claude_calls/2.args"
+assert "slots(3): prompt carries --ports fe=5174,be=8001 (slot 1)" bash -c \
+  "[ -f '$act_args' ] && grep -q -- '--ports fe=5174,be=8001' '$act_args'"
+[[ -f "$act_args" ]] && grep -h -- '--ports fe=' "$act_args" >>"$PORTS_SEEN_FILE"
+
+# --- (4) AP_BUILD_SLOTS=1 reproduces today's single-lane behavior exactly:
+# one slot, assigned the same slot-1 ports as case (3) above.
+setup_case
+rc="$(AP_BUILD_SLOTS=1 AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-SLOTS4 \
+  AP_TEST_POLL_PLANPATH=docs/plans/x.md run_case)"
+assert "slots(4): exit 0" [ "$rc" -eq 0 ]
+act_args="$CASE_STUB_DIR/claude_calls/2.args"
+assert "slots(4): AP_BUILD_SLOTS=1 -> implement proceeded on the one slot" bash -c \
+  "[ -f '$act_args' ] && grep -q 'implement-plan' '$act_args'"
+assert "slots(4): AP_BUILD_SLOTS=1 -> same slot-1 ports as multi-slot case" bash -c \
+  "[ -f '$act_args' ] && grep -q -- '--ports fe=5174,be=8001' '$act_args'"
+[[ -f "$act_args" ]] && grep -h -- '--ports fe=' "$act_args" >>"$PORTS_SEEN_FILE"
+
+# --- (5) no slot, across every case above, is ever assigned the human's
+# baseline pair (5173/8000).
+assert "slots(5): at least 3 --ports lines were recorded to check" \
+  bash -c "[ \"\$(wc -l < '$PORTS_SEEN_FILE')\" -ge 3 ]"
+assert "slots(5): no recorded prompt ever assigns fe=5173" \
+  bash -c "! grep -q 'fe=5173' '$PORTS_SEEN_FILE'"
+assert "slots(5): no recorded prompt ever assigns be=8000" \
+  bash -c "! grep -q 'be=8000' '$PORTS_SEEN_FILE'"
+rm -f "$PORTS_SEEN_FILE"
+
+# =============================================================================
+# Feature: limit-aware auto-resume. AP_LIMIT_COOLDOWN_MIN default is 60
+# (minutes); "old" mtimes below are set well past that.
+# =============================================================================
+
+# --- (a) reason usage-limit + old mtime -> cycle proceeds normally, and the
+# pause file is gone.
+setup_case
+echo "usage-limit" >"$CASE_AP_HOME/pause"
+touch -d "@$(( $(date -u +%s) - 3700 ))" "$CASE_AP_HOME/pause"
+rc="$(AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-LIMIT-A \
+  AP_TEST_POLL_PLANPATH=docs/plans/x.md run_case)"
+assert "limit(a): exit 0" [ "$rc" -eq 0 ]
+assert "limit(a): pause file cleared" [ ! -e "$CASE_AP_HOME/pause" ]
+assert "limit(a): cycle proceeded (claude called)" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -ge 1 ]
+
+# --- (b) reason usage-limit + fresh mtime -> still paused, no claude call.
+setup_case
+echo "usage-limit" >"$CASE_AP_HOME/pause"
+rc="$(AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-LIMIT-B run_case)"
+assert "limit(b): exit 0" [ "$rc" -eq 0 ]
+assert "limit(b): still paused (fresh cooldown)" [ -e "$CASE_AP_HOME/pause" ]
+assert "limit(b): claude never called" [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 0 ]
+
+# --- (c) reason failures + old mtime -> still paused (not a usage-limit
+# reason, so cooldown never applies).
+setup_case
+echo "failures" >"$CASE_AP_HOME/pause"
+touch -d "@$(( $(date -u +%s) - 3700 ))" "$CASE_AP_HOME/pause"
+rc="$(AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-LIMIT-C run_case)"
+assert "limit(c): exit 0" [ "$rc" -eq 0 ]
+assert "limit(c): still paused (reason=failures never auto-clears)" [ -e "$CASE_AP_HOME/pause" ]
+assert "limit(c): claude never called" [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 0 ]
+
+# --- (d) reason manual + old mtime -> still paused (manual pauses never
+# auto-clear, regardless of age).
+setup_case
+echo "manual" >"$CASE_AP_HOME/pause"
+touch -d "@$(( $(date -u +%s) - 3700 ))" "$CASE_AP_HOME/pause"
+rc="$(AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-LIMIT-D run_case)"
+assert "limit(d): exit 0" [ "$rc" -eq 0 ]
+assert "limit(d): still paused (reason=manual never auto-clears)" [ -e "$CASE_AP_HOME/pause" ]
+assert "limit(d): claude never called" [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 0 ]
+
+# --- (e) two consecutive act failures whose stderr matches a usage-limit
+# signature -> the pause file the wrapper writes carries reason usage-limit.
+setup_case
+export AP_TEST_GH_ISSUES_PLAN_REVIEW='[{"number":800}]'
+export AP_TEST_GH_COMMENT_800='[{"id":1,"user":{"login":"haroun"},"body":"go"}]'
+rc1="$(AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-LIMIT-E1 \
+  AP_TEST_POLL_PLANPATH=docs/plans/x.md AP_TEST_POLL_INBOX=800 \
+  AP_TEST_ACT_STATUS=FAILED AP_TEST_ACT_STDERR="Claude usage limit reached" run_case)"
+assert "limit(e): run1 exit 0" [ "$rc1" -eq 0 ]
+assert "limit(e): run1 no pause yet" [ ! -e "$CASE_AP_HOME/pause" ]
+export AP_TEST_GH_COMMENT_800='[{"id":2,"user":{"login":"haroun"},"body":"go"}]'
+rc2="$(AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-LIMIT-E2 \
+  AP_TEST_POLL_PLANPATH=docs/plans/x.md AP_TEST_POLL_INBOX=800 \
+  AP_TEST_ACT_STATUS=FAILED AP_TEST_ACT_STDERR="Claude usage limit reached" run_case)"
+assert "limit(e): run2 exit 0" [ "$rc2" -eq 0 ]
+unset AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_COMMENT_800
+assert "limit(e): pause file written after 2nd consecutive failure" [ -e "$CASE_AP_HOME/pause" ]
+assert "limit(e): pause reason is usage-limit" bash -c \
+  "[ \"\$(head -n1 '$CASE_AP_HOME/pause')\" = 'usage-limit' ]"
+
+# =============================================================================
+# Feature: visible ship stage (`shipping` label). Held only while
+# `/ship-work --headless --no-merge` runs, swapped in by the WRAPPER (not the
+# skill) right before invoking that phase, with its own ping.
+# =============================================================================
+
+# --- (a)/(c) implement DONE -> ship runs: the wrapper swaps
+# building->shipping with its own "shipping:"-titled ping BEFORE the ship
+# call, and the existing "ready to test" ping still fires on ship DONE.
+setup_case
+rc="$(AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-SHIP-A \
+  AP_TEST_POLL_PLANPATH=docs/plans/x.md AP_TEST_POLL_INBOX=850 \
+  AP_TEST_IMPLEMENT_STATUS=DONE AP_TEST_SHIP_STATUS=DONE run_case)"
+assert "ship-label(a): exit 0" [ "$rc" -eq 0 ]
+assert "ship-label(a): 3 claude calls (poll+implement+ship)" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 3 ]
+assert "ship-label(a): gh issue edit adds the shipping label" bash -c \
+  "grep -rl '^shipping\$' '$CASE_STUB_DIR/gh_calls' >/dev/null"
+assert "ship-label(a): notify title starts with 'shipping:'" bash -c \
+  "grep -rl '^shipping: ENG-SHIP-A\$' '$CASE_STUB_DIR/notify_calls' >/dev/null"
+assert "ship-label(c): existing ready-to-test ping still fires on ship DONE" bash -c \
+  "grep -rl 'ready to test' '$CASE_STUB_DIR/notify_calls' >/dev/null"
+
+# --- (b) a shipping-labelled issue is NOT picked up by the intake scan even
+# if it also (stale-)carries the Queued label.
+setup_case
+now_ts="$(date -u +%FT%TZ)"
+printf '{"inbox":{},"new_intake_seen":[],"last_poll_ts":"%s"}' "$now_ts" >"$CASE_AP_HOME/scan-state.json"
+export AP_TEST_GH_ISSUES_ALL_OPEN='[{"number":880,"labels":[{"name":"Queued"},{"name":"shipping"}]}]'
+rc="$(AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-880 run_case)"
+assert "ship-label(b): exit 0" [ "$rc" -eq 0 ]
+assert "ship-label(b): claude never called (shipping excludes it from intake)" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 0 ]
+unset AP_TEST_GH_ISSUES_ALL_OPEN
 
 if [[ "$FAILURES" -eq 0 ]]; then
   echo "ALL PASS"

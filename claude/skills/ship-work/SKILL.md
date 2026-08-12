@@ -318,16 +318,17 @@ Each of the six **Hard stops** above, hit under `--headless`, ends the run as
 conflicting diff, the finding string, the out-of-plan file list, the second
 failed check, or the main/force-push/wrong-base attempt) as a comment on the
 inbox issue, prefixed with the line `Phase: ship` per the protocol's
-ask→fallback rule, set its label to `needs-input`, and write `status.json`
-with `status: NEEDS_HUMAN`, `phase: "ship"`, and `question` set to that same
-text.
+ask→fallback rule, swap its label `shipping` → `needs-input` (the wrapper
+already swapped `building` → `shipping` before invoking this phase), and
+write `status.json` with `status: NEEDS_HUMAN`, `phase: "ship"`, and
+`question` set to that same text.
 Never continue past a hard stop headlessly — the interactive rule ("stop,
 report, do not proceed to the next repo") holds unchanged; headless mode only
 changes where the stop is reported.
 
 **Success end state** (all gates clear, PRs open and green or gateless, no
 merge): PR URLs are posted as a comment on the inbox issue and the inbox
-label is swapped to `ready-to-test`. On Linear — the one write beyond the
+label is swapped `shipping` → `ready-to-test`. On Linear — the one write beyond the
 claim, and it is a label, not a comment — add label `agent:ready-to-test`;
 Linear status stays `In Progress`. Headless ship-work never posts a Linear
 comment, success or failure; the PR link(s) live on the inbox issue only.

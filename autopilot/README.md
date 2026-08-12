@@ -51,6 +51,14 @@ what you need:
   marker heuristic, and (b) a claim stranded by a mid-cycle crash that the
   poll skill's own stale-claim sweep would recover — not a queue-pickup
   mechanism. Set to `0` to disable this leg entirely.
+- `AP_BUILD_SLOTS` (default `2`, clamped to `1`-`4`) — concurrent
+  implement→ship chains. Safe here specifically because backend tests run on
+  mongomock (in-memory, per-test, never shared) and every build works in its
+  own git worktree. See "Concurrent builds" below.
+- `AP_LIMIT_COOLDOWN_MIN` (default `60`) — minutes a usage-limit auto-pause
+  (see "Two consecutive failures" below) waits before clearing itself. `0`
+  disables auto-resume entirely, so every pause then waits for a human,
+  same as before this existed.
 
 At least one of `NTFY_TOPIC` / `SLACK_WEBHOOK_URL` must be set for pings to
 actually go anywhere; unconfigured, `ap-notify.sh` just logs to
@@ -68,14 +76,20 @@ actually go anywhere; unconfigured, `ap-notify.sh` just logs to
      cycle claims it and starts building.
    - Comment anything else and it is treated as feedback: the next cycle
      re-plans in place, quoting your comment.
-4. **Build happens unattended.** `implement-plan` runs full QA (including the
-   four-server comparison), then tears down the changed-pair servers and
-   leaves only your baseline (5173/8000) bound. `ship-work` opens a PR with
-   `--no-merge`. You get a "ready to test" ping with the PR link and the exact
-   relaunch commands (worktree paths, ports) — also posted on the inbox
-   issue. Headless autopilot never comments on Linear: the claim and the
-   `agent:ready-to-test` label are its only Linear writes; everything else
-   (PR links, QA notes, relaunch commands) lands in the private inbox issue.
+4. **Build happens unattended**, on one of `AP_BUILD_SLOTS` (default `2`)
+   concurrent build slots, each with its own frontend/backend port pair
+   (`5173+n`/`8000+n` for slot `n`; the human's own `5173`/`8000` are never
+   assigned to a slot) — see "Concurrent builds" below. `implement-plan` runs
+   full QA (including the four-server comparison), then tears down the
+   changed-pair servers and leaves only your baseline (5173/8000) bound. The
+   inbox label swaps `building` → `shipping` the moment `ship-work` starts
+   (with its own ping), so you can tell "still building" apart from "opening
+   the PR" — then `ship-work` opens a PR with `--no-merge`. You get a "ready
+   to test" ping with the PR link and the exact relaunch commands (worktree
+   paths, ports) — also posted on the inbox issue. Headless autopilot never
+   comments on Linear: the claim and the `agent:ready-to-test` label are its
+   only Linear writes; everything else (PR links, QA notes, relaunch
+   commands) lands in the private inbox issue.
 5. **Morning:** run the relaunch commands from the inbox issue, test against
    the running servers, then run the interactive `/ship-work` yourself to
    merge (autonomous merging is permanently out of scope) — it also archives
@@ -95,8 +109,8 @@ Linear polling): intake happens by opening a new inbox issue titled with the
 Linear id (e.g. `ENG-1234`) from the GitHub mobile app to delegate work, or
 by commenting on an existing `plan-review` / `needs-input` inbox issue.
 Concretely, the gate wakes the poll when it finds: an open inbox issue with
-none of the six state labels (`planning`/`plan-review`/`building`/
-`ready-to-test`/`needs-input`/`failed`) — a fresh delegation; an unseen human
+none of the seven state labels (`planning`/`plan-review`/`building`/
+`shipping`/`ready-to-test`/`needs-input`/`failed`) — a fresh delegation; an unseen human
 comment (not one of autopilot's own `Plan file:` / `Phase:`-stamped posts) on
 a `plan-review` or `needs-input` inbox issue; or — as pure insurance against
 a misclassified comment or a crash-stranded claim, not a queue-pickup
@@ -105,21 +119,40 @@ i.e. 6h; `0` disables this leg entirely) since the last poll. The
 gate is deliberately biased toward waking: a wrong "maybe" costs one idle
 haiku poll, which is what the old `*/20` cadence spent on every single fire.
 
+## Concurrent builds
+
+The build lane is `AP_BUILD_SLOTS` independent slots (`lock.build.1` ..
+`lock.build.N` under `~/.autopilot`), not one — so several
+implement→ship chains can run at once. This is safe in this repo
+specifically, not in general: backend tests run on mongomock (in-memory,
+created fresh per test), so concurrent `pytest` runs never share a database,
+and every build works in its own git worktree, so concurrent implementers
+never touch the same checkout. The lane is reported busy to the poll only
+when every slot is full (lowest-numbered free slot wins). Each slot gets a
+dedicated frontend/backend port pair, `5173+n`/`8000+n` for slot `n`
+(`n` starts at `1`, so the human's own `5173`/`8000` baseline pair is never
+handed to a slot) — the orchestrator tells the headless session its ports as
+literal prompt text, `--ports fe=<port>,be=<port>`, the same mechanism as
+`--run-dir`.
+
 ## Controls
 
 ```bash
 ap up        # start the tmux session running supercronic (idempotent)
 ap down      # stop it
-ap status    # tmux liveness, pause state, last 3 ledger lines, gap warning
-ap pause     # touch ~/.autopilot/pause — cron entrypoints exit immediately
+ap status    # tmux liveness, pause state (+ reason), build slot occupancy,
+             # last 3 ledger lines, gap warning
+ap pause     # writes ~/.autopilot/pause (reason "manual", never auto-clears)
 ap resume    # rm the pause file, reset the consecutive-failure counter
 ```
 
 The pause file (`~/.autopilot/pause`) is the one-command override for
 anything invasive you're about to do by hand — it does not touch a build
-already in flight (the flock is per-cycle), but no new cycle starts while it
+already in flight (the flock is per-slot), but no new cycle starts while it
 exists. Autopilot also auto-pauses itself (with a ping) after 2 consecutive
-`FAILED` cycles.
+`FAILED` cycles. `ap down` refuses (unless `--force`d) while any build slot
+or the plan lane is occupied, for the same "would kill a build in flight"
+reason.
 
 Budgets are the other brake: `AP_MAX_ISSUES_PER_DAY` and
 `AP_MAX_DAY_COST_USD` in `~/.autopilot/env`, checked against the day's ledger
@@ -137,7 +170,14 @@ before every acting cycle.
   held lock as `failed`, with a comment. This covers both a workspace restart
   mid-run and a legitimate crash.
 - **Two consecutive failures:** autopilot auto-pauses and pings; `rm
-  ~/.autopilot/pause` or `ap resume` once you've fixed the cause.
+  ~/.autopilot/pause` or `ap resume` once you've fixed the cause. Exception:
+  if the failing run's own stderr/stdout matched a usage/rate-limit
+  signature (`usage limit`, `rate limit`, `429`, or `quota`, case-insensitive)
+  the pause is tagged reason `usage-limit` and clears **itself** once it's
+  older than `AP_LIMIT_COOLDOWN_MIN` (default `60`) minutes — a real bug
+  (reason `failures`) or a pause you set by hand (`ap pause`, reason
+  `manual`) never auto-clears. `ap status` shows the reason and, for a
+  usage-limit pause, when it will auto-resume.
 - **No cycles for a while:** `ap status` and the daily brief both surface a
   ledger gap over an hour as a warning — check the tmux session
   (`tmux attach -t autopilot`) and `~/.autopilot/logs/cycle.log`.
@@ -167,5 +207,6 @@ minutes for a build), and without the flag supercronic skips every tick while
 the previous one runs — which serializes the pipeline and leaves free lanes
 idle no matter how many issues are waiting. Overlap is safe because
 `ap-cycle.sh` owns its own mutual exclusion: `lock.poll` allows one decider at
-a time, `lock.plan` and `lock.build` cap each lane at one occupant, and a
-cycle with nothing to do exits in seconds.
+a time, `lock.plan` caps the plan lane at one occupant, `lock.build.1` ..
+`lock.build.N` (`AP_BUILD_SLOTS`) cap the build lane at N concurrent
+occupants, and a cycle with nothing to do exits in seconds.

@@ -199,10 +199,10 @@ sys.exit(0 if 'auto' in names else 1)
 
 # extract_new_intake_issues <gh-issue-list-json (number,labels)> -> issue
 # numbers, one per line, for open issues carrying the `Queued` label
-# (case-insensitive; the repo label is "Queued") and NONE of the six state
+# (case-insensitive; the repo label is "Queued") and NONE of the seven state
 # labels below -- i.e. an owner delegation (create the inbox issue, add
 # Queued), not an unlabeled draft, which the pipeline ignores entirely.
-NEW_INTAKE_STATE_LABELS='["planning","plan-review","building","ready-to-test","needs-input","failed"]'
+NEW_INTAKE_STATE_LABELS='["planning","plan-review","building","shipping","ready-to-test","needs-input","failed"]'
 extract_new_intake_issues() {
   local json="$1"
   if command -v jq >/dev/null 2>&1; then
@@ -333,15 +333,38 @@ PYEOF
 }
 
 # --- Stage 0: pause / lock.poll / budget ------------------------------------
-# Three locks, not one: lock.poll serializes the decision path (at most one
-# cycle deciding at a time); lock.build and lock.plan are held only for the
-# duration of an actual act (implement's ship chain counts as part of the
-# build lane; plan/replan is the plan lane). This lets a plan keep flowing
-# while a build runs -- at most one build AND one plan concurrently, plus the
-# one cycle currently deciding. See autopilot/README.md's concurrency section.
+# Locks, not one: lock.poll serializes the decision path (at most one cycle
+# deciding at a time); lock.plan and the AP_BUILD_SLOTS build slots
+# (lock.build.1 .. lock.build.N) are held only for the duration of an actual
+# act (implement's ship chain counts as part of the build lane it claimed;
+# plan/replan is the plan lane). This lets a plan keep flowing while builds
+# run -- up to AP_BUILD_SLOTS builds AND one plan concurrently, plus the one
+# cycle currently deciding. See autopilot/README.md's concurrency section.
 
+# A usage-limit failure (a rate/quota trip, not a real bug) auto-pauses the
+# pipeline exactly like a real failure would, and then would otherwise wait
+# for a human forever -- costing a whole night of throughput for something
+# that clears itself. So a pause file with reason "usage-limit" self-clears
+# once it's older than AP_LIMIT_COOLDOWN_MIN; any other reason ("failures",
+# "manual", or none at all -- an old-style empty pause file) keeps today's
+# behavior: exit 0, stay paused until `ap resume`.
 if [[ -e "$AP_HOME/pause" ]]; then
-  exit 0
+  pause_reason="$(head -n1 "$AP_HOME/pause" 2>/dev/null)"
+  auto_resumed=false
+  if [[ "$pause_reason" == "usage-limit" && "${AP_LIMIT_COOLDOWN_MIN:-60}" -gt 0 ]]; then
+    pause_mtime="$(stat -c %Y "$AP_HOME/pause" 2>/dev/null || echo 0)"
+    now_epoch_pause="$(date -u +%s)"
+    pause_age_min=$(( (now_epoch_pause - pause_mtime) / 60 ))
+    [[ "$pause_age_min" -ge "$AP_LIMIT_COOLDOWN_MIN" ]] && auto_resumed=true
+  fi
+  if [[ "$auto_resumed" == true ]]; then
+    rm -f "$AP_HOME/pause"
+    echo 0 >"$AP_HOME/fail_count"
+    log "pause: usage-limit cooldown elapsed, auto-resuming"
+    ap-notify.sh "autopilot auto-resumed" "usage-limit cooldown (${AP_LIMIT_COOLDOWN_MIN}m) elapsed; resuming automatically." || true
+  else
+    exit 0
+  fi
 fi
 
 exec 9>"$AP_HOME/lock.poll"
@@ -367,9 +390,21 @@ lane_free() {
   return 1
 }
 
+# Build lane = AP_BUILD_SLOTS independent slots (lock.build.1 .. lock.build.N),
+# so several implement->ship chains can run at once (see ap-env.sh for why
+# that's safe here: mongomock per-test + per-build worktrees). The lane counts
+# as busy to the poll ONLY when every slot is occupied; probing lowest-first
+# so the same slot number is reused preferentially over higher ones.
 busy_build=false
 busy_plan=false
-lane_free "$AP_HOME/lock.build" || busy_build=true
+free_build_slot=""
+for ((build_slot_n = 1; build_slot_n <= AP_BUILD_SLOTS; build_slot_n++)); do
+  if lane_free "$AP_HOME/lock.build.$build_slot_n"; then
+    free_build_slot="$build_slot_n"
+    break
+  fi
+done
+[[ -z "$free_build_slot" ]] && busy_build=true
 lane_free "$AP_HOME/lock.plan" || busy_plan=true
 
 busy_lanes=""
@@ -572,7 +607,7 @@ for item in d if isinstance(d, list) else []:
 fi
 
 # --- Inbox leg, trigger 3: new intake -- an open issue carrying the `Queued`
-# label (case-insensitive) and none of the six state labels is an owner
+# label (case-insensitive) and none of the seven state labels is an owner
 # delegation (titled with the Linear id, e.g. "ENG-1234"); an unlabeled open
 # issue is a draft the pipeline ignores entirely.
 inbox_list_all_open="$(gh issue list --repo "$AP_INBOX_REPO" --state open --json number,labels --limit 100 2>>"$AP_HOME/logs/cycle.log")"
@@ -698,13 +733,33 @@ log "poll: action=$action issue=${issue:-} plan=${plan_path:-} inbox=${inbox_iss
 # to exactly one at a time.
 act_lane=""
 act_lock_file=""
+build_slot=""
+fe_port=""
+be_port=""
 case "$action" in
   plan|replan) act_lane="plan"; act_lock_file="$AP_HOME/lock.plan" ;;
-  implement) act_lane="build"; act_lock_file="$AP_HOME/lock.build" ;;
+  implement)
+    act_lane="build"
+    build_slot="$free_build_slot"
+    if [[ -n "$build_slot" ]]; then
+      act_lock_file="$AP_HOME/lock.build.$build_slot"
+      # Port pair for this slot, so two concurrent builds never bind the same
+      # port. 5173/8000 are the human's baseline pair (README's four-server
+      # comparison) and must never be handed to a slot, hence n starting at 1.
+      fe_port=$((5173 + build_slot))
+      be_port=$((8000 + build_slot))
+    fi
+    ;;
 esac
 
 if [[ -z "$act_lane" ]]; then
   log "poll: unknown action '$action'"
+  flock -u 9
+  exit 0
+fi
+
+if [[ "$act_lane" == "build" && -z "$act_lock_file" ]]; then
+  log "act: no free build slot right after a free probe under lock.poll -- not acting this cycle; the poll's own label swap will be caught by the stale-claim sweep"
   flock -u 9
   exit 0
 fi
@@ -823,9 +878,26 @@ case "$action" in
     run_claude "replan" "/plan-issue $issue --headless --feedback '$feedback_escaped'"
     ;;
   implement)
-    run_claude "implement" "/implement-plan $plan_path --headless"
+    # --ports is literal prompt text, same mechanism as --run-dir (the
+    # dontAsk profile is path-scoped, so the session cannot read env): tells
+    # this slot's implement (and, harmlessly, ship) which changed-pair ports
+    # to bind so concurrent build slots never collide. See
+    # claude/skills/implement-plan/SKILL.md's headless section.
+    run_claude "implement" "/implement-plan $plan_path --headless --ports fe=$fe_port,be=$be_port"
     if [[ "$final_status" == "DONE" ]]; then
-      run_claude "ship" "/ship-work $plan_path --headless --no-merge"
+      # The wrapper, not the skill, owns this swap and its ping -- reliable
+      # even if the ship session dies before writing anything. `shipping` is
+      # held only for the duration of this phase (push, PR, CI wait), so the
+      # owner can tell "still building" apart from "opening the PR" instead
+      # of the inbox going silently quiet between building and ready-to-test.
+      if [[ -n "$inbox_issue" && "$inbox_issue" != "null" ]]; then
+        gh issue edit "$inbox_issue" --repo "$AP_INBOX_REPO" \
+          --add-label shipping --remove-label building \
+          >>"$AP_HOME/logs/cycle.log" 2>&1 || true
+        ap-notify.sh "shipping: ${issue:-$action}" "implement done, opening the PR" \
+          "https://github.com/$AP_INBOX_REPO/issues/$inbox_issue" || true
+      fi
+      run_claude "ship" "/ship-work $plan_path --headless --no-merge --ports fe=$fe_port,be=$be_port"
     fi
     ;;
   *)
@@ -885,8 +957,22 @@ ${stdout_tail:-no output captured}"
     fail_count=$(( fail_count + 1 ))
     echo "$fail_count" >"$AP_HOME/fail_count"
     if [[ "$fail_count" -ge 2 ]]; then
-      touch "$AP_HOME/pause"
-      ap-notify.sh "autopilot auto-paused" "2 consecutive failures. rm $AP_HOME/pause to resume." || true
+      # A usage/rate-limit trip is not a real bug -- it clears itself, so tag
+      # the pause with a reason the top-of-cycle check can act on (see Stage
+      # 0's pause handling). Any other failure gets "failures", which never
+      # auto-clears. Signature is deliberately loose (case-insensitive
+      # substring match on the failing run's own stderr+stdout) since the
+      # exact wording of a limit message isn't a documented, stable contract.
+      pause_reason="failures"
+      failure_signature="${stderr_tail:-} ${LAST_ACT_OUTPUT:-}"
+      if [[ -n "${LAST_ACT_STDERR_FILE:-}" && -f "$LAST_ACT_STDERR_FILE" ]]; then
+        failure_signature="$(cat "$LAST_ACT_STDERR_FILE" 2>/dev/null) ${LAST_ACT_OUTPUT:-}"
+      fi
+      if printf '%s' "$failure_signature" | grep -qiE 'usage limit|rate limit|429|quota'; then
+        pause_reason="usage-limit"
+      fi
+      echo "$pause_reason" >"$AP_HOME/pause"
+      ap-notify.sh "autopilot auto-paused" "2 consecutive failures (reason: $pause_reason). rm $AP_HOME/pause to resume." || true
     fi
     ;;
 

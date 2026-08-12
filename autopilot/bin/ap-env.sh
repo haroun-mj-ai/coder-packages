@@ -50,3 +50,29 @@ export AP_AUTO_APPROVE="${AP_AUTO_APPROVE:-0}"
 # Marker inherited by every claude process autopilot spawns; the user's
 # global Stop hook checks it to avoid phone-pinging on headless cycles.
 export AP_AUTOPILOT=1
+
+# Build lane concurrency: N implement->ship chains can run at once instead of
+# one. Safe to parallelize because of two properties of THIS repo, not a
+# general guarantee: backend tests run on mongomock (in-memory, created fresh
+# per test), so concurrent `pytest` runs never share a database; and every
+# build works in its own git worktree, so concurrent implementers never touch
+# the same checkout. Clamped to 1..4 -- each slot gets its own frontend/
+# backend port pair (see ap-cycle.sh), and the CORS allowlist plus this
+# workspace's realistic resource budget both cap out well before higher N
+# would help.
+export AP_BUILD_SLOTS="${AP_BUILD_SLOTS:-2}"
+if ! [[ "$AP_BUILD_SLOTS" =~ ^[0-9]+$ ]]; then
+  AP_BUILD_SLOTS=2
+elif [[ "$AP_BUILD_SLOTS" -lt 1 ]]; then
+  AP_BUILD_SLOTS=1
+elif [[ "$AP_BUILD_SLOTS" -gt 4 ]]; then
+  AP_BUILD_SLOTS=4
+fi
+export AP_BUILD_SLOTS
+
+# Minutes the pipeline stays auto-paused after a usage-limit failure before
+# clearing itself (see ap-cycle.sh's pause-reason handling). A real-bug pause
+# (reason "failures") or a manual pause (reason "manual") never auto-clears,
+# regardless of this value. 0 disables auto-resume entirely -- every pause
+# then waits for a human, same as before this feature existed.
+export AP_LIMIT_COOLDOWN_MIN="${AP_LIMIT_COOLDOWN_MIN:-60}"

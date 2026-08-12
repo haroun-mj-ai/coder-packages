@@ -58,9 +58,9 @@ items** — except Spend and Health, which are always printed, so a fully
 quiet day still reports something.
 
 - **Queued** — `inbox` entries carrying the `Queued` label (case-insensitive)
-  and none of the six state labels
-  (`planning`/`plan-review`/`building`/`ready-to-test`/`needs-input`/
-  `failed`): one line each, issue title + URL. These are delegations the
+  and none of the seven state labels
+  (`planning`/`plan-review`/`building`/`shipping`/`ready-to-test`/
+  `needs-input`/`failed`): one line each, issue title + URL. These are delegations the
   owner created and labeled since the last cycle picked them up; the section
   clears once `autopilot-poll` claims them into `planning`.
   - **Drafts (unlabeled — add the Queued label to delegate)** — a separate
@@ -79,6 +79,11 @@ quiet day still reports something.
   still auto-approve without the label; say so plainly rather than inventing
   it: end the section with one line noting that some entries may auto-approve
   via the global flag or an `auto` comment even without the label shown here.
+- **Shipping** — `inbox` entries labeled `shipping`: one line each, issue
+  title + URL. These are mid-`ship-work` (pushing, opening the PR, waiting on
+  CI) — a build already implemented and QA'd, not yet a PR to review. The
+  input has no started-at time (that lives only in the ledger's `ship` rows,
+  which this section does not cross-reference), so just list them.
 - **Ready to test** — `inbox` entries labeled `ready-to-test`: one line each,
   issue title + URL. The input has no PR links or relaunch commands (those
   live in the inbox issue's own comments, which this skill cannot read) — say

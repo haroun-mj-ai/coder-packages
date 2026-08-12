@@ -615,6 +615,27 @@ the teardown actually happened with `ss -ltnp` (before/after, or immediately
 after stopping) and note the result in `detail`; a server left bound defeats
 the port-budget point of this whole step.
 
+**`--ports fe=<n>,be=<m>` overrides the port range above.** The orchestrator
+runs several build slots concurrently (`AP_BUILD_SLOTS`), each with its own
+port pair, and hands the assigned pair to this invocation as literal prompt
+text — the same mechanism as `--run-dir`, and for the same reason: the
+`dontAsk` profile is path-scoped, so the session cannot read it from env.
+When `--ports` is present, bind the changed-pair frontend and backend to
+**exactly** those two ports, `fe=<n>` for `vite --port` and `be=<m>` for the
+worktree `uvicorn --port`, instead of 1c/step 11's 5173–5176 range — and
+**never** to the baseline pair (5173/8000), even if `--ports` happens to
+name a port inside that historical range. Start the worktree backend with
+`BACKEND_CORS_ORIGINS` set to a JSON list containing at least
+`http://localhost:<feport>`, e.g.
+`BACKEND_CORS_ORIGINS='["http://localhost:<feport>"]' uvicorn app.main:app --port <beport>`
+— per `backend/app/main.py`'s `settings.BACKEND_CORS_ORIGINS or
+_DEFAULT_CORS_ORIGINS`, setting this env var **replaces** the default
+allowlist rather than extending it, which is exactly what lets a `--ports`
+pair outside 5173–5176 work at all; omitting it here is the same broken-page
+failure 1c warns about, just for a different port range. The teardown rule
+is unchanged either way: stop the changed pair after QA, leave the baseline
+alone, and record the relaunch commands with the actual ports used.
+
 **End state.** Commit exactly as interactive mode does (step 10: explicit
 paths, only the human's `Co-Authored-By` trailers), and run `roborev` exactly
 as interactive mode does. Then write `status.json` with `status: DONE`,

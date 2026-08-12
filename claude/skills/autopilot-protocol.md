@@ -91,7 +91,7 @@ team-visible.
   context, not machine-parsed.
 - **`Queued` label = new delegation.** An open inbox issue carrying the
   `Queued` label (case-insensitive match on the label name) and none of the
-  six state labels below is unclaimed work waiting for `autopilot-poll` to
+  seven state labels below is unclaimed work waiting for `autopilot-poll` to
   pick it up. An open issue WITHOUT `Queued` is a **draft** — the pipeline
   ignores it entirely, whether or not it carries a state label. On claiming
   it, the poll removes `Queued` and adds the target state label
@@ -116,8 +116,16 @@ team-visible.
   regardless of any switch.
 - **State labels** — exactly one held at a time, swapped rather than
   accumulated:
-  `planning`, `plan-review`, `building`, `ready-to-test`, `needs-input`,
-  `failed`. Swap with:
+  `planning`, `plan-review`, `building`, `shipping`, `ready-to-test`,
+  `needs-input`, `failed`. State machine:
+  `planning → plan-review → building → shipping → ready-to-test`, with
+  `needs-input`/`failed` reachable from any state. `shipping` is the odd one
+  out: it is set by the **orchestrator** (`ap-cycle.sh`), not by a skill,
+  right before it invokes the ship phase (`building` → `shipping`) — this
+  makes it reliable even if the ship session dies before writing anything.
+  `/ship-work --headless` owns the swap out of it (`shipping` →
+  `ready-to-test` on success, `shipping` → `needs-input` on a hard stop).
+  Every other swap is skill-side. Swap with:
   ```bash
   gh issue edit <n> --repo "$AP_INBOX_REPO" --add-label <new> --remove-label <old>
   ```
@@ -178,7 +186,19 @@ headless-safe default.
 
 The wrapper (`ap-cycle.sh`), not the skill, guarantees:
 
-- `$AP_RUN_DIR` exists before the skill runs.
+- `$AP_RUN_DIR` exists before the skill runs, and its absolute path is
+  appended to the invocation as literal prompt text, `--run-dir <path>` — the
+  `dontAsk` profile is path-scoped, so the session usually cannot read
+  `$AP_RUN_DIR` from its environment.
+- For `implement`/`ship` acts, the assigned build slot's port pair is
+  appended the same way: `--ports fe=<port>,be=<port>`. Under this flag,
+  bind exactly those two ports for the changed pair (never the human's
+  baseline 5173/8000) — see `implement-plan`'s headless section for the CORS
+  implication.
+- The `building` → `shipping` inbox-label swap happens before the ship phase
+  is invoked (see "State labels" above) and the "shipping: `<issue>`" phone
+  ping fires at the same time — both wrapper-side, not skill-side, so they
+  happen even if the ship session dies before writing anything.
 - Reconciliation of `FAILED` or crashed runs (missing `status.json`) — a
   skill never needs to self-handle a crash; it only needs to write
   `status.json` on every path it controls.

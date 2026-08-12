@@ -131,7 +131,9 @@ poll, one claim, one JSON object.
        `Phase: plan`.
 
 4. **Open inbox issues carrying the `Queued` label** (case-insensitive) **and
-   none of the six state labels** → a new owner delegation, oldest first.
+   none of the seven state labels** (including `shipping` — the orchestrator
+   sets that one, not this skill, but a stale `Queued` label must not
+   re-enter intake while it's set) → a new owner delegation, oldest first.
    Skip this tier entirely if `plan` is in `--busy-lanes`. An open issue
    WITHOUT `Queued` is a draft — the pipeline ignores it entirely, whether or
    not it has a state label.

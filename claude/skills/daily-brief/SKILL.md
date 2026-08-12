@@ -1,78 +1,101 @@
 ---
 name: daily-brief
-description: Composes the daily autopilot digest — what's awaiting approval, ready to test, blocked, failed, and today's spend/health — from the run ledger and inbox state. Invoked by the orchestrator at 07:00 (ap-brief.sh) or manually. Prints markdown to stdout; makes no state changes beyond writing the brief file and its own timestamp marker.
+description: Composes the daily autopilot digest — what's awaiting approval, ready to test, blocked, failed, and today's spend/health — from a pre-gathered JSON snapshot. Invoked headless by the orchestrator (ap-brief.sh) at 07:00 AP_TZ. Prints markdown to stdout; makes no state changes of any kind.
 ---
 
 # daily-brief
 
-Reads what happened since the last brief and prints a short markdown digest.
-Read-only against the pipeline itself — this skill never touches inbox
-labels, Linear, or any run state. Its only writes are the brief file and the
-timestamp marker that tracks "since when" for the next run.
+Pure transform. `ap-brief.sh` runs under a `dontAsk` profile that is
+path-scoped to the project, so this skill has **no access to `~/.autopilot`**
+(no ledger, no env, no marker file) and makes **no `gh` calls** — the wrapper
+already gathered everything and handed it over as a single JSON file. Read
+that file, print a markdown digest to stdout, and stop. That is the entire
+job: no reads outside the input file, no writes anywhere (the wrapper owns
+the brief file and the `.last-brief-ts` marker), no questions.
 
 Shared vocabulary — inbox labels, the ledger shape, the protocol's
 `status.json` fields — is defined in `.claude/skills/autopilot-protocol.md`.
 Read it first.
 
-## Inputs
+## Input
 
-- **Ledger since the last brief:** `~/.autopilot/runs/*.jsonl`, filtered to
-  entries with `ts` after the timestamp recorded in
-  `~/.autopilot/briefs/.last-brief-ts` (ISO-8601). If that marker file is
-  absent (first-ever brief), use all available ledger entries.
-- **Current inbox state:**
-  ```bash
-  gh issue list --repo "$AP_INBOX_REPO" --state open \
-    --json number,title,labels
-  ```
-- Budgets: `$AP_MAX_DAY_COST_USD`, `$AP_MAX_ISSUES_PER_DAY` (same env as
-  `ap-cycle.sh`; source `~/.autopilot/env` if the wrapper hasn't already).
+The file named by the `--input <path>` argument, inside the project (read it
+with the Read tool). Shape:
+
+```json
+{
+  "since": "<ISO ts>",
+  "now": "<ISO ts>",
+  "ledger": [ {"ts": "...", "issue": "ENG-123 or null", "phase": "poll|plan|replan|implement|ship", "status": "...", "cost": 0.0, "session_id": "..."}, ... ],
+  "inbox": [ {"number": 1, "title": "...", "labels": [{"name": "..."}], "url": "..."}, ... ],
+  "budget": {"max_issues": 3, "max_cost": 50, "today_cost": 0.0, "today_issues": 0},
+  "health": {"newest_entry_age_min": 5, "paused": false, "scheduler_alive": true}
+}
+```
+
+- `ledger` is every row from `$AP_HOME/runs/*.jsonl` with `ts` >= `since`
+  (all rows, if this is the first-ever brief).
+- `inbox` is every currently-open inbox issue (`gh issue list --state open
+  --json number,title,labels,url`), regardless of window.
+- `health.newest_entry_age_min` is `null` if there has never been a ledger
+  entry at all.
+
+If the input file is missing, empty, or fails to parse as JSON, print
+exactly one line and stop:
+
+```
+Daily brief unavailable: could not read the input file.
+```
+
+Do not apologize, do not ask a question, do not attempt to reconstruct the
+digest from anything else — there is nothing else available to this skill.
 
 ## Digest sections
 
 Compose, in this order, one line per item, each line linking out (inbox
-issue URL, PR URL) where a link exists. **Omit a section entirely if it has
-no items** — except Spend and Health, which are always printed, so a fully
+issue URL) where a link exists. **Omit a section entirely if it has no
+items** — except Spend and Health, which are always printed, so a fully
 quiet day still reports something.
 
-- **Queued** — open inbox issues with none of the six state labels: one line
-  each, issue title + inbox URL. These are delegations the owner created
-  since the last cycle picked them up; the section clears once
+- **Queued** — `inbox` entries with none of the six state labels
+  (`planning`/`plan-review`/`building`/`ready-to-test`/`needs-input`/
+  `failed`): one line each, issue title + URL. These are delegations the
+  owner created since the last cycle picked them up; the section clears once
   `autopilot-poll` claims them into `planning`.
-- **Awaiting your approval** — inbox issues currently labeled
-  `plan-review`: one line each, issue title + inbox URL.
-- **Ready to test** — inbox issues currently labeled `ready-to-test`: one
-  line each with the PR link(s) and the relaunch command(s) recorded on that
-  issue (per `/implement-plan`'s headless server-teardown section — pull
-  them from the inbox comment, not the ledger).
-- **Needs input** — inbox issues currently labeled `needs-input`: one line
-  each with the exact question (from the issue's own comment, or from a
-  ledger entry's `status.json` `question` field if more current). If the
-  newest `NEEDS_HUMAN` comment's `Phase:` line reads `Phase: ship`, append
-  "resolve interactively (`/ship-work`)" — that stop needs the owner's own
-  session, not a `go`/feedback reply autopilot can act on.
-- **Failed** — inbox issues currently labeled `failed`: one line each with
-  the last error line (from the failing ledger entry's `detail`, or the
-  inbox `failed` comment if the ledger entry is missing/stale).
-- **Spend** — always present: total `total_cost_usd` summed across the
-  ledger entries in this window vs. `$AP_MAX_DAY_COST_USD`, and count of
-  distinct issues acted on vs. `$AP_MAX_ISSUES_PER_DAY`.
-- **Health** — always present: warn if the newest ledger entry overall
-  (not just in-window) is older than 1 hour (scheduler gap), and warn if
-  `~/.autopilot/pause` exists (autopilot is paused).
+- **Awaiting your approval** — `inbox` entries labeled `plan-review`: one
+  line each, issue title + URL.
+- **Ready to test** — `inbox` entries labeled `ready-to-test`: one line each,
+  issue title + URL. The input has no PR links or relaunch commands (those
+  live in the inbox issue's own comments, which this skill cannot read) — say
+  so plainly ("see inbox issue for PR link + relaunch commands") rather than
+  inventing a link.
+- **Needs input** — `inbox` entries labeled `needs-input`: one line each,
+  issue title + URL. The input has no comment body, so the exact question
+  and the `Phase:` marker (which would flag a `ship`-phase stop as needing an
+  interactive `/ship-work` rather than a `go`/feedback reply) are not
+  derivable from this data — say so plainly ("see inbox issue for the
+  question") rather than inventing either.
+- **Failed** — `inbox` entries labeled `failed`: one line each, issue title +
+  URL. The ledger rows carry no error text (that lives only in the inbox
+  `failed` comment, which this skill cannot read) — say so plainly ("see
+  inbox issue for the error") rather than inventing one.
+- **Spend** — always present: `budget.today_cost` vs `budget.max_cost`, and
+  `budget.today_issues` vs `budget.max_issues`.
+- **Health** — always present: warn if `health.newest_entry_age_min` is
+  `null` (no ledger activity ever) or greater than 60 (scheduler gap); warn
+  if `health.paused` is true (autopilot is paused); warn if
+  `health.scheduler_alive` is false (the tmux session isn't running at all).
+  Otherwise report "ok".
 
 A day with zero ledger activity and an empty inbox still prints Spend
-(`$0.00 / $AP_MAX_DAY_COST_USD`, `0 / $AP_MAX_ISSUES_PER_DAY` issues) and
-Health (gap warning if applicable, or "ok").
+(`$0.00 / $<max_cost>`, `0 / $<max_issues>` issues) and Health (whichever
+warnings apply, or "ok").
 
 ## Output
 
-1. Write the full digest to `~/.autopilot/briefs/YYYY-MM-DD.md` (today's
-   date, local).
-2. Update `~/.autopilot/briefs/.last-brief-ts` to the current time, so the
-   next brief's window starts here. Do this only after the file write above
-   succeeds.
-3. Print the **same, full** digest to stdout as the skill's final output —
-   this is what `ap-brief.sh` pipes to the phone notifier. Nothing else goes
-   to stdout; this is markdown for a human to read, not a machine-parsed
-   contract like `autopilot-poll`'s JSON.
+Print the digest markdown to stdout. Nothing else — no preamble, no
+questions, no trailing commentary. This is markdown for a human to read
+(the wrapper forwards it verbatim to the phone notifier), not a
+machine-parsed contract like `autopilot-poll`'s JSON. The skill makes no
+writes of any kind; `ap-brief.sh` owns the brief file, the marker, and
+cleanup of the input file.

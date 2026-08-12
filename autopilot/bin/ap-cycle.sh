@@ -651,6 +651,10 @@ ${stdout_tail:-no output captured}"
     if [[ "$final_phase" == "ship" ]]; then
       pr_urls="$(json_join "$status_json" ".pr_urls")"
       ap-notify.sh "ready to test: ${issue:-$action}" "${pr_urls:-see inbox}" "$inbox_url" || true
+    elif [[ "$final_phase" == "plan" || "$final_phase" == "replan" ]]; then
+      # The approval gate is the whole point: the owner must know a plan is
+      # waiting for review the moment it lands.
+      ap-notify.sh "plan ready for review: ${issue:-$action}" "comment 'go' to build, anything else = feedback" "$inbox_url" || true
     fi
     ;;
 esac

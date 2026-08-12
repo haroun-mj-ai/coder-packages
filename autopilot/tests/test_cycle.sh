@@ -310,6 +310,8 @@ if [[ -f "$act_args" ]]; then
   assert "case4: act call prompt has --headless" bash -c "grep -q -- '--headless' '$act_args'"
   assert "case4: act call prompt has --run-dir with the run path" bash -c "grep -q -- '--run-dir /' '$act_args'"
   assert "case4: act call prompt targets plan-issue ENG-4" bash -c "grep -q 'plan-issue ENG-4' '$act_args'"
+  assert "case4: plan DONE pings the owner (plan ready for review)" bash -c \
+    "grep -rl 'plan ready for review' '$CASE_STUB_DIR/notify_calls' >/dev/null"
 else
   fail "case4: act call has --settings (no 2.args file)"
   fail "case4: act call settings path is absolute autopilot.json"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Autopilot CLI: up / down / status / pause / resume.
+# Autopilot CLI: up / down / status / pause / resume / runs / run / tail / watch.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
@@ -11,11 +11,27 @@ CRONTAB_RENDERED="$AP_HOME/crontab.rendered"
 TMUX_SESSION="autopilot"
 
 usage() {
-  echo "Usage: ap {up [--quiet]|down|status|pause|resume|--print-paths}" >&2
+  echo "Usage: ap {up [--quiet]|down|status|pause|resume|runs|run|tail|watch|--print-paths}" >&2
+  echo "  runs [-n N]    List recent acts; live ones are marked LIVE." >&2
+  echo "  run  [TARGET]  One act in detail: main-loop model, tokens, tool mix," >&2
+  echo "                 status.json, stderr, final message. --timeline for" >&2
+  echo "                 every tool call it made." >&2
+  echo "  tail [TARGET]  Follow an act as it works, or replay a finished one." >&2
+  echo "  watch          tmux pane per live act, each tailing it." >&2
+  echo "  TARGET is a session-id prefix, an issue id (ENG-1234), or 'latest'." >&2
   echo "  --print-paths  Debug: render the crontab and print resolved paths" >&2
   echo "                 (script dir, crontab template/rendered, AP_HOME); exits 0." >&2
   exit 1
 }
+
+# An act is a headless `claude -p`, so there is no pane to attach to. These
+# four read its transcript, run dir and ledger row instead; the backend is one
+# python script so the joining logic lives in one place.
+RUNS_PY="$SCRIPT_DIR/ap-runs.py"
+cmd_runs() { python3 "$RUNS_PY" list "$@"; }
+cmd_run() { python3 "$RUNS_PY" show "$@"; }
+cmd_tail() { python3 -u "$RUNS_PY" tail "$@"; }
+cmd_watch() { python3 "$RUNS_PY" watch "$@"; }
 
 session_alive() {
   tmux has-session -t "$TMUX_SESSION" 2>/dev/null
@@ -169,6 +185,10 @@ case "$sub" in
   status) cmd_status ;;
   pause) cmd_pause ;;
   resume) cmd_resume ;;
+  runs) cmd_runs "$@" ;;
+  run) cmd_run "$@" ;;
+  tail) cmd_tail "$@" ;;
+  watch) cmd_watch "$@" ;;
   --print-paths) cmd_print_paths ;;
   *) usage ;;
 esac

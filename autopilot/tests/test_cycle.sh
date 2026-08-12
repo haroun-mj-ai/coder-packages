@@ -288,6 +288,14 @@ setup_case
 rc="$(AP_TEST_POLL_ACTION=plan AP_TEST_POLL_ISSUE=ENG-4 run_case)"
 assert "case4: exit 0" [ "$rc" -eq 0 ]
 assert "case4: two claude calls (poll + plan)" [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 2 ]
+poll_args="$CASE_STUB_DIR/claude_calls/1.args"
+if [[ -f "$poll_args" ]]; then
+  assert "case4: poll call has --settings" bash -c "grep -qx -- '--settings' '$poll_args'"
+  assert "case4: poll call settings path is absolute autopilot.json" bash -c "grep -q '/autopilot/settings/autopilot.json$' '$poll_args'"
+else
+  fail "case4: poll call has --settings (no 1.args file)"
+  fail "case4: poll call settings path is absolute autopilot.json"
+fi
 act_args="$CASE_STUB_DIR/claude_calls/2.args"
 if [[ -f "$act_args" ]]; then
   assert "case4: act call has --settings" bash -c "grep -qx -- '--settings' '$act_args'"

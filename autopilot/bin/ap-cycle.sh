@@ -458,7 +458,7 @@ log "scan: waking poll ($wake_reason)"
 POLL_SCHEMA='{"type":"object","properties":{"action":{"type":"string","enum":["plan","implement","replan","none"]},"issue":{"type":"string"},"planPath":{"type":"string"},"inboxIssue":{"type":"number"},"feedback":{"type":"string"}},"required":["action"]}'
 
 poll_rc=0
-poll_output="$(claude -p "/autopilot-poll" --model haiku --output-format json --json-schema "$POLL_SCHEMA" 2>>"$AP_HOME/logs/cycle.log")" || poll_rc=$?
+poll_output="$(claude -p "/autopilot-poll" --model haiku --settings "$SETTINGS_PATH" --output-format json --json-schema "$POLL_SCHEMA" 2>>"$AP_HOME/logs/cycle.log")" || poll_rc=$?
 
 if [[ $poll_rc -ne 0 ]]; then
   log "poll invocation failed rc=$poll_rc"

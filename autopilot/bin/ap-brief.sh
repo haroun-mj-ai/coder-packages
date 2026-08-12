@@ -9,6 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 source "$SCRIPT_DIR/ap-env.sh"
 
 WORK_REPO="${AP_WORK_REPO:-/home/coder/root-for-local}"
+SETTINGS_PATH="$(cd "$SCRIPT_DIR/../settings" && pwd)/autopilot.json"
 MAX_BODY_CHARS=3500
 
 mkdir -p "$AP_HOME" "$AP_HOME/logs" "$AP_HOME/briefs"
@@ -20,7 +21,7 @@ log() {
 pushd "$WORK_REPO" >/dev/null 2>&1 || cd "$WORK_REPO" || exit 0
 
 rc=0
-digest="$(claude -p "/daily-brief" --model haiku 2>>"$AP_HOME/logs/brief.log")" || rc=$?
+digest="$(claude -p "/daily-brief" --model haiku --settings "$SETTINGS_PATH" 2>>"$AP_HOME/logs/brief.log")" || rc=$?
 
 popd >/dev/null 2>&1 || true
 

@@ -1125,6 +1125,39 @@ rc="$(AP_PLAN_MODEL=fable AP_TEST_POLL_ACTION=plan AP_TEST_POLL_ISSUE=ENG-26 run
 assert "case26: override cycle exit 0" [ "$rc" -eq 0 ]
 assert_model "case26: plan honours AP_PLAN_MODEL" "$CASE_STUB_DIR/claude_calls/2.args" fable
 
+# =============================================================================
+# Case 27: the ledger row records the model the act ran on. Without it the only
+# way to learn what a run cost money on is to dig its transcript out of
+# ~/.claude, which is how a pipeline on fable-5 went unnoticed for a day.
+# =============================================================================
+setup_case
+rc="$(AP_TEST_POLL_ACTION=plan AP_TEST_POLL_ISSUE=ENG-27 run_case)"
+ledger="$(today_ledger)"
+assert "case27: exit 0" [ "$rc" -eq 0 ]
+assert "case27: poll row records the poll model, act row records the act model" bash -c \
+  "python3 -c \"
+import json
+rows = [json.loads(l) for l in open('$ledger') if l.strip()]
+poll = [r for r in rows if r['phase'] == 'poll']
+plan = [r for r in rows if r['phase'] == 'plan']
+assert len(poll) == 1 and len(plan) == 1, rows
+assert poll[0]['model'] == 'haiku', poll[0]
+assert plan[0]['model'] == 'opus', plan[0]
+\""
+
+# the override must reach the ledger too, not just the argv
+setup_case
+rc="$(AP_PLAN_MODEL=fable AP_TEST_POLL_ACTION=plan AP_TEST_POLL_ISSUE=ENG-27 run_case)"
+ledger="$(today_ledger)"
+assert "case27: override cycle exit 0" [ "$rc" -eq 0 ]
+assert "case27: ledger records the overridden model" bash -c \
+  "python3 -c \"
+import json
+rows = [json.loads(l) for l in open('$ledger') if l.strip()]
+plan = [r for r in rows if r['phase'] == 'plan']
+assert plan and plan[0]['model'] == 'fable', plan
+\""
+
 if [[ "$FAILURES" -eq 0 ]]; then
   echo "ALL PASS"
   exit 0

@@ -71,6 +71,15 @@ assert "list: poll rows appear with --all" bash -c \
 assert "list: MODEL column is the main-loop model, not the subagent's" \
   grep -q 'ENG-1 .*DONE .*opus-5' <<<"$out"
 
+# A row that carries ap-cycle.sh's own model field is trusted over the
+# transcript; the fixture above has no model field, so this proves the
+# preference rather than the fallback.
+cat >>"$AP_HOME/runs/2026-08-12.jsonl" <<LEDGER2
+{"ts":"2026-08-12T03:00:00Z","issue":"ENG-3","phase":"ship","status":"DONE","cost":1.0,"session_id":"dddddddd-0000-0000-0000-000000000000","model":"sonnet"}
+LEDGER2
+assert "list: uses the ledger's model field when present (no transcript needed)" \
+  bash -c "python3 '$RUNS_PY' list -n 10 | grep -q 'ENG-3 .*DONE .*sonnet'"
+
 # --- show --------------------------------------------------------------------
 out="$(python3 "$RUNS_PY" show "${SID_OK:0:8}" 2>&1)"
 assert "show: resolves a session-id prefix" grep -q "$SID_OK" <<<"$out"

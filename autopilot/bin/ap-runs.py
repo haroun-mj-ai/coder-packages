@@ -257,7 +257,9 @@ def cmd_list(args):
     for r in rows:
         t = transcript(r.get("session_id"))
         s = summarize(t) if t else None
-        model = main_model(s)
+        # Prefer the ledger's own model field; fall back to the transcript for
+        # rows written before ap-cycle.sh started recording it.
+        model = r.get("model") or main_model(s)
         dur = (s["last"] - s["first"]).total_seconds() / 60 if s and s["first"] and s["last"] else 0
         st = str(r.get("status"))
         cl = "g" if st in ("DONE",) else "r" if st == "FAILED" else "dim"

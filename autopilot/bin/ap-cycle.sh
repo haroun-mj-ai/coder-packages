@@ -11,6 +11,9 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 source "$SCRIPT_DIR/ap-env.sh"
 
 SETTINGS_PATH="$(cd "$SCRIPT_DIR/.." && pwd)/settings/autopilot.json"
+# The poll only triages, so it stays on the cheapest model. Declared here, and
+# used both for the invocation and for the ledger row, so the two cannot drift.
+POLL_MODEL="${AP_POLL_MODEL:-haiku}"
 WORK_REPO="${AP_WORK_REPO:-/home/coder/root-for-local}"
 
 # EVERY claude invocation in this cycle -- the poll included -- must run from
@@ -283,14 +286,18 @@ ledger_path() {
   echo "$AP_HOME/runs/$(TZ="$AP_TZ" date +%F).jsonl"
 }
 
-# append_ledger <issue> <phase> <status> <cost> <session_id>
+# append_ledger <issue> <phase> <status> <cost> <session_id> [model]
+# `model` is the model the act actually ran on. Recorded because otherwise the
+# only way to learn it is to dig the transcript out of ~/.claude and read the
+# per-message model field -- which is how a pipeline silently running fable-5
+# went unnoticed for a day.
 # Two-lane concurrency: a build act and a plan act can both be appending to
 # TODAY's ledger file at the same moment. That's fine -- each call here is a
 # single `>>` write of one already-fully-formed line, and POSIX guarantees
 # O_APPEND writes of that shape don't interleave/corrupt each other even
 # across processes. No locking needed for this file.
 append_ledger() {
-  local issue="$1" phase="$2" status="$3" cost="$4" session_id="$5"
+  local issue="$1" phase="$2" status="$3" cost="$4" session_id="$5" model="${6:-}"
   local ts ledger_file
   ts="$(date -u +%FT%TZ)"
   ledger_file="$(ledger_path)"
@@ -299,13 +306,14 @@ append_ledger() {
     jq -nc \
       --arg ts "$ts" --arg issue "$issue" --arg phase "$phase" \
       --arg status "$status" --arg session_id "${session_id:-unknown}" \
+      --arg model "$model" \
       --argjson cost "${cost:-0}" \
-      '{ts:$ts, issue: (if $issue=="" then null else $issue end), phase:$phase, status:$status, cost:$cost, session_id:$session_id}' \
+      '{ts:$ts, issue: (if $issue=="" then null else $issue end), phase:$phase, status:$status, cost:$cost, session_id:$session_id, model: (if $model=="" then null else $model end)}' \
       >>"$ledger_file" 2>>"$AP_HOME/logs/cycle.log"
   else
-    python3 - "$ts" "$issue" "$phase" "$status" "$cost" "$session_id" >>"$ledger_file" <<'PYEOF'
+    python3 - "$ts" "$issue" "$phase" "$status" "$cost" "$session_id" "$model" >>"$ledger_file" <<'PYEOF'
 import json, sys
-ts, issue, phase, status, cost, session_id = sys.argv[1:7]
+ts, issue, phase, status, cost, session_id, model = sys.argv[1:8]
 try:
     cost_val = float(cost) if cost not in ("", "null") else 0.0
 except ValueError:
@@ -317,6 +325,7 @@ line = {
     "status": status,
     "cost": cost_val,
     "session_id": session_id if session_id not in ("", "null") else "unknown",
+    "model": model if model not in ("", "null") else None,
 }
 print(json.dumps(line))
 PYEOF
@@ -634,11 +643,11 @@ poll_prompt="/autopilot-poll"
 [[ "$AP_AUTO_APPROVE" == "1" ]] && poll_prompt="$poll_prompt --auto-approve"
 
 poll_rc=0
-poll_output="$(claude -p "$poll_prompt" --model haiku --settings "$SETTINGS_PATH" --output-format json --json-schema "$POLL_SCHEMA" 2>>"$AP_HOME/logs/cycle.log")" || poll_rc=$?
+poll_output="$(claude -p "$poll_prompt" --model "$POLL_MODEL" --settings "$SETTINGS_PATH" --output-format json --json-schema "$POLL_SCHEMA" 2>>"$AP_HOME/logs/cycle.log")" || poll_rc=$?
 
 if [[ $poll_rc -ne 0 ]]; then
   log "poll invocation failed rc=$poll_rc"
-  append_ledger "" "poll" "FAILED" 0 "unknown"
+  append_ledger "" "poll" "FAILED" 0 "unknown" "$POLL_MODEL"
   flock -u 9
   exit 0
 fi
@@ -671,7 +680,7 @@ feedback="$(json_field "$poll_json" ".feedback")"
 
 poll_cost="$(json_field "$poll_output" ".total_cost_usd")"
 poll_session="$(json_field "$poll_output" ".session_id")"
-append_ledger "$issue" "poll" "${action:-none}" "${poll_cost:-0}" "${poll_session:-unknown}"
+append_ledger "$issue" "poll" "${action:-none}" "${poll_cost:-0}" "${poll_session:-unknown}" "$POLL_MODEL"
 
 if [[ -z "$action" || "$action" == "none" ]]; then
   log "poll: no action"
@@ -792,7 +801,7 @@ run_claude() {
   if [[ -z "${st:-}" ]]; then
     st="FAILED"
   fi
-  append_ledger "$issue" "$phase" "$st" "${cost:-0}" "${session_id:-unknown}"
+  append_ledger "$issue" "$phase" "$st" "${cost:-0}" "${session_id:-unknown}" "$model"
   final_phase="$phase"
   final_status="$st"
   LAST_ACT_OUTPUT="$out"

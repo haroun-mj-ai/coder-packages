@@ -1,0 +1,10 @@
+# supercronic crontab TEMPLATE for autopilot. Installed bin/* are symlinked
+# into ~/.local/bin by scripts/install-autopilot.sh (U2). `ap up` renders
+# this template to $AP_HOME/crontab.rendered, replacing the CRON_TZ line
+# below with `CRON_TZ=$AP_TZ` (sourced from ap-env.sh / ~/.autopilot/env at
+# run time), and points supercronic at the rendered file. The line below is
+# just the template default — defaults to UTC if AP_TZ is unset.
+CRON_TZ=UTC
+
+*/20 * * * * /home/coder/.local/bin/ap-cycle.sh
+0 7 * * * /home/coder/.local/bin/ap-brief.sh

@@ -40,6 +40,12 @@
           # git subcommand/flag completion. Absent from the base workspace
           # image, so bare bash has no `git ` completion without it.
           inherit (pkgs) bash-completion;
+
+          # Autopilot scheduler substrate: a persistent session to hold
+          # supercronic, and the cron-alike itself. Wired up by
+          # scripts/install-autopilot.sh.
+          inherit (pkgs) tmux;
+          inherit (pkgs) supercronic;
         };
 
         extras = builtins.attrValues extraAttrs;

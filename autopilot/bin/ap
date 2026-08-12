@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# Autopilot CLI: up / down / status / pause / resume.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/ap-env.sh"
+
+CRONTAB_TEMPLATE="$(cd "$SCRIPT_DIR/.." && pwd)/crontab"
+CRONTAB_RENDERED="$AP_HOME/crontab.rendered"
+TMUX_SESSION="autopilot"
+
+usage() {
+  echo "Usage: ap {up [--quiet]|down|status|pause|resume|--print-paths}" >&2
+  echo "  --print-paths  Debug: render the crontab and print resolved paths" >&2
+  echo "                 (script dir, crontab template/rendered, AP_HOME); exits 0." >&2
+  exit 1
+}
+
+session_alive() {
+  tmux has-session -t "$TMUX_SESSION" 2>/dev/null
+}
+
+# render_crontab: writes $CRONTAB_RENDERED from $CRONTAB_TEMPLATE with the
+# CRON_TZ line replaced by the current AP_TZ (sourced from ap-env.sh above).
+render_crontab() {
+  mkdir -p "$AP_HOME"
+  sed "s|^CRON_TZ=.*|CRON_TZ=$AP_TZ|" "$CRONTAB_TEMPLATE" >"$CRONTAB_RENDERED"
+}
+
+cmd_up() {
+  local quiet=false
+  [[ "${1:-}" == "--quiet" ]] && quiet=true
+
+  mkdir -p "$AP_HOME" "$AP_HOME/runs" "$AP_HOME/logs"
+  render_crontab
+
+  if session_alive; then
+    [[ "$quiet" == true ]] || echo "autopilot already running (tmux session '$TMUX_SESSION')"
+    return 0
+  fi
+
+  tmux new-session -d -s "$TMUX_SESSION" "supercronic '$CRONTAB_RENDERED'"
+  [[ "$quiet" == true ]] || echo "autopilot started (tmux session '$TMUX_SESSION')"
+}
+
+cmd_print_paths() {
+  mkdir -p "$AP_HOME"
+  render_crontab
+  echo "SCRIPT_DIR=$SCRIPT_DIR"
+  echo "AP_HOME=$AP_HOME"
+  echo "AP_TZ=$AP_TZ"
+  echo "CRONTAB_TEMPLATE=$CRONTAB_TEMPLATE"
+  echo "CRONTAB_RENDERED=$CRONTAB_RENDERED"
+}
+
+cmd_down() {
+  if session_alive; then
+    tmux kill-session -t "$TMUX_SESSION"
+    echo "autopilot stopped"
+  else
+    echo "autopilot not running"
+  fi
+}
+
+cmd_status() {
+  if session_alive; then
+    echo "session:  alive (tmux '$TMUX_SESSION')"
+  else
+    echo "session:  DOWN"
+  fi
+
+  if [[ -e "$AP_HOME/pause" ]]; then
+    echo "pause:    PAUSED ($AP_HOME/pause exists)"
+  else
+    echo "pause:    running"
+  fi
+
+  local today ledger_file
+  today="$(TZ="$AP_TZ" date +%F)"
+  ledger_file="$AP_HOME/runs/$today.jsonl"
+  echo "ledger:   $ledger_file"
+  if [[ -f "$ledger_file" ]]; then
+    tail -n 3 "$ledger_file" | sed 's/^/  /'
+
+    local last_ts now_ts age
+    last_ts="$(tail -n 1 "$ledger_file" | python3 -c "
+import json, sys, datetime
+try:
+    d = json.loads(sys.stdin.read())
+    ts = d.get('ts', '')
+    dt = datetime.datetime.strptime(ts, '%Y-%m-%dT%H:%M:%SZ')
+    print(int(dt.replace(tzinfo=datetime.timezone.utc).timestamp()))
+except Exception:
+    print(0)
+")"
+    now_ts="$(date -u +%s)"
+    if [[ "$last_ts" -gt 0 ]]; then
+      age=$(( now_ts - last_ts ))
+      if [[ "$age" -gt 3600 ]]; then
+        echo "warning:  no ledger entry in $((age / 60)) minutes (>1h) — is the scheduler alive?"
+      fi
+    fi
+  else
+    echo "  (no entries yet today)"
+  fi
+}
+
+cmd_pause() {
+  mkdir -p "$AP_HOME"
+  touch "$AP_HOME/pause"
+  echo "paused (rm $AP_HOME/pause, or 'ap resume', to resume)"
+}
+
+cmd_resume() {
+  rm -f "$AP_HOME/pause"
+  echo 0 >"$AP_HOME/fail_count"
+  echo "resumed"
+}
+
+[[ $# -ge 1 ]] || usage
+sub="$1"; shift
+case "$sub" in
+  up) cmd_up "${1:-}" ;;
+  down) cmd_down ;;
+  status) cmd_status ;;
+  pause) cmd_pause ;;
+  resume) cmd_resume ;;
+  --print-paths) cmd_print_paths ;;
+  *) usage ;;
+esac

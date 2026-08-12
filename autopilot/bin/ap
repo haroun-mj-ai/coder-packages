@@ -47,7 +47,11 @@ cmd_up() {
   # are free. Overlap is safe because ap-cycle.sh owns its own mutual
   # exclusion: lock.poll serializes deciding, lock.plan/lock.build cap each
   # lane at one occupant, and a cycle with nothing to do exits in seconds.
-  tmux new-session -d -s "$TMUX_SESSION" "supercronic -overlapping '$CRONTAB_RENDERED'"
+  # -c pins the session's cwd to the work repo so no cycle ever inherits the
+  # directory `ap up` was typed in (skill discovery is cwd-based; ap-cycle.sh
+  # cd's too, but belt and braces).
+  tmux new-session -d -s "$TMUX_SESSION" -c "${AP_WORK_REPO:-/home/coder/root-for-local}" \
+    "supercronic -overlapping '$CRONTAB_RENDERED'"
   [[ "$quiet" == true ]] || echo "autopilot started (tmux session '$TMUX_SESSION')"
 }
 

@@ -13,6 +13,14 @@ source "$SCRIPT_DIR/ap-env.sh"
 SETTINGS_PATH="$(cd "$SCRIPT_DIR/.." && pwd)/settings/autopilot.json"
 WORK_REPO="${AP_WORK_REPO:-/home/coder/root-for-local}"
 
+# EVERY claude invocation in this cycle -- the poll included -- must run from
+# the work repo: Claude Code discovers project skills from the cwd, so a cycle
+# that inherits some other directory (whatever `ap up` happened to be typed
+# in) silently runs the poll with NO /autopilot-poll skill at all. That fails
+# OPEN: $0 cost, instant action:none, every minute, and nothing in the log to
+# say why. cd here, at the top -- not just before the act stage.
+cd "$WORK_REPO" || exit 1
+
 mkdir -p "$AP_HOME" "$AP_HOME/runs" "$AP_HOME/logs"
 
 log() {

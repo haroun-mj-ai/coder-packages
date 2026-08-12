@@ -31,6 +31,10 @@ mkdir -p "$calls_dir"
 n=$(find "$calls_dir" -maxdepth 1 -name '*.args' | wc -l)
 n=$((n + 1))
 printf '%s\n' "$@" >"$calls_dir/$n.args"
+# Record the cwd every claude invocation inherits: skill discovery is
+# cwd-based, so a cycle running from anywhere but the work repo finds no
+# skills and fails open with action:none.
+pwd >"$calls_dir/$n.pwd"
 
 is_poll=false
 for a in "$@"; do
@@ -225,12 +229,18 @@ setup_case() {
 }
 
 run_case() {
-  # runs ap-cycle.sh with the current fixture; stdout/stderr discarded to log
-  AP_HOME="$CASE_AP_HOME" \
-  AP_WORK_REPO="$CASE_WORK_REPO" \
-  AP_TEST_STUB_DIR="$CASE_STUB_DIR" \
-  PATH="$CASE_STUB_DIR:$PATH" \
-    bash "$CYCLE" >"$CASE_AP_HOME/stdout.log" 2>"$CASE_AP_HOME/stderr.log"
+  # runs ap-cycle.sh with the current fixture; stdout/stderr discarded to log.
+  # Deliberately launched from a directory that is NOT the work repo (the
+  # subshell cd) so the cwd-discipline case can catch a regression of the bug
+  # where the poll ran in the inherited cwd and therefore found no skills.
+  (
+    cd /tmp || exit 1
+    AP_HOME="$CASE_AP_HOME" \
+    AP_WORK_REPO="$CASE_WORK_REPO" \
+    AP_TEST_STUB_DIR="$CASE_STUB_DIR" \
+    PATH="$CASE_STUB_DIR:$PATH" \
+      bash "$CYCLE" >"$CASE_AP_HOME/stdout.log" 2>"$CASE_AP_HOME/stderr.log"
+  )
   echo $?
 }
 
@@ -1057,6 +1067,22 @@ act_args="$CASE_STUB_DIR/claude_calls/2.args"
 assert "autoC(comment): implement act proceeded ('auto' comment is a directive, not feedback)" bash -c \
   "[ -f '$act_args' ] && grep -q 'implement-plan' '$act_args'"
 unset AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_COMMENT_3006
+
+# =============================================================================
+# Case 25: cwd discipline -- EVERY claude invocation (the poll included) must
+# run from the work repo, because Claude Code discovers project skills from the
+# cwd. run_case deliberately launches the cycle from /tmp; a cycle that does
+# not cd would hand the poll a directory with no .claude/skills, which fails
+# OPEN (no skill, $0 cost, instant action:none, every minute, nothing logged).
+# =============================================================================
+setup_case
+rc="$(AP_TEST_POLL_ACTION=plan AP_TEST_POLL_ISSUE=ENG-25 run_case)"
+assert "case25: exit 0" [ "$rc" -eq 0 ]
+for f in "$CASE_STUB_DIR"/claude_calls/*.pwd; do
+  [[ -e "$f" ]] || continue
+  assert "case25: $(basename "$f" .pwd) ran in the work repo" \
+    [ "$(cat "$f")" = "$CASE_WORK_REPO" ]
+done
 
 if [[ "$FAILURES" -eq 0 ]]; then
   echo "ALL PASS"

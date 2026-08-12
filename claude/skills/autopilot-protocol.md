@@ -17,6 +17,21 @@ No autopilot run is ever a human at a terminal. A synchronous question would
 block forever, so headless mode never blocks: it takes a documented default,
 or it ends the run.
 
+## Command discipline under `dontAsk`
+
+Headless runs execute under a `dontAsk` permission profile: any tool call not
+explicitly allowed is denied instantly, and **a piped or compound Bash command
+is denied unless every segment is allowed**. So:
+
+- One command per Bash call. Never pipe to `jq`/`python3`/`head` — `jq` is not
+  even installed. For JSON from `gh`, use its built-in `--jq` flag
+  (`gh issue list --json number,title,labels --jq '...'`), which needs no pipe.
+- Prefer the allowed GitHub MCP issue tools (`list_issues`, `issue_read`,
+  `issue_write`, `add_issue_comment`) over `gh` when one fits.
+- A permission denial is not a prompt: nobody will answer. Retry once with an
+  allowed form; if still denied, treat it per this protocol (FAILED with the
+  denial string in `detail`) rather than asking in chat.
+
 ## Status vocabulary
 
 - `DONE` — the phase finished; whatever it was supposed to produce (a

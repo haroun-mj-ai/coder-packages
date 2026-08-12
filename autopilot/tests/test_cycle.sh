@@ -103,12 +103,18 @@ if [[ "${AP_TEST_STATUS_TO_ADHOC:-}" == "1" ]]; then
   mkdir -p "$AP_HOME/runs/adhoc"
   status_dest="$AP_HOME/runs/adhoc/status.json"
 fi
+# status.json always carries "issue" per the protocol's shape. Defaults to
+# this act's own issue (AP_TEST_POLL_ISSUE) so adhoc adoption's .issue match
+# succeeds by default; AP_TEST_ADHOC_STATUS_ISSUE overrides it to simulate a
+# DIFFERENT concurrent act's leftover file (a mismatch the wrapper must not
+# adopt).
+status_issue="${AP_TEST_ADHOC_STATUS_ISSUE:-${AP_TEST_POLL_ISSUE:-}}"
 if [[ "$skip_status" != "1" && -n "${AP_RUN_DIR:-}" ]]; then
   mkdir -p "$AP_RUN_DIR"
-  python3 - "$status" "${AP_TEST_QUESTION:-what should I do}" "${AP_TEST_PR_URL:-https://github.com/x/y/pull/1}" <<'PY' >"$status_dest"
+  python3 - "$status" "${AP_TEST_QUESTION:-what should I do}" "${AP_TEST_PR_URL:-https://github.com/x/y/pull/1}" "$status_issue" <<'PY' >"$status_dest"
 import json, sys
-status, question, pr_url = sys.argv[1:4]
-d = {"status": status}
+status, question, pr_url, issue = sys.argv[1:5]
+d = {"status": status, "issue": (issue or None)}
 if status == "NEEDS_HUMAN":
     d["question"] = question
 if status == "DONE":
@@ -167,6 +173,14 @@ if [[ "${1:-}" == "api" ]]; then
   echo "${!var:-[]}"
   exit 0
 fi
+# Change C reconcile-time label check: `gh issue view <n> --repo ... --json labels`
+if [[ "${1:-}" == "issue" && "${2:-}" == "view" ]]; then
+  num="${3:-}"
+  var="AP_TEST_GH_ISSUE_VIEW_${num}"
+  default_labels='{"labels":[]}'
+  echo "${!var:-$default_labels}"
+  exit 0
+fi
 exit 0
 STUB_GH
 
@@ -191,7 +205,7 @@ AP_TEST_VARS=(
   AP_TEST_SHIP_STATUS AP_TEST_ACT_MODE AP_TEST_QUESTION AP_TEST_PR_URL
   AP_TEST_ACT_STDERR
   AP_TEST_SKIP_STATUS_IMPLEMENT AP_TEST_SKIP_STATUS_SHIP AP_TEST_SKIP_STATUS_PLAN
-  AP_TEST_SKIP_STATUS_REPLAN AP_TEST_STATUS_TO_ADHOC
+  AP_TEST_SKIP_STATUS_REPLAN AP_TEST_STATUS_TO_ADHOC AP_TEST_ADHOC_STATUS_ISSUE
   AP_TEST_EXIT_CODE_IMPLEMENT AP_TEST_EXIT_CODE_SHIP AP_TEST_EXIT_CODE_PLAN
   AP_TEST_EXIT_CODE_REPLAN
 )
@@ -218,6 +232,20 @@ run_case() {
   PATH="$CASE_STUB_DIR:$PATH" \
     bash "$CYCLE" >"$CASE_AP_HOME/stdout.log" 2>"$CASE_AP_HOME/stderr.log"
   echo $?
+}
+
+# hold_lane_lock <lock-file> <seconds> -> sets $LANE_HOLDER_PID. Stubs a
+# concurrently-running act by grabbing the lane's flock in a background
+# process for the given duration; caller should `wait "$LANE_HOLDER_PID"
+# 2>/dev/null` (or let it expire) once done. NOT invoked via `$(...)`
+# command substitution -- that runs the function (and its `&` background
+# job) inside a throwaway subshell, and this sandbox reaps that subshell's
+# orphaned children the moment the subshell exits, so the lock would never
+# actually be held by the time the caller checks it.
+hold_lane_lock() {
+  local lock_file="$1" secs="$2"
+  flock "$lock_file" sleep "$secs" &
+  LANE_HOLDER_PID=$!
 }
 
 count_files() {
@@ -260,12 +288,13 @@ assert "case1: pause -> exit 0" [ "$rc" -eq 0 ]
 assert "case1: pause -> claude never called" [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 0 ]
 
 # =============================================================================
-# Case 2: lock held by a slow first run -> second invocation exits without
-# calling claude
+# Case 2: lock.poll held by a slow first run -> second invocation exits
+# without calling claude (lock.poll serializes the decision path; a single
+# $AP_HOME/lock no longer exists)
 # =============================================================================
 setup_case
 (
-  exec 9>"$CASE_AP_HOME/lock" 2>/dev/null || { mkdir -p "$CASE_AP_HOME"; exec 9>"$CASE_AP_HOME/lock"; }
+  exec 9>"$CASE_AP_HOME/lock.poll" 2>/dev/null || { mkdir -p "$CASE_AP_HOME"; exec 9>"$CASE_AP_HOME/lock.poll"; }
   flock 9
   sleep 3
 ) &
@@ -698,11 +727,10 @@ assert "case19: marker suppression -> claude NOT called" [ "$(count_files "$CASE
 unset AP_TEST_GH_ISSUES_NEEDS_INPUT AP_TEST_GH_COMMENT_202
 
 # =============================================================================
-# Case 20 (pre-scan gate): new-intake wake -- an open inbox issue with none
-# of the six state labels (a fresh delegation the user opened, titled with
-# the Linear id) wakes the poll; scan-state records it as seen after the
-# cycle; an identical second cycle (same issue, now seen) does not wake
-# again.
+# Case 20 (pre-scan gate): new-intake wake -- an open inbox issue carrying the
+# `Queued` label and none of the six state labels (an owner delegation) wakes
+# the poll; scan-state records it as seen after the cycle; an identical
+# second cycle (same issue, now seen) does not wake again.
 # Fails pre-gate: no new-intake leg (nor any Linear leg -- that's been
 # removed) exists at all; more concretely, the "second cycle does not wake
 # again" assertion would fail since the poll always ran on every cycle.
@@ -710,7 +738,7 @@ unset AP_TEST_GH_ISSUES_NEEDS_INPUT AP_TEST_GH_COMMENT_202
 setup_case
 now_ts="$(date -u +%FT%TZ)"
 printf '{"inbox":{},"new_intake_seen":[],"last_poll_ts":"%s"}' "$now_ts" >"$CASE_AP_HOME/scan-state.json"
-export AP_TEST_GH_ISSUES_ALL_OPEN='[{"number":501,"labels":[]}]'
+export AP_TEST_GH_ISSUES_ALL_OPEN='[{"number":501,"labels":[{"name":"Queued"}]}]'
 rc="$(AP_TEST_POLL_ACTION=none run_case)"
 assert "case20: new-intake wake -> exit 0" [ "$rc" -eq 0 ]
 assert "case20: new-intake wake -> claude called once (poll)" [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 1 ]
@@ -719,6 +747,26 @@ assert "case20: scan-state new_intake_seen includes 501" bash -c \
 rc2="$(AP_TEST_POLL_ACTION=none run_case)"
 assert "case20: second identical cycle -> exit 0" [ "$rc2" -eq 0 ]
 assert "case20: second identical cycle -> claude NOT called again" [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 1 ]
+unset AP_TEST_GH_ISSUES_ALL_OPEN
+
+# =============================================================================
+# Case 20b (Queued intake, Change A): a genuinely unlabeled open inbox issue
+# is a DRAFT -- the pipeline ignores it entirely, never wakes the poll.
+# =============================================================================
+setup_case
+now_ts="$(date -u +%FT%TZ)"
+printf '{"inbox":{},"new_intake_seen":[],"last_poll_ts":"%s"}' "$now_ts" >"$CASE_AP_HOME/scan-state.json"
+export AP_TEST_GH_ISSUES_ALL_OPEN='[{"number":601,"labels":[]}]'
+rc="$(AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-601 run_case)"
+assert "case20b: unlabeled draft -> exit 0" [ "$rc" -eq 0 ]
+assert "case20b: unlabeled draft -> claude NEVER called" [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 0 ]
+assert "case20b: unlabeled draft -> not recorded as seen (never considered intake at all)" bash -c \
+  "[ ! -f '$CASE_AP_HOME/scan-state.json' ] || python3 -c \"
+import json
+with open('$CASE_AP_HOME/scan-state.json') as f:
+    d = json.load(f)
+assert '601' not in d.get('new_intake_seen', []), d
+\""
 unset AP_TEST_GH_ISSUES_ALL_OPEN
 
 # =============================================================================
@@ -806,7 +854,7 @@ assert "case23: adhoc file consumed (moved, not left stale)" bash -c \
 setup_case
 now_ts="$(date -u +%FT%TZ)"
 printf '{"inbox":{},"new_intake_seen":[],"last_poll_ts":"%s"}' "$now_ts" >"$CASE_AP_HOME/scan-state.json"
-export AP_TEST_GH_ISSUES_ALL_OPEN='[{"number":901,"labels":[]},{"number":902,"labels":[]}]'
+export AP_TEST_GH_ISSUES_ALL_OPEN='[{"number":901,"labels":[{"name":"Queued"}]},{"number":902,"labels":[{"name":"Queued"}]}]'
 rc="$(AP_TEST_POLL_ACTION=plan AP_TEST_POLL_ISSUE=ENG-901 AP_TEST_POLL_INBOX=901 run_case)"
 assert "case24: first cycle exit 0" [ "$rc" -eq 0 ]
 assert "case24: first cycle woke the poll" [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -ge 1 ]
@@ -817,6 +865,198 @@ rc2="$(AP_TEST_POLL_ACTION=plan AP_TEST_POLL_ISSUE=ENG-902 AP_TEST_POLL_INBOX=90
 assert "case24: second cycle exit 0" [ "$rc2" -eq 0 ]
 assert "case24: second cycle re-woke the poll for the remaining intake" \
   [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -gt "$calls_before" ]
+
+# =============================================================================
+# Case 23b (adhoc adoption hardening, needed for two-lane concurrency): the
+# adhoc status.json's .issue does NOT match THIS act's issue -- a different
+# concurrent act's leftover file sharing the one adhoc path. Must NOT be
+# adopted: left in place, this act is treated as FAILED (no status.json ever
+# resolved for it), and the mismatched file survives for its real owner.
+# =============================================================================
+setup_case
+rc="$(AP_TEST_POLL_ACTION=plan AP_TEST_POLL_ISSUE=ENG-23B AP_TEST_STATUS_TO_ADHOC=1 \
+  AP_TEST_ADHOC_STATUS_ISSUE=ENG-OTHER run_case)"
+assert "case23b: exit 0" [ "$rc" -eq 0 ]
+assert "case23b: ledger plan row is FAILED, not adopted from the mismatched adhoc file" bash -c \
+  "cat '$CASE_AP_HOME/runs/'*.jsonl | python3 -c 'import json,sys; rows=[json.loads(l) for l in sys.stdin if l.strip()]; sys.exit(0 if any(r[\"phase\"]==\"plan\" and r[\"status\"]==\"FAILED\" for r in rows) else 1)'"
+assert "case23b: mismatched adhoc file left in place (not consumed)" bash -c \
+  "[ -f '$CASE_AP_HOME/runs/adhoc/status.json' ]"
+
+# =============================================================================
+# Two-lane concurrency (Change B). lock.build / lock.plan are stubbed busy by
+# grabbing the lock file with a background `flock <file> sleep <n> &`.
+# =============================================================================
+
+# --- (i) build lane held + Queued intake present -> poll runs with
+# "--busy-lanes build" in argv, and a plan act proceeds (plan lane is free).
+setup_case
+now_ts="$(date -u +%FT%TZ)"
+printf '{"inbox":{},"new_intake_seen":[],"last_poll_ts":"%s"}' "$now_ts" >"$CASE_AP_HOME/scan-state.json"
+export AP_TEST_GH_ISSUES_ALL_OPEN='[{"number":2001,"labels":[{"name":"Queued"}]}]'
+hold_lane_lock "$CASE_AP_HOME/lock.build" 3; build_holder="$LANE_HOLDER_PID"
+sleep 0.4
+rc="$(AP_TEST_POLL_ACTION=plan AP_TEST_POLL_ISSUE=ENG-2001 run_case)"
+wait "$build_holder" 2>/dev/null
+assert "laneB(i): exit 0" [ "$rc" -eq 0 ]
+poll_args="$CASE_STUB_DIR/claude_calls/1.args"
+assert "laneB(i): poll invoked with --busy-lanes build" bash -c \
+  "[ -f '$poll_args' ] && grep -q -- '--busy-lanes build' '$poll_args'"
+act_args="$CASE_STUB_DIR/claude_calls/2.args"
+assert "laneB(i): plan act proceeded (plan lane free)" bash -c \
+  "[ -f '$act_args' ] && grep -q 'plan-issue ENG-2001' '$act_args'"
+unset AP_TEST_GH_ISSUES_ALL_OPEN
+
+# --- (ii) plan lane held + go-approval present -> implement proceeds with
+# "--busy-lanes plan" (build lane is free).
+setup_case
+export AP_TEST_GH_ISSUES_PLAN_REVIEW='[{"number":2002}]'
+export AP_TEST_GH_COMMENT_2002='[{"id":900,"user":{"login":"haroun"},"body":"go"}]'
+hold_lane_lock "$CASE_AP_HOME/lock.plan" 3; plan_holder="$LANE_HOLDER_PID"
+sleep 0.4
+rc="$(AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-2002 AP_TEST_POLL_PLANPATH=docs/plans/x.md \
+  AP_TEST_POLL_INBOX=2002 run_case)"
+wait "$plan_holder" 2>/dev/null
+assert "laneB(ii): exit 0" [ "$rc" -eq 0 ]
+poll_args="$CASE_STUB_DIR/claude_calls/1.args"
+assert "laneB(ii): poll invoked with --busy-lanes plan" bash -c \
+  "[ -f '$poll_args' ] && grep -q -- '--busy-lanes plan' '$poll_args'"
+act_args="$CASE_STUB_DIR/claude_calls/2.args"
+assert "laneB(ii): implement act proceeded (build lane free)" bash -c \
+  "[ -f '$act_args' ] && grep -q 'implement-plan' '$act_args'"
+unset AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_COMMENT_2002
+
+# --- (iii) BOTH lanes held -> no claude call at all (not even the poll).
+setup_case
+now_ts="$(date -u +%FT%TZ)"
+printf '{"inbox":{},"new_intake_seen":[],"last_poll_ts":"%s"}' "$now_ts" >"$CASE_AP_HOME/scan-state.json"
+export AP_TEST_GH_ISSUES_ALL_OPEN='[{"number":2003,"labels":[{"name":"Queued"}]}]'
+export AP_TEST_GH_ISSUES_PLAN_REVIEW='[{"number":2004}]'
+export AP_TEST_GH_COMMENT_2004='[{"id":901,"user":{"login":"haroun"},"body":"go"}]'
+hold_lane_lock "$CASE_AP_HOME/lock.build" 3; build_holder="$LANE_HOLDER_PID"
+hold_lane_lock "$CASE_AP_HOME/lock.plan" 3; plan_holder="$LANE_HOLDER_PID"
+sleep 0.4
+rc="$(AP_TEST_POLL_ACTION=none run_case)"
+wait "$build_holder" "$plan_holder" 2>/dev/null
+assert "laneB(iii): exit 0" [ "$rc" -eq 0 ]
+assert "laneB(iii): no claude call at all (both lanes busy)" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 0 ]
+unset AP_TEST_GH_ISSUES_ALL_OPEN AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_COMMENT_2004
+
+# --- (iv) go-approval present while build lane held -> NOT marked seen
+# (re-fires once the lane frees).
+setup_case
+now_ts="$(date -u +%FT%TZ)"
+printf '{"inbox":{},"new_intake_seen":[],"last_poll_ts":"%s"}' "$now_ts" >"$CASE_AP_HOME/scan-state.json"
+export AP_TEST_GH_ISSUES_PLAN_REVIEW='[{"number":2005}]'
+export AP_TEST_GH_COMMENT_2005='[{"id":902,"user":{"login":"haroun"},"body":"go"}]'
+hold_lane_lock "$CASE_AP_HOME/lock.build" 3; build_holder="$LANE_HOLDER_PID"
+sleep 0.4
+rc="$(AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-2005 AP_TEST_POLL_PLANPATH=docs/plans/x.md run_case)"
+wait "$build_holder" 2>/dev/null
+assert "laneB(iv): exit 0 (build busy -> no free-lane signal, poll not woken)" [ "$rc" -eq 0 ]
+assert "laneB(iv): claude NOT called (signal's lane busy)" [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 0 ]
+assert "laneB(iv): comment NOT marked seen" bash -c \
+  "[ ! -f '$CASE_AP_HOME/scan-state.json' ] || python3 -c \"
+import json
+with open('$CASE_AP_HOME/scan-state.json') as f:
+    d = json.load(f)
+assert d.get('inbox', {}).get('2005') is None, d
+\""
+rc2="$(AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-2005 AP_TEST_POLL_PLANPATH=docs/plans/x.md run_case)"
+assert "laneB(iv): second cycle (lane free) exit 0" [ "$rc2" -eq 0 ]
+assert "laneB(iv): second cycle -> claude called (re-fired)" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -ge 1 ]
+unset AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_COMMENT_2005
+
+# =============================================================================
+# Auto-approve (Change C).
+# =============================================================================
+
+# --- (a) global auto-approve on + plan-review issue with only an
+# agent-marker comment -> implement claimed, --auto-approve in poll argv.
+setup_case
+export AP_TEST_GH_ISSUES_PLAN_REVIEW='[{"number":3001,"labels":[]}]'
+export AP_TEST_GH_COMMENT_3001='[{"id":10,"user":{"login":"agent"},"body":"Plan file: /x/plan.md\nthe plan"}]'
+rc="$(AP_AUTO_APPROVE=1 AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-3001 \
+  AP_TEST_POLL_PLANPATH=docs/plans/x.md AP_TEST_POLL_INBOX=3001 run_case)"
+assert "autoC(a): exit 0" [ "$rc" -eq 0 ]
+poll_args="$CASE_STUB_DIR/claude_calls/1.args"
+assert "autoC(a): poll invoked with --auto-approve" bash -c \
+  "[ -f '$poll_args' ] && grep -q -- '--auto-approve' '$poll_args'"
+act_args="$CASE_STUB_DIR/claude_calls/2.args"
+assert "autoC(a): implement act proceeded (auto-approved, no 'go' needed)" bash -c \
+  "[ -f '$act_args' ] && grep -q 'implement-plan' '$act_args'"
+unset AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_COMMENT_3001
+
+# --- (b) same, but a FRESH owner comment that is feedback (not go/auto) ->
+# feedback wins: the wrapper wakes the PLAN lane for it, not build, and the
+# replan action (as the poll -- stubbed here -- decides) proceeds normally.
+setup_case
+export AP_TEST_GH_ISSUES_PLAN_REVIEW='[{"number":3002,"labels":[]}]'
+export AP_TEST_GH_COMMENT_3002='[{"id":11,"user":{"login":"haroun"},"body":"please use a different table name"}]'
+rc="$(AP_AUTO_APPROVE=1 AP_TEST_POLL_ACTION=replan AP_TEST_POLL_ISSUE=ENG-3002 \
+  AP_TEST_POLL_FEEDBACK="please use a different table name" AP_TEST_POLL_INBOX=3002 run_case)"
+assert "autoC(b): exit 0" [ "$rc" -eq 0 ]
+act_args="$CASE_STUB_DIR/claude_calls/2.args"
+assert "autoC(b): replan act proceeded (feedback wins over auto-approve)" bash -c \
+  "[ -f '$act_args' ] && grep -q -- '--feedback' '$act_args'"
+assert "autoC(b): NOT implement" bash -c \
+  "[ -f '$act_args' ] && ! grep -q 'implement-plan' '$act_args'"
+unset AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_COMMENT_3002
+
+# --- (c) auto-approve on + needs-input issue with no new comment -> no
+# action at all (needs-input is NEVER auto-approved).
+setup_case
+export AP_TEST_GH_ISSUES_NEEDS_INPUT='[{"number":3003}]'
+export AP_TEST_GH_COMMENT_3003='[{"id":12,"user":{"login":"agent"},"body":"Phase: plan\nsome details"}]'
+now_ts="$(date -u +%FT%TZ)"
+printf '{"inbox":{"3003":12},"new_intake_seen":[],"last_poll_ts":"%s"}' "$now_ts" >"$CASE_AP_HOME/scan-state.json"
+rc="$(AP_AUTO_APPROVE=1 AP_TEST_POLL_ACTION=none run_case)"
+assert "autoC(c): exit 0" [ "$rc" -eq 0 ]
+assert "autoC(c): claude NOT called (needs-input never auto-approves)" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 0 ]
+unset AP_TEST_GH_ISSUES_NEEDS_INPUT AP_TEST_GH_COMMENT_3003
+
+# --- (d) auto-approve OFF + plan-review with no owner comment (marker only)
+# -> no action, unchanged from today.
+setup_case
+now_ts="$(date -u +%FT%TZ)"
+printf '{"inbox":{},"new_intake_seen":[],"last_poll_ts":"%s"}' "$now_ts" >"$CASE_AP_HOME/scan-state.json"
+export AP_TEST_GH_ISSUES_PLAN_REVIEW='[{"number":3004,"labels":[]}]'
+export AP_TEST_GH_COMMENT_3004='[{"id":13,"user":{"login":"agent"},"body":"Plan file: /x/plan.md\nthe plan"}]'
+rc="$(AP_TEST_POLL_ACTION=none run_case)"
+assert "autoC(d): exit 0" [ "$rc" -eq 0 ]
+assert "autoC(d): claude NOT called (auto-approve off, no 'go')" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 0 ]
+unset AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_COMMENT_3004
+
+# --- (e) per-issue `auto` label with global OFF -> implement claimed.
+setup_case
+export AP_TEST_GH_ISSUES_PLAN_REVIEW='[{"number":3005,"labels":[{"name":"auto"}]}]'
+export AP_TEST_GH_COMMENT_3005='[{"id":14,"user":{"login":"agent"},"body":"Plan file: /x/plan.md\nthe plan"}]'
+rc="$(AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-3005 AP_TEST_POLL_PLANPATH=docs/plans/x.md \
+  AP_TEST_POLL_INBOX=3005 run_case)"
+assert "autoC(e): exit 0" [ "$rc" -eq 0 ]
+act_args="$CASE_STUB_DIR/claude_calls/2.args"
+assert "autoC(e): implement act proceeded (per-issue auto label, global off)" bash -c \
+  "[ -f '$act_args' ] && grep -q 'implement-plan' '$act_args'"
+poll_args="$CASE_STUB_DIR/claude_calls/1.args"
+assert "autoC(e): poll invoked WITHOUT --auto-approve (global flag stays off)" bash -c \
+  "[ -f '$poll_args' ] && ! grep -q -- '--auto-approve' '$poll_args'"
+unset AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_COMMENT_3005
+
+# --- (refinement) an `auto` first-line comment on a plan-review issue claims
+# implement, NOT replan -- "auto" is a directive like "go", never feedback.
+setup_case
+export AP_TEST_GH_ISSUES_PLAN_REVIEW='[{"number":3006,"labels":[]}]'
+export AP_TEST_GH_COMMENT_3006='[{"id":15,"user":{"login":"haroun"},"body":"auto"}]'
+rc="$(AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-3006 AP_TEST_POLL_PLANPATH=docs/plans/x.md \
+  AP_TEST_POLL_INBOX=3006 run_case)"
+assert "autoC(comment): exit 0" [ "$rc" -eq 0 ]
+act_args="$CASE_STUB_DIR/claude_calls/2.args"
+assert "autoC(comment): implement act proceeded ('auto' comment is a directive, not feedback)" bash -c \
+  "[ -f '$act_args' ] && grep -q 'implement-plan' '$act_args'"
+unset AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_COMMENT_3006
 
 if [[ "$FAILURES" -eq 0 ]]; then
   echo "ALL PASS"

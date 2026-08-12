@@ -327,13 +327,14 @@ changes where the stop is reported.
 
 **Success end state** (all gates clear, PRs open and green or gateless, no
 merge): PR URLs are posted as a comment on the inbox issue and the inbox
-label is swapped to `ready-to-test`. On Linear — the one public write beyond
-the claim — post one comment with the PR link(s) and add label
-`agent:ready-to-test`; Linear status stays `In Progress`. Never `Staging`
-headlessly (`Staging` means merged, and headless ship-work never merges) and
-never `Done` (a reviewer sets that, same as interactive). Write
-`status.json` with `status: "DONE"`, `phase: "ship"`, and `pr_urls` filled
-with every opened PR URL.
+label is swapped to `ready-to-test`. On Linear — the one write beyond the
+claim, and it is a label, not a comment — add label `agent:ready-to-test`;
+Linear status stays `In Progress`. Headless ship-work never posts a Linear
+comment, success or failure; the PR link(s) live on the inbox issue only.
+Never `Staging` headlessly (`Staging` means merged, and headless ship-work
+never merges) and never `Done` (a reviewer sets that, same as interactive).
+Write `status.json` with `status: "DONE"`, `phase: "ship"`, and `pr_urls`
+filled with every opened PR URL.
 
 Plan archiving (`docs/plans/` → `docs/plans/completed/`) does **not** happen
 under `--headless` — it stays exactly where step 9 leaves it today, performed

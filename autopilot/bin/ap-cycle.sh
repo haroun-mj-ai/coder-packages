@@ -164,16 +164,44 @@ if cid is not None:
 " 2>/dev/null
 }
 
+# issue_labeled_auto <inbox-issue-number> -> rc 0 if the issue carries the
+# `auto` label (case-insensitive; Change C's per-issue auto-approve switch),
+# rc 1 otherwise (including "couldn't tell" -- err on not-auto-approving).
+issue_labeled_auto() {
+  local num="$1" json
+  json="$(gh issue view "$num" --repo "$AP_INBOX_REPO" --json labels 2>>"$AP_HOME/logs/cycle.log")"
+  [[ -z "$json" ]] && return 1
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$json" | jq -e '(.labels // []) | map(.name | ascii_downcase) | any(. == "auto")' >/dev/null 2>&1
+    return
+  fi
+  printf '%s' "$json" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+names = {str(l.get('name', '')).lower() for l in (d.get('labels') or []) if isinstance(l, dict)}
+sys.exit(0 if 'auto' in names else 1)
+"
+}
+
 # extract_new_intake_issues <gh-issue-list-json (number,labels)> -> issue
-# numbers, one per line, for open issues carrying NONE of the six state
-# labels below -- i.e. a fresh delegation the user just opened from the
-# GitHub mobile app, titled with the Linear id (e.g. "ENG-1234").
+# numbers, one per line, for open issues carrying the `Queued` label
+# (case-insensitive; the repo label is "Queued") and NONE of the six state
+# labels below -- i.e. an owner delegation (create the inbox issue, add
+# Queued), not an unlabeled draft, which the pipeline ignores entirely.
 NEW_INTAKE_STATE_LABELS='["planning","plan-review","building","ready-to-test","needs-input","failed"]'
 extract_new_intake_issues() {
   local json="$1"
   if command -v jq >/dev/null 2>&1; then
     printf '%s' "$json" | jq -r --argjson state_labels "$NEW_INTAKE_STATE_LABELS" '
-      .[]? | select(((.labels // []) | map(.name)) as $names | ($state_labels | any(. as $s | $names | index($s))) | not) | .number
+      .[]? |
+      (((.labels // []) | map(.name))) as $names |
+      select(
+        ($names | map(ascii_downcase) | any(. == "queued")) and
+        (($state_labels | any(. as $s | $names | index($s))) | not)
+      ) | .number
     ' 2>/dev/null
     return
   fi
@@ -190,6 +218,9 @@ for item in d:
     if not isinstance(item, dict):
         continue
     names = {l.get('name') for l in (item.get('labels') or []) if isinstance(l, dict)}
+    names_lower = {str(n).lower() for n in names if n is not None}
+    if 'queued' not in names_lower:
+        continue
     if names & state_labels:
         continue
     if item.get('number') is not None:
@@ -245,6 +276,11 @@ ledger_path() {
 }
 
 # append_ledger <issue> <phase> <status> <cost> <session_id>
+# Two-lane concurrency: a build act and a plan act can both be appending to
+# TODAY's ledger file at the same moment. That's fine -- each call here is a
+# single `>>` write of one already-fully-formed line, and POSIX guarantees
+# O_APPEND writes of that shape don't interleave/corrupt each other even
+# across processes. No locking needed for this file.
 append_ledger() {
   local issue="$1" phase="$2" status="$3" cost="$4" session_id="$5"
   local ts ledger_file
@@ -279,15 +315,50 @@ PYEOF
   fi
 }
 
-# --- Stage 0: pause / lock / budget ----------------------------------------
+# --- Stage 0: pause / lock.poll / budget ------------------------------------
+# Three locks, not one: lock.poll serializes the decision path (at most one
+# cycle deciding at a time); lock.build and lock.plan are held only for the
+# duration of an actual act (implement's ship chain counts as part of the
+# build lane; plan/replan is the plan lane). This lets a plan keep flowing
+# while a build runs -- at most one build AND one plan concurrently, plus the
+# one cycle currently deciding. See autopilot/README.md's concurrency section.
 
 if [[ -e "$AP_HOME/pause" ]]; then
   exit 0
 fi
 
-exec 9>"$AP_HOME/lock"
+exec 9>"$AP_HOME/lock.poll"
 if ! flock -n 9; then
+  # Another cycle is already deciding -- not busy-waiting, just exit; the
+  # next cron minute tries again.
   exit 0
+fi
+
+# lane_free <lock-file> -- probes a lane lock non-destructively: opens it on
+# a spare fd, flock -n; on success unlock+close immediately (lane free) and
+# return 0; on failure close and return 1 (lane busy). Never blocks.
+lane_free() {
+  local lock_file="$1"
+  local fd
+  exec {fd}>"$lock_file" || return 1
+  if flock -n "$fd"; then
+    flock -u "$fd"
+    exec {fd}>&-
+    return 0
+  fi
+  exec {fd}>&-
+  return 1
+}
+
+busy_build=false
+busy_plan=false
+lane_free "$AP_HOME/lock.build" || busy_build=true
+lane_free "$AP_HOME/lock.plan" || busy_plan=true
+
+busy_lanes=""
+[[ "$busy_build" == true ]] && busy_lanes="build"
+if [[ "$busy_plan" == true ]]; then
+  busy_lanes="${busy_lanes:+$busy_lanes,}plan"
 fi
 
 today="$(TZ="$AP_TZ" date +%F)"
@@ -377,17 +448,24 @@ wake_reason=""
 inbox_list_plan_review="$(gh issue list --repo "$AP_INBOX_REPO" --state open --label plan-review --json number 2>>"$AP_HOME/logs/cycle.log")"
 inbox_list_needs_input="$(gh issue list --repo "$AP_INBOX_REPO" --state open --label needs-input --json number 2>>"$AP_HOME/logs/cycle.log")"
 
-inbox_issue_numbers="$(
-  { extract_issue_numbers "${inbox_list_plan_review:-[]}"; extract_issue_numbers "${inbox_list_needs_input:-[]}"; } \
-    | sort -un
-)"
-
-if [[ -n "$inbox_issue_numbers" ]]; then
+# scan_inbox_comments <issue-numbers> <fixed-lane-or-empty>
+# Two-lane concurrency: a tier-1 approval ("go" on plan-review) claims the
+# BUILD lane (it becomes `implement`); everything else here -- plan-review
+# feedback (-> replan) and needs-input answers (-> replan) -- claims the PLAN
+# lane. fixed_lane forces the lane (needs-input is always plan); empty means
+# classify from the comment text (plan-review: exact "go" -> build, else
+# plan). A signal whose lane is currently busy is skipped entirely: not
+# recorded as pending, so it is neither acted on nor marked seen -- it
+# re-fires next cycle once the lane frees.
+scan_inbox_comments() {
+  local numbers="$1" fixed_lane="$2"
+  [[ -z "$numbers" ]] && return
   while IFS= read -r num; do
     [[ -z "$num" ]] && continue
     # Ascending order (sort/direction are ignored on this endpoint); fetch a
     # full page and let extract_newest_comment take the last element. Inbox
     # threads are short; >100 comments would need pagination we skip for now.
+    local comment_json comment_line comment_id comment_first_line recorded_id signal_lane comment_lower
     comment_json="$(gh api "repos/$AP_INBOX_REPO/issues/$num/comments?per_page=100" 2>>"$AP_HOME/logs/cycle.log")"
     [[ -z "$comment_json" ]] && continue
     comment_line="$(extract_newest_comment "$comment_json")"
@@ -402,16 +480,84 @@ if [[ -n "$inbox_issue_numbers" ]]; then
     recorded_id="$(dict_get "$inbox_state_json" "$num")"
     recorded_id="${recorded_id:-0}"
     if [[ "$comment_id" =~ ^[0-9]+$ ]] && [[ "$comment_id" -gt "$recorded_id" ]] 2>/dev/null; then
+      if [[ -n "$fixed_lane" ]]; then
+        signal_lane="$fixed_lane"
+      else
+        # "auto" joins "go" as a directive (Change C): posted on a
+        # plan-review issue it means build now, exactly like "go" -- never
+        # feedback, so it must not fall into the plan lane below.
+        comment_lower="$(printf '%s' "$comment_first_line" | tr '[:upper:]' '[:lower:]')"
+        if [[ "$comment_lower" == "go" || "$comment_lower" == "auto" ]]; then
+          signal_lane="build"
+        else
+          signal_lane="plan"
+        fi
+      fi
+      if [[ "$signal_lane" == "build" && "$busy_build" == true ]] || \
+         [[ "$signal_lane" == "plan" && "$busy_plan" == true ]]; then
+        continue
+      fi
       wake=true
       wake_reason="${wake_reason:+$wake_reason,}inbox:$num"
       printf '%s\t%s\n' "$num" "$comment_id" >>"$pending_inbox_tsv"
     fi
-  done <<<"$inbox_issue_numbers"
+  done <<<"$numbers"
+}
+
+scan_inbox_comments "$(extract_issue_numbers "${inbox_list_plan_review:-[]}" | sort -un)" ""
+scan_inbox_comments "$(extract_issue_numbers "${inbox_list_needs_input:-[]}" | sort -un)" "plan"
+
+# --- Auto-approve leg (Change C): a plan-review issue is a build-lane
+# approval signal even with NO new owner comment when auto-approve applies
+# to it -- global $AP_AUTO_APPROVE=1, or the issue itself carries the `auto`
+# label (case-insensitive). This is deliberately a superset of what the
+# comment leg above already wakes for (a fresh "go"/"auto" comment, or a
+# fresh non-directive comment that must win as feedback in the PLAN lane
+# instead): the poll skill, not this bash gate, is the one that reads the
+# full thread and decides which tier actually applies, so an extra wake here
+# is harmless (never marked seen, no pending write -- just a cheap re-check
+# every cycle until claimed, same as any other biased-toward-waking signal).
+# NEVER extended to needs-input: a blocking question always waits for the
+# owner, auto-approve or not.
+if [[ "$busy_build" != true ]]; then
+  inbox_list_plan_review_labeled="$(gh issue list --repo "$AP_INBOX_REPO" --state open --label plan-review --json number,labels 2>>"$AP_HOME/logs/cycle.log")"
+  auto_approve_numbers="$(
+    if command -v jq >/dev/null 2>&1; then
+      printf '%s' "${inbox_list_plan_review_labeled:-[]}" | jq -r --arg auto_on "$AP_AUTO_APPROVE" '
+        .[]? | select($auto_on == "1" or ((.labels // []) | map(.name | ascii_downcase) | any(. == "auto"))) | .number
+      ' 2>/dev/null
+    else
+      printf '%s' "${inbox_list_plan_review_labeled:-[]}" | python3 -c "
+import json, os, sys
+auto_on = os.environ.get('AP_AUTO_APPROVE', '0') == '1'
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = []
+for item in d if isinstance(d, list) else []:
+    if not isinstance(item, dict):
+        continue
+    names = {str(l.get('name', '')).lower() for l in (item.get('labels') or []) if isinstance(l, dict)}
+    if auto_on or 'auto' in names:
+        num = item.get('number')
+        if num is not None:
+            print(num)
+"
+    fi
+  )"
+  if [[ -n "$auto_approve_numbers" ]]; then
+    while IFS= read -r num; do
+      [[ -z "$num" ]] && continue
+      wake=true
+      wake_reason="${wake_reason:+$wake_reason,}auto-approve:$num"
+    done <<<"$auto_approve_numbers"
+  fi
 fi
 
-# --- Inbox leg, trigger 3: new intake -- an open issue with none of the six
-# state labels is a fresh delegation the user just opened (titled with the
-# Linear id, e.g. "ENG-1234") from the GitHub mobile app.
+# --- Inbox leg, trigger 3: new intake -- an open issue carrying the `Queued`
+# label (case-insensitive) and none of the six state labels is an owner
+# delegation (titled with the Linear id, e.g. "ENG-1234"); an unlabeled open
+# issue is a draft the pipeline ignores entirely.
 inbox_list_all_open="$(gh issue list --repo "$AP_INBOX_REPO" --state open --json number,labels --limit 100 2>>"$AP_HOME/logs/cycle.log")"
 new_intake_numbers="$(extract_new_intake_issues "${inbox_list_all_open:-[]}")"
 
@@ -419,6 +565,11 @@ if [[ -n "$new_intake_numbers" ]]; then
   while IFS= read -r num; do
     [[ -z "$num" ]] && continue
     if ! list_contains "$new_intake_seen_json" "$num"; then
+      # Queued intake claims the PLAN lane (it becomes `plan`); busy -> skip,
+      # not marked seen, re-fires next cycle once the plan lane frees.
+      if [[ "$busy_plan" == true ]]; then
+        continue
+      fi
       wake=true
       wake_reason="${wake_reason:+$wake_reason,}new-intake:$num"
       printf '%s\n' "$num" >>"$pending_new_intake_txt"
@@ -453,21 +604,34 @@ fi
 
 if [[ "$wake" != true ]]; then
   log "scan: no signal, skipping poll"
+  flock -u 9
   exit 0
 fi
 
-log "scan: waking poll ($wake_reason)"
+log "scan: waking poll ($wake_reason) busy-lanes=${busy_lanes:-none}"
 
 # --- Stage 1: poll (haiku) --------------------------------------------------
 
 POLL_SCHEMA='{"type":"object","properties":{"action":{"type":"string","enum":["plan","implement","replan","none"]},"issue":{"type":"string"},"planPath":{"type":"string"},"inboxIssue":{"type":"number"},"feedback":{"type":"string"}},"required":["action"]}'
 
+# Tells the poll skill which lanes are currently occupied by an act in a
+# DIFFERENT, still-running cycle, so it skips tiers whose action would target
+# a busy lane rather than emitting one the wrapper would just have to reject
+# (see the lane-lock acquisition below). Omitted entirely when no lane is
+# busy.
+poll_prompt="/autopilot-poll"
+[[ -n "$busy_lanes" ]] && poll_prompt="$poll_prompt --busy-lanes $busy_lanes"
+# Global auto-approve only -- per-issue (`auto` label or an `auto` comment)
+# the skill reads itself from the labels/comments it already fetches.
+[[ "$AP_AUTO_APPROVE" == "1" ]] && poll_prompt="$poll_prompt --auto-approve"
+
 poll_rc=0
-poll_output="$(claude -p "/autopilot-poll" --model haiku --settings "$SETTINGS_PATH" --output-format json --json-schema "$POLL_SCHEMA" 2>>"$AP_HOME/logs/cycle.log")" || poll_rc=$?
+poll_output="$(claude -p "$poll_prompt" --model haiku --settings "$SETTINGS_PATH" --output-format json --json-schema "$POLL_SCHEMA" 2>>"$AP_HOME/logs/cycle.log")" || poll_rc=$?
 
 if [[ $poll_rc -ne 0 ]]; then
   log "poll invocation failed rc=$poll_rc"
   append_ledger "" "poll" "FAILED" 0 "unknown"
+  flock -u 9
   exit 0
 fi
 
@@ -503,10 +667,43 @@ append_ledger "$issue" "poll" "${action:-none}" "${poll_cost:-0}" "${poll_sessio
 
 if [[ -z "$action" || "$action" == "none" ]]; then
   log "poll: no action"
+  flock -u 9
   exit 0
 fi
 
 log "poll: action=$action issue=${issue:-} plan=${plan_path:-} inbox=${inbox_issue:-}"
+
+# --- Lane lock: acquire the lane this action needs, THEN release lock.poll -
+# so a plan can be decided (and start) while this cycle's build runs, or vice
+# versa. act_lane is derived from the SAME probe the scan filtered signals
+# against, so this acquisition should always succeed; a failure here is a
+# real anomaly, not ordinary contention, since lock.poll serializes deciders
+# to exactly one at a time.
+act_lane=""
+act_lock_file=""
+case "$action" in
+  plan|replan) act_lane="plan"; act_lock_file="$AP_HOME/lock.plan" ;;
+  implement) act_lane="build"; act_lock_file="$AP_HOME/lock.build" ;;
+esac
+
+if [[ -z "$act_lane" ]]; then
+  log "poll: unknown action '$action'"
+  flock -u 9
+  exit 0
+fi
+
+exec {lane_fd}>"$act_lock_file"
+if ! flock -n "$lane_fd"; then
+  log "act: lane lock '$act_lane' unexpectedly busy right after a free probe under lock.poll -- not acting this cycle; the poll's own label swap will be caught by the stale-claim sweep"
+  flock -u 9
+  exit 0
+fi
+
+# The lane lock (held for the rest of this script, released by process exit
+# either way -- crash semantics preserved) is now the only thing guarding
+# this act. Release lock.poll so the NEXT cycle can start deciding the other
+# lane immediately, instead of waiting on this act to finish.
+flock -u 9
 
 # --- Stage 2: act (full model) ---------------------------------------------
 
@@ -546,9 +743,21 @@ run_claude() {
   session_id="$(json_field "$out" ".session_id")"
   if [[ ! -f "$status_file" && -f "$adhoc_status" ]]; then
     # Session fell back to the documented adhoc path (could not resolve the
-    # run dir). Freshly cleared above, so if present it is this phase's own.
-    mv "$adhoc_status" "$status_file" 2>/dev/null || cp "$adhoc_status" "$status_file"
-    log "act: adopted adhoc status.json for phase=$phase"
+    # run dir). $AP_HOME/runs/adhoc/status.json is a SINGLE shared path, and
+    # two-lane concurrency means a build act and a plan act can both be
+    # running right now -- either could have left this file. Freshly cleared
+    # above (so a hit here postdates that clear), but that alone no longer
+    # proves it's THIS act's: parse .issue and adopt only on an exact match;
+    # otherwise leave the file untouched and treat it as missing (the other
+    # act still needs to find it).
+    local adhoc_issue
+    adhoc_issue="$(json_field "$(cat "$adhoc_status" 2>/dev/null)" ".issue")"
+    if [[ "$adhoc_issue" == "${issue:-}" ]]; then
+      mv "$adhoc_status" "$status_file" 2>/dev/null || cp "$adhoc_status" "$status_file"
+      log "act: adopted adhoc status.json for phase=$phase"
+    else
+      log "act: adhoc status.json .issue mismatch (want='${issue:-}' got='$adhoc_issue') for phase=$phase -- leaving it for its actual owner, treating as missing"
+    fi
   fi
   if [[ -f "$status_file" ]]; then
     st="$(json_field "$(cat "$status_file")" ".status")"
@@ -626,6 +835,15 @@ ${stdout_tail:-no output captured}"
     fi
     ap-notify.sh "autopilot FAILED: ${issue:-$action}" "$failure_body" "$inbox_url" || true
 
+    # Two-lane concurrency: a plan-lane FAILED and a build-lane FAILED can
+    # read-increment-write this file at the same moment -- an unguarded
+    # read-modify-write, so one increment can be lost to the other (both read
+    # "1", both write "2" instead of "2" then "3"). Acceptable: it only makes
+    # auto-pause slightly less prompt in the rare case of a genuinely
+    # simultaneous plan+build failure, never less safe (never fails to pause
+    # eventually, since each lane's own next failure re-reads and increments
+    # again), and a lock here would fight the very concurrency this feature
+    # exists for.
     fail_count=0
     [[ -f "$AP_HOME/fail_count" ]] && fail_count="$(cat "$AP_HOME/fail_count")"
     fail_count=$(( fail_count + 1 ))
@@ -653,8 +871,23 @@ ${stdout_tail:-no output captured}"
       ap-notify.sh "ready to test: ${issue:-$action}" "${pr_urls:-see inbox}" "$inbox_url" || true
     elif [[ "$final_phase" == "plan" || "$final_phase" == "replan" ]]; then
       # The approval gate is the whole point: the owner must know a plan is
-      # waiting for review the moment it lands.
-      ap-notify.sh "plan ready for review: ${issue:-$action}" "comment 'go' to build, anything else = feedback" "$inbox_url" || true
+      # waiting for review the moment it lands -- UNLESS auto-approve already
+      # applies to this issue (global flag, or its own `auto` label/comment
+      # history, which the poll skill would already have promoted to the
+      # `auto` label per autopilot-protocol.md), in which case it's about to
+      # build without a `go`, and the ping should say so instead of asking
+      # for one -- the owner must be able to tell the two apart at a glance.
+      auto_will_build=false
+      if [[ "$AP_AUTO_APPROVE" == "1" ]]; then
+        auto_will_build=true
+      elif [[ -n "$inbox_issue" && "$inbox_issue" != "null" ]] && issue_labeled_auto "$inbox_issue"; then
+        auto_will_build=true
+      fi
+      if [[ "$auto_will_build" == true ]]; then
+        ap-notify.sh "plan auto-approved, building: ${issue:-$action}" "no 'go' needed -- auto-approve is on for this issue; comment to override with feedback before it starts" "$inbox_url" || true
+      else
+        ap-notify.sh "plan ready for review: ${issue:-$action}" "comment 'go' to build, anything else = feedback" "$inbox_url" || true
+      fi
     fi
     ;;
 esac

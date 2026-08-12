@@ -39,6 +39,14 @@ export AP_INBOX_REPO="${AP_INBOX_REPO:-haroun-mj-ai/autopilot-inbox}"
 # legs). 0 disables this leg entirely.
 export AP_FULL_POLL_INTERVAL_MIN="${AP_FULL_POLL_INTERVAL_MIN:-360}"
 
+# Global auto-approve: 1 = build every plan-review issue as soon as it lands,
+# without waiting for a "go" comment. Never applies to needs-input (a
+# blocking question always waits for the owner). Two other switches
+# auto-approve a single delegation without this global flag: the `auto`
+# label on the inbox issue, or an owner comment whose first line is exactly
+# `auto`. See autopilot-protocol.md's inbox contract.
+export AP_AUTO_APPROVE="${AP_AUTO_APPROVE:-0}"
+
 # Marker inherited by every claude process autopilot spawns; the user's
 # global Stop hook checks it to avoid phone-pinging on headless cycles.
 export AP_AUTOPILOT=1

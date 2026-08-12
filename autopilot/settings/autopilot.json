@@ -46,7 +46,6 @@
       "mcp__linear-server__list_issues",
       "mcp__linear-server__list_projects",
       "mcp__linear-server__save_issue",
-      "mcp__linear-server__save_comment",
       "mcp__github__create_pull_request",
       "mcp__github__pull_request_read",
       "mcp__github__update_pull_request",

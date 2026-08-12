@@ -72,9 +72,10 @@ actually go anywhere; unconfigured, `ap-notify.sh` just logs to
    four-server comparison), then tears down the changed-pair servers and
    leaves only your baseline (5173/8000) bound. `ship-work` opens a PR with
    `--no-merge`. You get a "ready to test" ping with the PR link and the exact
-   relaunch commands (worktree paths, ports) — also posted on the inbox issue
-   and, publicly, as a PR-link comment + `agent:ready-to-test` label on the
-   Linear issue.
+   relaunch commands (worktree paths, ports) — also posted on the inbox
+   issue. Headless autopilot never comments on Linear: the claim and the
+   `agent:ready-to-test` label are its only Linear writes; everything else
+   (PR links, QA notes, relaunch commands) lands in the private inbox issue.
 5. **Morning:** run the relaunch commands from the inbox issue, test against
    the running servers, then run the interactive `/ship-work` yourself to
    merge (autonomous merging is permanently out of scope) — it also archives

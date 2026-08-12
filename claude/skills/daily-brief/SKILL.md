@@ -57,13 +57,28 @@ issue URL) where a link exists. **Omit a section entirely if it has no
 items** — except Spend and Health, which are always printed, so a fully
 quiet day still reports something.
 
-- **Queued** — `inbox` entries with none of the six state labels
+- **Queued** — `inbox` entries carrying the `Queued` label (case-insensitive)
+  and none of the six state labels
   (`planning`/`plan-review`/`building`/`ready-to-test`/`needs-input`/
   `failed`): one line each, issue title + URL. These are delegations the
-  owner created since the last cycle picked them up; the section clears once
-  `autopilot-poll` claims them into `planning`.
+  owner created and labeled since the last cycle picked them up; the section
+  clears once `autopilot-poll` claims them into `planning`.
+  - **Drafts (unlabeled — add the Queued label to delegate)** — a separate
+    one-liner, not a per-item list: `inbox` entries with no state label AND
+    no `Queued` label are drafts the pipeline ignores entirely. Count them
+    and print one line naming the count (e.g. "3 drafts waiting for the
+    `Queued` label — see inbox for titles/URLs") rather than listing each;
+    omit the line if the count is zero.
 - **Awaiting your approval** — `inbox` entries labeled `plan-review`: one
-  line each, issue title + URL.
+  line each, issue title + URL. If the entry also carries the `auto` label,
+  append a note that it will auto-approve on the next cycle rather than
+  actually waiting on the owner (e.g. "(auto-approves next cycle)") — this is
+  derivable from the `auto` label already present in each `inbox` entry's
+  `labels` array in the input snapshot. The global `AP_AUTO_APPROVE` switch
+  and any `auto` owner comment are NOT in this snapshot, so an entry can
+  still auto-approve without the label; say so plainly rather than inventing
+  it: end the section with one line noting that some entries may auto-approve
+  via the global flag or an `auto` comment even without the label shown here.
 - **Ready to test** — `inbox` entries labeled `ready-to-test`: one line each,
   issue title + URL. The input has no PR links or relaunch commands (those
   live in the inbox issue's own comments, which this skill cannot read) — say

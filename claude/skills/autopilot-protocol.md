@@ -89,10 +89,31 @@ team-visible.
   match, e.g. `ENG-1234` or `ENG-1234: whatever note`); anything in the title
   after the id, plus the issue body, is a note passed to `/plan-issue` as
   context, not machine-parsed.
-- **No state label = new delegation.** An open inbox issue with none of the
+- **`Queued` label = new delegation.** An open inbox issue carrying the
+  `Queued` label (case-insensitive match on the label name) and none of the
   six state labels below is unclaimed work waiting for `autopilot-poll` to
-  pick it up. The pipeline never creates inbox issues itself; it only labels
-  and comments on ones the owner already created.
+  pick it up. An open issue WITHOUT `Queued` is a **draft** — the pipeline
+  ignores it entirely, whether or not it carries a state label. On claiming
+  it, the poll removes `Queued` and adds the target state label
+  (`planning`, or `needs-input` if the title carries no `ENG-\d+` id) in a
+  single `gh issue edit` call. The pipeline never creates inbox issues
+  itself; it only labels ones the owner already created.
+- **Three independent auto-approve switches.** Any one of the following
+  treats a `plan-review` issue with no new pending owner feedback exactly
+  like a `go` comment (approve → `implement`), skipping the manual `go`:
+  1. **Global flag** — `AP_AUTO_APPROVE=1` in the orchestrator's env; the
+     wrapper passes `--auto-approve` to the poll prompt.
+  2. **Label** — the issue itself carries the `auto` label
+     (case-insensitive).
+  3. **Comment** — an owner comment on the issue whose first line is
+     exactly `auto` (case-insensitive, exact word — `go` and `auto` are the
+     only two recognized directive keywords).
+  A **new** owner comment that is neither `go` nor `auto` is feedback and
+  beats every auto-approve switch (route to a re-plan, never build a plan
+  the owner just objected to) — check for new comments before falling back
+  to auto-approval. `needs-input` issues are **never** auto-approved: a
+  blocking question or a ship-phase stop always waits for the human,
+  regardless of any switch.
 - **State labels** — exactly one held at a time, swapped rather than
   accumulated:
   `planning`, `plan-review`, `building`, `ready-to-test`, `needs-input`,
@@ -106,7 +127,9 @@ team-visible.
   with the line `Plan file: <absolute path>` before the plan markdown — this
   is the machine-readable source `autopilot-poll` extracts `planPath` from.
 - **Owner comments are the approval mechanism:**
-  - The word `go`, case-insensitive, exact (no other content) = approval.
+  - The word `go` or `auto`, case-insensitive, exact (no other content) =
+    approval (see the auto-approve switches above — these are the only two
+    recognized directive keywords).
   - Any other comment on a `plan-review` or `needs-input` issue = feedback or
     an answer, to be folded into a re-plan (quoted, not silently applied).
 
@@ -133,13 +156,17 @@ in). Never post a question or plan content to Linear.
 
 ## Linear footprint
 
-Headless runs only ever make the same two public writes the interactive
-skills already make — nothing new:
+Headless runs never post a Linear comment — not ever, for any reason.
+Questions, plan content, PR links, QA notes, and relaunch commands all go to
+the inbox issue only (see the inbox contract above); Linear is team-visible
+and the notify channel plus the private inbox repo are the only places a
+headless run talks to a human. The entire headless footprint on Linear is
+exactly two writes:
 
 - **Claim** (on first touching an issue): `assignee: me`, `state: In
   Progress`.
-- **Ship success**: one comment with the PR link(s), plus label
-  `agent:ready-to-test`.
+- **Ship success**: label `agent:ready-to-test` — no comment. The PR link(s)
+  go to the inbox issue only.
 
 Never set `Staging` or `Done` headlessly — `Staging` means merged
 (`AGENTS.md`), and merging is never autonomous. Never create a Linear issue

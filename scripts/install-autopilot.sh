@@ -188,6 +188,13 @@ else
 # against a misclassified inbox comment or a crash-stranded claim, not a
 # queue-pickup mechanism. Set to 0 to disable this leg entirely.
 # AP_FULL_POLL_INTERVAL_MIN=360
+
+# Global auto-approve: skip waiting for a "go" comment on EVERY plan-review
+# issue and build as soon as the plan lands (still never merges -- ship-work
+# always runs --no-merge). Never applies to a needs-input stop (a blocking
+# question always waits for you). Prefer the per-issue `auto` label or an
+# `auto` comment on one delegation instead of turning this on globally.
+# AP_AUTO_APPROVE=0
 ENVEOF
     report DID "seeded $ENV_FILE"
   fi

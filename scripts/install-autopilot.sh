@@ -9,15 +9,20 @@ set -uo pipefail
 #   --check   Report convergence; change nothing. Exit 1 if anything is
 #             missing/stale, so it is usable in CI or as a health check.
 #
-# Converges five things, in order:
+# Converges six things, in order:
 #   1. tmux + supercronic present on PATH (nix profile install if missing)
 #   2. ~/.autopilot/{runs,briefs,logs} exist
 #   3. ~/.autopilot/env seeded from a commented template (never overwritten)
 #   4. autopilot/bin/* symlinked into ~/.local/bin
 #   5. a managed block in ~/.bashrc self-heals the scheduler on login
+#   6. the JourneyAI checkout's .claude/skills/* symlinked into this repo's
+#      claude/skills/* (single source of truth), tracked paths underneath
+#      skip-worktree'd, and the untracked symlink names hidden via
+#      .git/info/exclude
 #
-# Honors $HOME throughout (tests run with HOME=$(mktemp -d)); the only
-# hardcoded path is locating this repo checkout itself.
+# Honors $HOME throughout (tests run with HOME=$(mktemp -d)); step 6 honors
+# $AP_WORK_REPO (default /home/coder/root-for-local) for the same reason.
+# The only hardcoded path is locating this repo checkout itself.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -48,6 +53,62 @@ report() {
   local status="$1"; shift
   echo "  $status  $*"
   [[ "$status" == "ok" || "$status" == "DID" ]] || converged=0
+}
+
+# ensure_managed_block <file> <start-marker> <end-marker> <desired-body> <label>
+# Idempotently converges a marked fence block in <file>: appends if absent,
+# replaces in place if stale, leaves untouched if already correct, never
+# duplicates. Shared by the ~/.bashrc self-heal block (step 5) and the
+# .git/info/exclude autopilot-skills block (step 6). Honors $CHECK_ONLY.
+ensure_managed_block() {
+  local file="$1" start="$2" end="$3" body="$4" label="$5"
+  local current_block=""
+  if [[ -f "$file" ]] && grep -qF "$start" "$file" 2>/dev/null; then
+    current_block="$(sed -n "/^${start//\//\\/}\$/,/^${end//\//\\/}\$/p" "$file")"
+  fi
+
+  local desired_block="$start
+$body
+$end"
+
+  if [[ "$current_block" == "$desired_block" ]]; then
+    report ok "$label up to date"
+    return
+  fi
+
+  if [[ "$CHECK_ONLY" == true ]]; then
+    if [[ -n "$current_block" ]]; then
+      report MISSING "$label present but stale"
+    else
+      report MISSING "$label absent"
+    fi
+    return
+  fi
+
+  mkdir -p "$(dirname "$file")"
+  touch "$file"
+  if [[ -n "$current_block" ]]; then
+    local tmp
+    tmp="$(mktemp)"
+    awk -v start="$start" -v end="$end" '
+      $0 == start { print; skip=1; next }
+      $0 == end && skip { print; skip=0; next }
+      skip { next }
+      { print }
+    ' "$file" >"$tmp"
+    awk -v start="$start" -v body="$body" '
+      $0 == start { print; print body; next }
+      { print }
+    ' "$tmp" >"$file"
+    rm -f "$tmp"
+    report DID "replaced stale $label"
+  else
+    {
+      echo ""
+      echo "$desired_block"
+    } >>"$file"
+    report DID "appended $label"
+  fi
 }
 
 # --- 1. tmux + supercronic --------------------------------------------------
@@ -122,6 +183,11 @@ else
 
 # Private GitHub repo used as the plan-review inbox (owner/repo).
 # AP_INBOX_REPO=haroun-mj-ai/autopilot-inbox
+
+# Minutes between the pre-scan gate's fallback full poll -- pure insurance
+# against a misclassified inbox comment or a crash-stranded claim, not a
+# queue-pickup mechanism. Set to 0 to disable this leg entirely.
+# AP_FULL_POLL_INTERVAL_MIN=360
 ENVEOF
     report DID "seeded $ENV_FILE"
   fi
@@ -181,48 +247,77 @@ done
 
 # --- 5. managed ~/.bashrc block ---------------------------------------------
 
-current_block=""
-if [[ -f "$BASHRC" ]] && grep -qF "$BLOCK_START" "$BASHRC" 2>/dev/null; then
-  current_block="$(sed -n "/^${BLOCK_START//\//\\/}\$/,/^${BLOCK_END//\//\\/}\$/p" "$BASHRC")"
-fi
+ensure_managed_block "$BASHRC" "$BLOCK_START" "$BLOCK_END" "$BLOCK_BODY" \
+  "$BASHRC autopilot block"
 
-desired_block="$BLOCK_START
-$BLOCK_BODY
-$BLOCK_END"
+# --- 6. autopilot skills wiring in the JourneyAI checkout -------------------
+# Reproduces (idempotently) the manual wiring this feature depends on: the
+# JourneyAI checkout's .claude/skills/<name> entries are symlinks into this
+# repo's claude/skills/<name> (the single source of truth). Any path git
+# already tracks underneath a replaced entry is skip-worktree'd so the
+# substitution never shows in `git status` or gets committed there, and the
+# (untracked) symlink names themselves are hidden via .git/info/exclude.
 
-if [[ "$current_block" == "$desired_block" ]]; then
-  report ok "$BASHRC autopilot block up to date"
-elif [[ "$CHECK_ONLY" == true ]]; then
-  if [[ -n "$current_block" ]]; then
-    report MISSING "$BASHRC autopilot block present but stale"
-  else
-    report MISSING "$BASHRC autopilot block absent"
-  fi
+AP_WORK_REPO="${AP_WORK_REPO:-/home/coder/root-for-local}"
+SKILLS_SRC_DIR="$ROOT_DIR/claude/skills"
+SKILLS_DEST_DIR="$AP_WORK_REPO/.claude/skills"
+SKILL_NAMES=(plan-issue implement-plan ship-work autopilot-poll daily-brief autopilot-protocol.md)
+
+if [[ ! -d "$AP_WORK_REPO/.git" ]]; then
+  report MISSING "$AP_WORK_REPO is not a git checkout (skipping autopilot skills wiring)"
 else
-  touch "$BASHRC"
-  if [[ -n "$current_block" ]]; then
-    # Replace the existing block in place (do not duplicate).
-    tmp="$(mktemp)"
-    awk -v start="$BLOCK_START" -v end="$BLOCK_END" '
-      $0 == start { print; skip=1; next }
-      $0 == end && skip { print; skip=0; next }
-      skip { next }
-      { print }
-    ' "$BASHRC" >"$tmp"
-    # Substitute the (now-empty-body) block back to the desired content.
-    awk -v start="$BLOCK_START" -v end="$BLOCK_END" -v body="$BLOCK_BODY" '
-      $0 == start { print; print body; next }
-      { print }
-    ' "$tmp" >"$BASHRC"
-    rm -f "$tmp"
-    report DID "replaced stale autopilot block in $BASHRC"
-  else
-    {
-      echo ""
-      echo "$desired_block"
-    } >>"$BASHRC"
-    report DID "appended autopilot block to $BASHRC"
-  fi
+  for name in "${SKILL_NAMES[@]}"; do
+    src="$SKILLS_SRC_DIR/$name"
+    dest="$SKILLS_DEST_DIR/$name"
+
+    if [[ ! -e "$src" ]]; then
+      report MISSING "skills source missing: $src"
+      continue
+    fi
+
+    if [[ -L "$dest" && "$(readlink "$dest")" == "$src" ]]; then
+      report ok "$name -> $src"
+    elif [[ "$CHECK_ONLY" == true ]]; then
+      report MISSING "$name not correctly symlinked at $dest (expected -> $src)"
+    else
+      mkdir -p "$SKILLS_DEST_DIR"
+      rm -rf "$dest"
+      ln -s "$src" "$dest"
+      report DID "linked $name -> $src"
+    fi
+
+    # Any path git already tracks under this entry must be skip-worktree'd
+    # so the symlink substitution above never shows in status/commits there.
+    tracked="$(git -C "$AP_WORK_REPO" ls-files -- ".claude/skills/$name" 2>/dev/null)"
+    [[ -z "$tracked" ]] && continue
+
+    while IFS= read -r tracked_file; do
+      [[ -z "$tracked_file" ]] && continue
+      bit="$(git -C "$AP_WORK_REPO" ls-files -v -- "$tracked_file" | cut -c1)"
+      if [[ "$bit" == "s" || "$bit" == "S" ]]; then
+        report ok "skip-worktree set: $tracked_file"
+      elif [[ "$CHECK_ONLY" == true ]]; then
+        report MISSING "skip-worktree not set: $tracked_file"
+      else
+        git -C "$AP_WORK_REPO" update-index --skip-worktree -- "$tracked_file"
+        report DID "set skip-worktree: $tracked_file"
+      fi
+    done <<<"$tracked"
+  done
+
+  EXCLUDE_FILE="$AP_WORK_REPO/.git/info/exclude"
+  EXCLUDE_START="# >>> autopilot skills >>>"
+  EXCLUDE_END="# <<< autopilot skills <<<"
+  EXCLUDE_BODY="# autopilot runtime symlinks (real files live in coder-packages/claude/skills)
+.claude/skills/plan-issue
+.claude/skills/implement-plan
+.claude/skills/ship-work
+.claude/skills/autopilot-poll
+.claude/skills/daily-brief
+.claude/skills/autopilot-protocol.md"
+
+  ensure_managed_block "$EXCLUDE_FILE" "$EXCLUDE_START" "$EXCLUDE_END" "$EXCLUDE_BODY" \
+    "$EXCLUDE_FILE autopilot skills block"
 fi
 
 if [[ "$CHECK_ONLY" == true ]]; then

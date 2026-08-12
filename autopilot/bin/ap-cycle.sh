@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Cron entrypoint for autopilot. Fired every 20 minutes by supercronic.
-# Stages: pause/lock/budget gate -> poll (haiku) -> act (full model) ->
-# reconcile (wrapper is authoritative for terminal states) -> ledger.
+# Cron entrypoint for autopilot. Fired every minute by supercronic.
+# Stages: pause/lock/budget gate -> scan (zero-token bash pre-scan; wakes the
+# poll only when there's plausibly something to act on) -> poll (haiku) ->
+# act (full model) -> reconcile (wrapper is authoritative for terminal
+# states) -> ledger.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
@@ -73,6 +75,167 @@ if not isinstance(cur, list):
     cur = []
 print(', '.join(str(x) for x in cur))
 " 2>/dev/null
+}
+
+# dict_get <json-object> <key> -> value at that string key, or empty
+dict_get() {
+  local json="$1" key="$2"
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$json" | jq -r --arg k "$key" '.[$k] // empty' 2>/dev/null
+    return
+  fi
+  printf '%s' "$json" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+key = sys.argv[1]
+v = d.get(key) if isinstance(d, dict) else None
+if v is not None:
+    print(v)
+" "$key" 2>/dev/null
+}
+
+# list_contains <json-array> <value> -> rc 0 if value (compared as string) is present
+list_contains() {
+  local json="$1" value="$2"
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$json" | jq -e --arg v "$value" 'any(.[]?; (. | tostring) == $v)' >/dev/null 2>&1
+    return
+  fi
+  printf '%s' "$json" | python3 -c "
+import json, sys
+try:
+    arr = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+value = sys.argv[1]
+sys.exit(0 if (isinstance(arr, list) and value in [str(x) for x in arr]) else 1)
+" "$value"
+}
+
+# extract_issue_numbers <gh-issue-list-json> -> issue numbers, one per line
+extract_issue_numbers() {
+  local json="$1"
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$json" | jq -r '.[]?.number' 2>/dev/null
+    return
+  fi
+  printf '%s' "$json" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if isinstance(d, list):
+    for item in d:
+        if isinstance(item, dict) and item.get('number') is not None:
+            print(item['number'])
+" 2>/dev/null
+}
+
+# extract_newest_comment <gh-api-comments-json (array)> -> "<id>\t<first body line>"
+# for element 0, or empty if the array is empty/unparseable.
+extract_newest_comment() {
+  local json="$1"
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$json" | jq -r '.[0] | select(.) | [(.id|tostring), ((.body // "") | split("\n")[0])] | @tsv' 2>/dev/null
+    return
+  fi
+  printf '%s' "$json" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if not isinstance(d, list) or not d:
+    sys.exit(0)
+c = d[0]
+if not isinstance(c, dict):
+    sys.exit(0)
+cid = c.get('id')
+body = c.get('body') or ''
+first_line = body.split('\n', 1)[0]
+if cid is not None:
+    print('%s\t%s' % (cid, first_line))
+" 2>/dev/null
+}
+
+# extract_new_intake_issues <gh-issue-list-json (number,labels)> -> issue
+# numbers, one per line, for open issues carrying NONE of the six state
+# labels below -- i.e. a fresh delegation the user just opened from the
+# GitHub mobile app, titled with the Linear id (e.g. "ENG-1234").
+NEW_INTAKE_STATE_LABELS='["planning","plan-review","building","ready-to-test","needs-input","failed"]'
+extract_new_intake_issues() {
+  local json="$1"
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$json" | jq -r --argjson state_labels "$NEW_INTAKE_STATE_LABELS" '
+      .[]? | select(((.labels // []) | map(.name)) as $names | ($state_labels | any(. as $s | $names | index($s))) | not) | .number
+    ' 2>/dev/null
+    return
+  fi
+  printf '%s' "$json" | python3 -c "
+import json, sys
+state_labels = set(json.loads('$NEW_INTAKE_STATE_LABELS'))
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if not isinstance(d, list):
+    sys.exit(0)
+for item in d:
+    if not isinstance(item, dict):
+        continue
+    names = {l.get('name') for l in (item.get('labels') or []) if isinstance(l, dict)}
+    if names & state_labels:
+        continue
+    if item.get('number') is not None:
+        print(item['number'])
+" 2>/dev/null
+}
+
+# commit_scan_state <state-path> <pending-inbox-tsv> <pending-new-intake-txt> <now-ts>
+# Merges pending inbox-comment / new-intake updates recorded during the scan
+# into the on-disk scan-state.json, refreshing last_poll_ts. Called only
+# after the claude poll stage has actually run (so a crashed poll leaves
+# state untouched and retries next cycle).
+commit_scan_state() {
+  local state_path="$1" inbox_tsv="$2" new_intake_txt="$3" now_ts="$4"
+  local old_json='{}'
+  [[ -f "$state_path" ]] && old_json="$(cat "$state_path")"
+  [[ -z "$old_json" ]] && old_json='{}'
+  local tmp="$state_path.tmp.$$"
+  python3 - "$old_json" "$inbox_tsv" "$new_intake_txt" "$now_ts" >"$tmp" <<'PYEOF'
+import json, sys
+old_json, inbox_tsv, new_intake_txt, now_ts = sys.argv[1:5]
+try:
+    old = json.loads(old_json)
+except Exception:
+    old = {}
+if not isinstance(old, dict):
+    old = {}
+inbox = dict(old.get("inbox") or {})
+with open(inbox_tsv) as f:
+    for line in f:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        k, v = line.split("\t", 1)
+        try:
+            inbox[k] = int(v)
+        except ValueError:
+            continue
+new_intake_seen = list(old.get("new_intake_seen") or [])
+with open(new_intake_txt) as f:
+    for line in f:
+        line = line.strip()
+        if line and line not in new_intake_seen:
+            new_intake_seen.append(line)
+new_state = {"inbox": inbox, "new_intake_seen": new_intake_seen, "last_poll_ts": now_ts}
+print(json.dumps(new_state))
+PYEOF
+  mv "$tmp" "$state_path"
 }
 
 ledger_path() {
@@ -177,6 +340,119 @@ if [[ "$over_budget" == true ]]; then
   exit 0
 fi
 
+# --- Stage 0.5: deterministic pre-scan gate ---------------------------------
+# Zero-token bash gate: only wake the haiku poll when there's plausibly
+# something to act on. A wrong "maybe" costs one idle haiku poll, so this
+# is deliberately biased toward waking. Haiku remains the decider (claiming,
+# priority, go-vs-feedback); this only gates whether it runs at all.
+
+scan_state_path="$AP_HOME/scan-state.json"
+old_state_json='{}'
+[[ -f "$scan_state_path" ]] && old_state_json="$(cat "$scan_state_path")"
+[[ -z "$old_state_json" ]] && old_state_json='{}'
+
+inbox_state_json="$(json_field "$old_state_json" ".inbox")"
+[[ -z "$inbox_state_json" || "$inbox_state_json" == "null" ]] && inbox_state_json='{}'
+new_intake_seen_json="$(json_field "$old_state_json" ".new_intake_seen")"
+[[ -z "$new_intake_seen_json" || "$new_intake_seen_json" == "null" ]] && new_intake_seen_json='[]'
+last_poll_ts="$(json_field "$old_state_json" ".last_poll_ts")"
+
+scan_pending_dir="$(mktemp -d "$AP_HOME/.scan-pending.XXXXXX")"
+pending_inbox_tsv="$scan_pending_dir/inbox.tsv"
+pending_new_intake_txt="$scan_pending_dir/new-intake.txt"
+: >"$pending_inbox_tsv"
+: >"$pending_new_intake_txt"
+# shellcheck disable=SC2317,SC2329 # invoked via trap, not directly
+cleanup_scan_pending() { rm -rf "$scan_pending_dir"; }
+trap cleanup_scan_pending EXIT
+
+wake=false
+wake_reason=""
+
+# --- Inbox leg, trigger 1+2: plan-review / needs-input issues -------------
+# Two separate `gh issue list` calls: --label ANDs on a single call, so OR-ing
+# the two labels needs two queries.
+inbox_list_plan_review="$(gh issue list --repo "$AP_INBOX_REPO" --state open --label plan-review --json number 2>>"$AP_HOME/logs/cycle.log")"
+inbox_list_needs_input="$(gh issue list --repo "$AP_INBOX_REPO" --state open --label needs-input --json number 2>>"$AP_HOME/logs/cycle.log")"
+
+inbox_issue_numbers="$(
+  { extract_issue_numbers "${inbox_list_plan_review:-[]}"; extract_issue_numbers "${inbox_list_needs_input:-[]}"; } \
+    | sort -un
+)"
+
+if [[ -n "$inbox_issue_numbers" ]]; then
+  while IFS= read -r num; do
+    [[ -z "$num" ]] && continue
+    comment_json="$(gh api "repos/$AP_INBOX_REPO/issues/$num/comments?sort=created&direction=desc&per_page=1" 2>>"$AP_HOME/logs/cycle.log")"
+    [[ -z "$comment_json" ]] && continue
+    comment_line="$(extract_newest_comment "$comment_json")"
+    [[ -z "$comment_line" ]] && continue
+    comment_id="${comment_line%%$'\t'*}"
+    comment_first_line="${comment_line#*$'\t'}"
+    # Agent-authored posts are always stamped with one of these markers; a
+    # human reply never starts a comment this way.
+    if [[ "$comment_first_line" == "Plan file:"* || "$comment_first_line" == "Phase:"* ]]; then
+      continue
+    fi
+    recorded_id="$(dict_get "$inbox_state_json" "$num")"
+    recorded_id="${recorded_id:-0}"
+    if [[ "$comment_id" =~ ^[0-9]+$ ]] && [[ "$comment_id" -gt "$recorded_id" ]] 2>/dev/null; then
+      wake=true
+      wake_reason="${wake_reason:+$wake_reason,}inbox:$num"
+      printf '%s\t%s\n' "$num" "$comment_id" >>"$pending_inbox_tsv"
+    fi
+  done <<<"$inbox_issue_numbers"
+fi
+
+# --- Inbox leg, trigger 3: new intake -- an open issue with none of the six
+# state labels is a fresh delegation the user just opened (titled with the
+# Linear id, e.g. "ENG-1234") from the GitHub mobile app.
+inbox_list_all_open="$(gh issue list --repo "$AP_INBOX_REPO" --state open --json number,labels --limit 100 2>>"$AP_HOME/logs/cycle.log")"
+new_intake_numbers="$(extract_new_intake_issues "${inbox_list_all_open:-[]}")"
+
+if [[ -n "$new_intake_numbers" ]]; then
+  while IFS= read -r num; do
+    [[ -z "$num" ]] && continue
+    if ! list_contains "$new_intake_seen_json" "$num"; then
+      wake=true
+      wake_reason="${wake_reason:+$wake_reason,}new-intake:$num"
+      printf '%s\n' "$num" >>"$pending_new_intake_txt"
+    fi
+  done <<<"$new_intake_numbers"
+fi
+
+# --- Fallback full poll: pure insurance, not a queue-pickup mechanism ------
+# Intake is now fully deterministic (the two inbox legs above), so this only
+# exists to catch (a) a human comment misclassified as agent-authored by the
+# `Plan file:` / `Phase:` marker heuristic, and (b) a claim stranded by a
+# mid-cycle crash that the poll skill's own stale-claim sweep would recover.
+# AP_FULL_POLL_INTERVAL_MIN=0 disables this leg entirely -- the scan legs
+# above remain the only wake source.
+full_poll_interval_min="${AP_FULL_POLL_INTERVAL_MIN:-360}"
+stale=false
+if [[ "$full_poll_interval_min" -gt 0 ]]; then
+  stale=true
+  if [[ -n "$last_poll_ts" && "$last_poll_ts" != "null" ]]; then
+    last_epoch="$(date -u -d "$last_poll_ts" +%s 2>/dev/null || echo 0)"
+    now_epoch="$(date -u +%s)"
+    elapsed_min=$(( (now_epoch - last_epoch) / 60 ))
+    if [[ "$elapsed_min" -le "$full_poll_interval_min" ]]; then
+      stale=false
+    fi
+  fi
+fi
+if [[ "$stale" == true ]]; then
+  wake=true
+  wake_reason="${wake_reason:+$wake_reason,}fallback"
+fi
+
+if [[ "$wake" != true ]]; then
+  log "scan: no signal, skipping poll"
+  exit 0
+fi
+
+log "scan: waking poll ($wake_reason)"
+
 # --- Stage 1: poll (haiku) --------------------------------------------------
 
 POLL_SCHEMA='{"type":"object","properties":{"action":{"type":"string","enum":["plan","implement","replan","none"]},"issue":{"type":"string"},"planPath":{"type":"string"},"inboxIssue":{"type":"number"},"feedback":{"type":"string"}},"required":["action"]}'
@@ -189,6 +465,11 @@ if [[ $poll_rc -ne 0 ]]; then
   append_ledger "" "poll" "FAILED" 0 "unknown"
   exit 0
 fi
+
+# The poll stage actually ran (didn't crash) -- commit this cycle's scan
+# findings now, not before. A crash above leaves scan-state untouched so the
+# same human input / Linear issue / stale timer retries next cycle.
+commit_scan_state "$scan_state_path" "$pending_inbox_tsv" "$pending_new_intake_txt" "$(date -u +%FT%TZ)"
 
 poll_json="$(json_field "$poll_output" ".structured_output")"
 if [[ -z "$poll_json" || "$poll_json" == "null" ]]; then

@@ -16,9 +16,13 @@ cd coder-packages
 
 This installs `tmux` and `supercronic` if missing, creates
 `~/.autopilot/{runs,briefs,logs}`, seeds `~/.autopilot/env` (only if absent —
-never overwritten), symlinks `autopilot/bin/*` into `~/.local/bin`, and adds a
+never overwritten), symlinks `autopilot/bin/*` into `~/.local/bin`, adds a
 managed self-heal block to `~/.bashrc` that runs `ap up --quiet` on every
-interactive login.
+interactive login, and wires the skills this feature runs (`plan-issue`,
+`implement-plan`, `ship-work`, `autopilot-poll`, `daily-brief`,
+`autopilot-protocol.md`) as symlinks into the JourneyAI checkout
+(`AP_WORK_REPO`, default `/home/coder/root-for-local`) — see "A note on
+`coder-packages/claude/skills/`" below.
 
 ## Configure `~/.autopilot/env`
 
@@ -38,7 +42,15 @@ what you need:
 - `AP_TZ` (default `UTC`) — timezone used for day boundaries (ledger,
   crontab, budget resets).
 - `AP_INBOX_REPO` (default `haroun-mj-ai/autopilot-inbox`) — the private
-  GitHub repo used for plan review.
+  GitHub repo used for plan review, and the only intake channel autopilot
+  scans.
+- `AP_FULL_POLL_INTERVAL_MIN` (default `360`, i.e. 6h) — minutes between the
+  pre-scan gate's fallback full poll. Intake is fully deterministic via the
+  two inbox legs above, so this is pure insurance against (a) a human
+  comment misclassified as agent-authored by the `Plan file:` / `Phase:`
+  marker heuristic, and (b) a claim stranded by a mid-cycle crash that the
+  poll skill's own stale-claim sweep would recover — not a queue-pickup
+  mechanism. Set to `0` to disable this leg entirely.
 
 At least one of `NTFY_TOPIC` / `SLACK_WEBHOOK_URL` must be set for pings to
 actually go anywhere; unconfigured, `ap-notify.sh` just logs to
@@ -71,6 +83,26 @@ actually go anywhere; unconfigured, `ap-notify.sh` just logs to
 A daily brief (`ap-brief.sh`, 07:00 `AP_TZ` by default) pings a digest of
 what's awaiting approval, ready to test, needs input, or failed, plus cost vs
 budget and any scheduler gap.
+
+### The 1-minute pre-scan gate
+
+`ap-cycle.sh` fires every minute, but the haiku poll (`/autopilot-poll`) —
+the only step that spends tokens before there's something to act on — only
+runs when a zero-token bash `gh` scan finds a plausible reason to wake it.
+The private inbox repo (`AP_INBOX_REPO`) is the only intake channel (no
+Linear polling): intake happens by opening a new inbox issue titled with the
+Linear id (e.g. `ENG-1234`) from the GitHub mobile app to delegate work, or
+by commenting on an existing `plan-review` / `needs-input` inbox issue.
+Concretely, the gate wakes the poll when it finds: an open inbox issue with
+none of the six state labels (`planning`/`plan-review`/`building`/
+`ready-to-test`/`needs-input`/`failed`) — a fresh delegation; an unseen human
+comment (not one of autopilot's own `Plan file:` / `Phase:`-stamped posts) on
+a `plan-review` or `needs-input` inbox issue; or — as pure insurance against
+a misclassified comment or a crash-stranded claim, not a queue-pickup
+mechanism — more than `AP_FULL_POLL_INTERVAL_MIN` minutes (default `360`,
+i.e. 6h; `0` disables this leg entirely) since the last poll. The
+gate is deliberately biased toward waking: a wrong "maybe" costs one idle
+haiku poll, which is what the old `*/20` cadence spent on every single fire.
 
 ## Controls
 
@@ -109,11 +141,19 @@ before every acting cycle.
   ledger gap over an hour as a warning — check the tmux session
   (`tmux attach -t autopilot`) and `~/.autopilot/logs/cycle.log`.
 
-## A note on `coder-packages/claude/`
+## A note on `coder-packages/claude/skills/`
 
-The three skills that autopilot wraps (`plan-issue`, `implement-plan`,
-`ship-work`) are shared team files. **The canonical copies live in the
-JourneyAI repo's `.claude/skills/`** — that is what teammates and this
-pipeline both use. The `claude/` directory in this repo is a stale mirror
-kept around from before the skills moved; it is not read by autopilot and is
-slated for removal as a follow-up. Don't edit it expecting it to take effect.
+This repo's `claude/skills/` is the single source of truth for `plan-issue`,
+`implement-plan`, `ship-work`, `autopilot-poll`, `daily-brief`, and
+`autopilot-protocol.md`. The JourneyAI checkout (`AP_WORK_REPO`) never holds
+its own copies — `scripts/install-autopilot.sh` symlinks each
+`.claude/skills/<name>` entry there straight into this repo, `skip-worktree`s
+any path the team repo still tracks underneath so the substitution never
+shows up in that repo's `git status` or gets committed, and hides the
+(untracked) symlink names via that repo's `.git/info/exclude`. Re-running the
+installer re-converges all of this; it's idempotent.
+
+**Recovery:** if a `git pull` in the JourneyAI checkout ever conflicts on a
+skip-worktree'd path, run `git update-index --no-skip-worktree <file> && git
+checkout -- <file>` there, then re-run `./scripts/install-autopilot.sh` from
+this repo to re-symlink and re-skip-worktree it.

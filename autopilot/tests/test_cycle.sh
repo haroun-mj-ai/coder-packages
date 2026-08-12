@@ -38,6 +38,10 @@ for a in "$@"; do
 done
 
 if $is_poll; then
+  if [[ "${AP_TEST_POLL_CRASH:-}" == "1" ]]; then
+    echo "stub: poll crashed" >&2
+    exit 1
+  fi
   action="${AP_TEST_POLL_ACTION:-none}"
   issue="${AP_TEST_POLL_ISSUE:-}"
   planpath="${AP_TEST_POLL_PLANPATH:-}"
@@ -123,6 +127,38 @@ n=$((n + 1))
 printf '%s\n' "$@" >"$calls_dir/$n.args"
 if [[ "${1:-}" == "auth" && "${2:-}" == "token" ]]; then
   echo "stub-gh-token"
+  exit 0
+fi
+# Pre-scan gate: `gh issue list --repo ... --label <label> --json number` for
+# the plan-review/needs-input comment triggers, or `gh issue list --repo ...
+# --json number,labels` (no --label) for the new-intake trigger.
+if [[ "${1:-}" == "issue" && "${2:-}" == "list" ]]; then
+  label=""
+  json_fields=""
+  prev=""
+  for a in "$@"; do
+    [[ "$prev" == "--label" ]] && label="$a"
+    [[ "$prev" == "--json" ]] && json_fields="$a"
+    prev="$a"
+  done
+  if [[ -z "$label" && "$json_fields" == *labels* ]]; then
+    echo "${AP_TEST_GH_ISSUES_ALL_OPEN:-[]}"
+    exit 0
+  fi
+  case "$label" in
+    plan-review) echo "${AP_TEST_GH_ISSUES_PLAN_REVIEW:-[]}" ;;
+    needs-input) echo "${AP_TEST_GH_ISSUES_NEEDS_INPUT:-[]}" ;;
+    *) echo "[]" ;;
+  esac
+  exit 0
+fi
+# Pre-scan gate: `gh api repos/OWNER/REPO/issues/<n>/comments?...`
+if [[ "${1:-}" == "api" ]]; then
+  path="${2:-}"
+  num="$(printf '%s' "$path" | sed -n 's#.*/issues/\([0-9][0-9]*\)/comments.*#\1#p')"
+  var="AP_TEST_GH_COMMENT_${num}"
+  echo "${!var:-[]}"
+  exit 0
 fi
 exit 0
 STUB_GH
@@ -160,6 +196,11 @@ setup_case() {
   make_stub_dir "$CASE_STUB_DIR"
   for v in "${AP_TEST_VARS[@]}"; do unset "$v"; done
   unset GITHUB_PERSONAL_ACCESS_TOKEN NTFY_TOPIC SLACK_WEBHOOK_URL
+  # Pre-scan gate knobs: default to no-signal-but-fallback-wakes (no
+  # scan-state -> stale -> wake), matching the pre-gate behavior every
+  # pre-existing case below already assumes (claude poll always runs).
+  unset AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_ISSUES_NEEDS_INPUT \
+    AP_TEST_GH_ISSUES_ALL_OPEN AP_TEST_POLL_CRASH AP_FULL_POLL_INTERVAL_MIN
 }
 
 run_case() {
@@ -289,16 +330,24 @@ assert "case6: notify called" [ "$(count_files "$CASE_STUB_DIR/notify_calls")" -
 # =============================================================================
 # Case 7: no status.json -> same failed handling; a second consecutive
 # failure -> pause file exists + notify
+# Pre-scan gate adaptation: both runs share CASE_AP_HOME, and run1's
+# successful poll would refresh last_poll_ts, so the fallback leg alone
+# wouldn't wake run2. Give each run its own unseen inbox comment so both
+# cycles wake on the inbox leg regardless of the fallback timer.
 # =============================================================================
 setup_case
+export AP_TEST_GH_ISSUES_PLAN_REVIEW='[{"number":700}]'
+export AP_TEST_GH_COMMENT_700='[{"id":1,"user":{"login":"haroun"},"body":"go"}]'
 rc1="$(AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-7 AP_TEST_POLL_PLANPATH=docs/plans/x.md \
   AP_TEST_POLL_INBOX=9 AP_TEST_ACT_MODE=no_status run_case)"
 assert "case7: run1 exit 0" [ "$rc1" -eq 0 ]
 assert "case7: run1 no pause yet" [ ! -e "$CASE_AP_HOME/pause" ]
 assert "case7: run1 fail_count=1" bash -c "[ \"\$(cat '$CASE_AP_HOME/fail_count')\" = 1 ]"
+export AP_TEST_GH_COMMENT_700='[{"id":2,"user":{"login":"haroun"},"body":"go"}]'
 rc2="$(AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-7b AP_TEST_POLL_PLANPATH=docs/plans/x.md \
   AP_TEST_POLL_INBOX=9 AP_TEST_ACT_MODE=no_status run_case)"
 assert "case7: run2 exit 0" [ "$rc2" -eq 0 ]
+unset AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_COMMENT_700
 assert "case7: run2 (2nd consecutive failure) -> pause file exists" [ -e "$CASE_AP_HOME/pause" ]
 assert "case7: run2 -> notify called (failed + auto-paused)" [ "$(count_files "$CASE_STUB_DIR/notify_calls")" -ge 3 ]
 
@@ -570,6 +619,143 @@ PY
   feedback_check_rc=$?
 fi
 assert "case16: recorded prompt's --feedback unescapes back to the original text" [ "$feedback_check_rc" -eq 0 ]
+
+# =============================================================================
+# Case 17 (pre-scan gate): idle cycle -- no labeled inbox issues, no new
+# intake, and a fresh last_poll_ts (so the fallback timer isn't stale either)
+# -> claude is never called at all, no ledger row is written, exit 0.
+# Fails pre-gate: the poll always ran unconditionally, so this would call
+# claude and write a ledger row regardless of any of this fixture.
+# =============================================================================
+setup_case
+now_ts="$(date -u +%FT%TZ)"
+printf '{"inbox":{},"new_intake_seen":[],"last_poll_ts":"%s"}' "$now_ts" >"$CASE_AP_HOME/scan-state.json"
+rc="$(AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-IDLE run_case)"
+assert "case17: idle -> exit 0" [ "$rc" -eq 0 ]
+assert "case17: idle -> claude never called" [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 0 ]
+assert "case17: idle -> no ledger file written" [ ! -f "$(today_ledger)" ]
+
+# =============================================================================
+# Case 18 (pre-scan gate): inbox wake -- a plan-review issue whose newest
+# comment ("go", no agent marker) is unseen wakes the poll; scan-state
+# records that comment id after the cycle; an identical second cycle (same
+# comment, now seen) does not wake again.
+# Fails pre-gate: no scan-state tracking exists, so the "identical second
+# cycle does not wake" assertion (count stays at 1) would fail -- the poll
+# always ran on every cycle.
+# =============================================================================
+setup_case
+export AP_TEST_GH_ISSUES_PLAN_REVIEW='[{"number":101}]'
+export AP_TEST_GH_COMMENT_101='[{"id":555,"user":{"login":"haroun"},"body":"go"}]'
+rc="$(AP_TEST_POLL_ACTION=none run_case)"
+assert "case18: inbox wake -> exit 0" [ "$rc" -eq 0 ]
+assert "case18: inbox wake -> claude called once (poll)" [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 1 ]
+assert "case18: scan-state records comment id 555 for issue 101" bash -c \
+  "python3 -c \"import json; d=json.load(open('$CASE_AP_HOME/scan-state.json')); assert d['inbox'].get('101') == 555, d\""
+rc2="$(AP_TEST_POLL_ACTION=none run_case)"
+assert "case18: second identical cycle -> exit 0" [ "$rc2" -eq 0 ]
+assert "case18: second identical cycle -> claude NOT called again" [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 1 ]
+unset AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_COMMENT_101
+
+# =============================================================================
+# Case 19 (pre-scan gate): marker suppression -- a needs-input issue whose
+# newest comment's first line starts with the agent marker `Phase:` is
+# agent-authored, not human input, so it must NOT wake the poll. A fresh
+# last_poll_ts rules out the fallback leg as the reason.
+# Fails pre-gate: the poll always ran regardless, so "claude NOT called"
+# would fail.
+# =============================================================================
+setup_case
+now_ts="$(date -u +%FT%TZ)"
+printf '{"inbox":{},"new_intake_seen":[],"last_poll_ts":"%s"}' "$now_ts" >"$CASE_AP_HOME/scan-state.json"
+export AP_TEST_GH_ISSUES_NEEDS_INPUT='[{"number":202}]'
+export AP_TEST_GH_COMMENT_202='[{"id":9,"user":{"login":"agent"},"body":"Phase: plan\nsome details"}]'
+rc="$(AP_TEST_POLL_ACTION=none run_case)"
+assert "case19: marker suppression -> exit 0" [ "$rc" -eq 0 ]
+assert "case19: marker suppression -> claude NOT called" [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 0 ]
+unset AP_TEST_GH_ISSUES_NEEDS_INPUT AP_TEST_GH_COMMENT_202
+
+# =============================================================================
+# Case 20 (pre-scan gate): new-intake wake -- an open inbox issue with none
+# of the six state labels (a fresh delegation the user opened, titled with
+# the Linear id) wakes the poll; scan-state records it as seen after the
+# cycle; an identical second cycle (same issue, now seen) does not wake
+# again.
+# Fails pre-gate: no new-intake leg (nor any Linear leg -- that's been
+# removed) exists at all; more concretely, the "second cycle does not wake
+# again" assertion would fail since the poll always ran on every cycle.
+# =============================================================================
+setup_case
+now_ts="$(date -u +%FT%TZ)"
+printf '{"inbox":{},"new_intake_seen":[],"last_poll_ts":"%s"}' "$now_ts" >"$CASE_AP_HOME/scan-state.json"
+export AP_TEST_GH_ISSUES_ALL_OPEN='[{"number":501,"labels":[]}]'
+rc="$(AP_TEST_POLL_ACTION=none run_case)"
+assert "case20: new-intake wake -> exit 0" [ "$rc" -eq 0 ]
+assert "case20: new-intake wake -> claude called once (poll)" [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 1 ]
+assert "case20: scan-state new_intake_seen includes 501" bash -c \
+  "python3 -c \"import json; d=json.load(open('$CASE_AP_HOME/scan-state.json')); assert '501' in d['new_intake_seen'], d\""
+rc2="$(AP_TEST_POLL_ACTION=none run_case)"
+assert "case20: second identical cycle -> exit 0" [ "$rc2" -eq 0 ]
+assert "case20: second identical cycle -> claude NOT called again" [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 1 ]
+unset AP_TEST_GH_ISSUES_ALL_OPEN
+
+# =============================================================================
+# Case 21 (pre-scan gate): fallback full poll -- a stale last_poll_ts (more
+# than AP_FULL_POLL_INTERVAL_MIN minutes old) wakes the poll; a fresh
+# last_poll_ts does not.
+# Fails pre-gate: the "fresh timestamp -> claude NOT called" assertion would
+# fail, since the poll always ran regardless of any timestamp.
+# =============================================================================
+setup_case
+printf '{"inbox":{},"new_intake_seen":[],"last_poll_ts":"2020-01-01T00:00:00Z"}' >"$CASE_AP_HOME/scan-state.json"
+rc="$(AP_TEST_POLL_ACTION=none run_case)"
+assert "case21: fallback stale -> exit 0" [ "$rc" -eq 0 ]
+assert "case21: fallback stale -> claude called once (poll)" [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 1 ]
+
+setup_case
+now_ts="$(date -u +%FT%TZ)"
+printf '{"inbox":{},"new_intake_seen":[],"last_poll_ts":"%s"}' "$now_ts" >"$CASE_AP_HOME/scan-state.json"
+rc="$(AP_TEST_POLL_ACTION=none run_case)"
+assert "case21: fallback fresh -> exit 0" [ "$rc" -eq 0 ]
+assert "case21: fallback fresh -> claude NOT called" [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 0 ]
+
+# =============================================================================
+# Case 21b (pre-scan gate): AP_FULL_POLL_INTERVAL_MIN=0 disables the fallback
+# leg entirely -- even a very stale last_poll_ts must NOT wake the poll (the
+# scan legs above remain the only wake source).
+# Fails pre-gate: the fallback leg (and the 0-disables-it rule) doesn't
+# exist at all, so the poll would always run regardless.
+# =============================================================================
+setup_case
+printf '{"inbox":{},"new_intake_seen":[],"last_poll_ts":"2020-01-01T00:00:00Z"}' >"$CASE_AP_HOME/scan-state.json"
+rc="$(AP_FULL_POLL_INTERVAL_MIN=0 AP_TEST_POLL_ACTION=none run_case)"
+assert "case21b: fallback disabled (0) -> exit 0" [ "$rc" -eq 0 ]
+assert "case21b: fallback disabled (0) -> claude NOT called despite stale ts" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 0 ]
+
+# =============================================================================
+# Case 22 (pre-scan gate): crash retry -- human input is found (wakes the
+# gate), but the claude poll invocation itself crashes (non-zero exit).
+# scan-state must NOT record the comment id, so the same comment retries
+# (wakes again) next cycle instead of being silently dropped.
+# Fails pre-gate: scan-state.json doesn't exist pre-gate at all, so this
+# assertion has no pre-gate equivalent; more relevantly, this is exactly the
+# deferred-write behavior the gate introduces.
+# =============================================================================
+setup_case
+export AP_TEST_GH_ISSUES_PLAN_REVIEW='[{"number":303}]'
+export AP_TEST_GH_COMMENT_303='[{"id":777,"user":{"login":"haroun"},"body":"go now"}]'
+export AP_TEST_POLL_CRASH=1
+rc="$(run_case)"
+assert "case22: crash retry -> exit 0" [ "$rc" -eq 0 ]
+assert "case22: crash retry -> comment id NOT recorded in scan-state" bash -c \
+  "[ ! -f '$CASE_AP_HOME/scan-state.json' ] || python3 -c \"
+import json
+with open('$CASE_AP_HOME/scan-state.json') as f:
+    d = json.load(f)
+assert d.get('inbox', {}).get('303') is None, d
+\""
+unset AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_COMMENT_303 AP_TEST_POLL_CRASH
 
 # =============================================================================
 

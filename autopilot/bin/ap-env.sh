@@ -18,8 +18,8 @@ fi
 export AP_HOME="${AP_HOME:-$HOME/.autopilot}"
 
 # User config: NTFY_TOPIC, SLACK_WEBHOOK_URL, AP_MAX_ISSUES_PER_DAY,
-# AP_MAX_DAY_COST_USD, AP_TZ, AP_INBOX_REPO. Never overwritten by defaults
-# below if already set here.
+# AP_MAX_DAY_COST_USD, AP_TZ, AP_INBOX_REPO, AP_FULL_POLL_INTERVAL_MIN. Never
+# overwritten by defaults below if already set here.
 if [[ -f "$AP_HOME/env" ]]; then
   # shellcheck disable=SC1091
   source "$AP_HOME/env"
@@ -31,3 +31,10 @@ export AP_MAX_ISSUES_PER_DAY="${AP_MAX_ISSUES_PER_DAY:-3}"
 export AP_MAX_DAY_COST_USD="${AP_MAX_DAY_COST_USD:-50}"
 export AP_TZ="${AP_TZ:-UTC}"
 export AP_INBOX_REPO="${AP_INBOX_REPO:-haroun-mj-ai/autopilot-inbox}"
+# Minutes between the pre-scan gate's fallback full poll -- pure insurance
+# against (a) a human inbox comment misclassified as agent-authored by the
+# `Plan file:` / `Phase:` marker heuristic, and (b) a claim stranded by a
+# mid-cycle crash that the poll skill's own stale-claim sweep would recover.
+# Not a queue-pickup mechanism (intake is fully deterministic via the inbox
+# legs). 0 disables this leg entirely.
+export AP_FULL_POLL_INTERVAL_MIN="${AP_FULL_POLL_INTERVAL_MIN:-360}"

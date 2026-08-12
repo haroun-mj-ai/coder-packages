@@ -6,5 +6,7 @@
 # just the template default — defaults to UTC if AP_TZ is unset.
 CRON_TZ=UTC
 
-*/20 * * * * /home/coder/.local/bin/ap-cycle.sh
+# Fires every minute; ap-cycle.sh runs a zero-token bash pre-scan gate and
+# only invokes the haiku poll when there's plausibly something to act on.
+*/1 * * * * /home/coder/.local/bin/ap-cycle.sh
 0 7 * * * /home/coder/.local/bin/ap-brief.sh

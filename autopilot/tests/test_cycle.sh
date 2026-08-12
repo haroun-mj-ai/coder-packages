@@ -793,6 +793,29 @@ assert "case23: no failed-label gh call" bash -c \
 assert "case23: adhoc file consumed (moved, not left stale)" bash -c \
   "[ ! -f '$CASE_AP_HOME/runs/adhoc/status.json' ]"
 
+# =============================================================================
+# Case 24: an ACTIONABLE poll must not mark the signals it didn't consume as
+# seen. Two fresh delegations wake the poll; it acts on one (plan). The other
+# must stay live so the next cycle re-wakes and drains it, instead of being
+# stranded until the insurance poll. Regression for the live incident where
+# 6 queued issues were all marked seen by the one poll that implemented an
+# unrelated approval.
+# =============================================================================
+setup_case
+now_ts="$(date -u +%FT%TZ)"
+printf '{"inbox":{},"new_intake_seen":[],"last_poll_ts":"%s"}' "$now_ts" >"$CASE_AP_HOME/scan-state.json"
+export AP_TEST_GH_ISSUES_ALL_OPEN='[{"number":901,"labels":[]},{"number":902,"labels":[]}]'
+rc="$(AP_TEST_POLL_ACTION=plan AP_TEST_POLL_ISSUE=ENG-901 AP_TEST_POLL_INBOX=901 run_case)"
+assert "case24: first cycle exit 0" [ "$rc" -eq 0 ]
+assert "case24: first cycle woke the poll" [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -ge 1 ]
+assert "case24: unconsumed intake NOT marked seen after actionable poll" bash -c \
+  "python3 -c \"import json; d=json.load(open('$CASE_AP_HOME/scan-state.json')); assert '902' not in d['new_intake_seen'] and '901' not in d['new_intake_seen'], d\""
+calls_before="$(count_files "$CASE_STUB_DIR/claude_calls")"
+rc2="$(AP_TEST_POLL_ACTION=plan AP_TEST_POLL_ISSUE=ENG-902 AP_TEST_POLL_INBOX=902 run_case)"
+assert "case24: second cycle exit 0" [ "$rc2" -eq 0 ]
+assert "case24: second cycle re-woke the poll for the remaining intake" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -gt "$calls_before" ]
+
 if [[ "$FAILURES" -eq 0 ]]; then
   echo "ALL PASS"
   exit 0

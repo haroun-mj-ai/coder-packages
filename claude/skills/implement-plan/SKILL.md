@@ -630,3 +630,14 @@ PR, never merge, never move the Linear status" applies identically in
 headless mode. Headless `/implement-plan` still stops at a committed,
 roborev-reviewed branch; pushing and PRs belong to `/ship-work`, headless or
 not.
+
+**Never end the turn with work still in the background.** The headless `-p`
+harness kills the session outright once its background-wait ceiling passes —
+no final message, no `status.json`, and the wrapper reconciles the run as a
+crash even when every gate was green. So in headless mode: run the quality
+gates as **blocking foreground commands** (never parked as background tasks
+you "wait on"), and treat writing `status.json` as a step that must complete
+before anything else is allowed to still be running. If a long suite
+genuinely must run in the background, write an interim `status.json`
+(`FAILED`, detail "gates still running at turn end") first and let the
+retry recover — never leave the file unwritten while waiting.

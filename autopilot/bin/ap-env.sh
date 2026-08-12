@@ -38,3 +38,7 @@ export AP_INBOX_REPO="${AP_INBOX_REPO:-haroun-mj-ai/autopilot-inbox}"
 # Not a queue-pickup mechanism (intake is fully deterministic via the inbox
 # legs). 0 disables this leg entirely.
 export AP_FULL_POLL_INTERVAL_MIN="${AP_FULL_POLL_INTERVAL_MIN:-360}"
+
+# Marker inherited by every claude process autopilot spawns; the user's
+# global Stop hook checks it to avoid phone-pinging on headless cycles.
+export AP_AUTOPILOT=1

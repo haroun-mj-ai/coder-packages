@@ -471,14 +471,24 @@ if [[ $poll_rc -ne 0 ]]; then
   exit 0
 fi
 
-# The poll stage actually ran (didn't crash) -- commit this cycle's scan
-# findings now, not before. A crash above leaves scan-state untouched so the
-# same human input / Linear issue / stale timer retries next cycle.
-commit_scan_state "$scan_state_path" "$pending_inbox_tsv" "$pending_new_intake_txt" "$(date -u +%FT%TZ)"
-
 poll_json="$(json_field "$poll_output" ".structured_output")"
 if [[ -z "$poll_json" || "$poll_json" == "null" ]]; then
   poll_json="$(json_field "$poll_output" ".result")"
+fi
+
+action_peek="$(json_field "$poll_json" ".action")"
+# The poll ran (didn't crash) -- commit scan findings, but only as much as
+# the poll actually consumed. The poll takes at most ONE action per cycle:
+# when it acted, the label swap it performed is the real bookkeeping, and
+# the OTHER pending signals must stay live so the next cycle re-wakes and
+# drains them one by one (previously they were all marked seen and stranded
+# until the insurance poll). When the poll found nothing actionable (none),
+# commit everything so non-actionable signals stop re-waking us every
+# minute. Either way last_poll_ts refreshes.
+if [[ "$action_peek" == "none" ]]; then
+  commit_scan_state "$scan_state_path" "$pending_inbox_tsv" "$pending_new_intake_txt" "$(date -u +%FT%TZ)"
+else
+  commit_scan_state "$scan_state_path" /dev/null /dev/null "$(date -u +%FT%TZ)"
 fi
 
 action="$(json_field "$poll_json" ".action")"
@@ -524,7 +534,12 @@ run_claude() {
   # read $AP_RUN_DIR from its environment; --run-dir hands it the path as
   # literal prompt text (see autopilot-protocol.md).
   set -- "$1 --run-dir $AP_RUN_DIR" "${@:2}"
-  out="$(claude -p "$@" --settings "$SETTINGS_PATH" --output-format json 2>"$stderr_file")" || rc=$?
+  # Act runs park long test suites in background tasks; the -p harness kills
+  # the session after its background-wait ceiling (default 10 min), which is
+  # how a healthy 28-min implement died with no result record. Give acts a
+  # 60-min ceiling (override via AP_BG_WAIT_CEILING_MS).
+  out="$(CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="${AP_BG_WAIT_CEILING_MS:-3600000}" \
+    claude -p "$@" --settings "$SETTINGS_PATH" --output-format json 2>"$stderr_file")" || rc=$?
   cat "$stderr_file" >>"$AP_HOME/logs/cycle.log" 2>/dev/null || true
   local cost session_id st
   cost="$(json_field "$out" ".total_cost_usd")"

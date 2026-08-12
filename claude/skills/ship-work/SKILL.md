@@ -340,3 +340,27 @@ filled with every opened PR URL.
 Plan archiving (`docs/plans/` → `docs/plans/completed/`) does **not** happen
 under `--headless` — it stays exactly where step 9 leaves it today, performed
 only by the human's later interactive `/ship-work` run that actually merges.
+
+**Never end the turn with work still in the background — this is how headless
+ship-work dies most often.** The `-p` harness ends the process when your turn
+ends: there is no later turn in which a background task's result comes back to
+you. Waiting on CI is exactly where this bites. A real run (ENG-1199,
+2026-08-12) finished its turn saying *"that worked and is running in the
+background, I'll wait for it to finish"* — the process exited, `status.json` was
+never written, and the wrapper correctly reconciled a successful push as a
+crash.
+
+So, in headless mode:
+
+- Poll CI with **blocking foreground** commands (`gh pr checks <n> --watch`, or
+  a bounded loop of `gh pr checks <n>` calls you actually wait on inside the
+  turn). Never park the wait in a background task and end your message.
+- Treat writing `status.json` as the last thing that must complete before
+  anything else is allowed to still be running. If you genuinely cannot finish
+  the wait inside the turn, write `status.json` FIRST with what you know —
+  `NEEDS_HUMAN` naming the PR and the pending check, or `FAILED` with
+  `detail: "CI wait exceeded the turn"` — so the run is reconcilable and the
+  next cycle (or the owner) can pick it up from a known state.
+- The same rule covers `roborev --wait`, long test suites, and anything else
+  you would be tempted to background: if it must run, run it in the foreground;
+  if it cannot, record state before yielding.

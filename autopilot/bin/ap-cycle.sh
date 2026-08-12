@@ -1041,6 +1041,7 @@ $failure_body" \
       if [[ -n "$inbox_issue" && "$inbox_issue" != "null" ]]; then
         gh issue edit "$inbox_issue" --repo "$AP_INBOX_REPO" \
           --add-label failed --remove-label planning --remove-label building \
+          --remove-label shipping --remove-label ship-pending \
           >>"$AP_HOME/logs/cycle.log" 2>&1 || true
         gh issue comment "$inbox_issue" --repo "$AP_INBOX_REPO" \
           --body "Autopilot: run failed.

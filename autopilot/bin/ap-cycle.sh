@@ -870,6 +870,26 @@ if ! flock -n "$lane_fd"; then
   exit 0
 fi
 
+# PER-ISSUE lock, on top of the lane lock. The lane locks cap how many acts
+# run at once; they do NOT stop the SAME issue entering two different slots.
+# Claiming is the poll skill's job (the plan-review -> building label swap),
+# and that is prose executed by a model: if the swap lags or is skipped, the
+# next cycle re-claims the same issue a minute later and two implementers race
+# on one worktree. That happened on ENG-1308 (2026-08-13): polls at 03:50:53
+# and 03:51:53 both emitted implement for it, and an implementer only caught
+# it by noticing files change between its own reads. This lock makes the claim
+# enforced rather than advisory, so the failure cannot recur however the poll
+# behaves. Held for the life of the act; released by process exit.
+if [[ -n "${issue:-}" && "$issue" != "null" ]]; then
+  issue_lock_file="$AP_HOME/lock.issue.$issue"
+  exec {issue_fd}>"$issue_lock_file"
+  if ! flock -n "$issue_fd"; then
+    log "act: issue $issue is ALREADY being acted on by another cycle -- refusing to start a second act on the same worktrees (see lock.issue.$issue)"
+    flock -u 9
+    exit 0
+  fi
+fi
+
 # The lane lock (held for the rest of this script, released by process exit
 # either way -- crash semantics preserved) is now the only thing guarding
 # this act. Release lock.poll so the NEXT cycle can start deciding the other
@@ -1145,7 +1165,18 @@ $failure_body" \
   NEEDS_HUMAN)
     question="$(json_field "$status_json" ".question")"
     if [[ -n "$inbox_issue" && "$inbox_issue" != "null" && -n "$question" && "$question" != "null" ]]; then
-      gh issue comment "$inbox_issue" --repo "$AP_INBOX_REPO" --body "$question" \
+      # MUST carry a marker. This is the wrapper ECHOING the skill's question,
+      # and the echo is a separate comment from the skill's own marked one --
+      # posted later, so it becomes the newest. Unmarked, the next scan reads
+      # the pipeline's own question as owner feedback and re-plans; that
+      # re-plan ends NEEDS_HUMAN, the wrapper echoes again, and it loops.
+      # Observed on ENG-1308: five re-plans, ~$17, all from this one echo.
+      # Prefix unconditionally rather than trusting `question` to be marked --
+      # a duplicated marker line is harmless, a missing one is a loop.
+      gh issue comment "$inbox_issue" --repo "$AP_INBOX_REPO" \
+        --body "Autopilot: needs input (phase ${final_phase:-unknown}).
+
+$question" \
         >>"$AP_HOME/logs/cycle.log" 2>&1 || true
     fi
     ap-notify.sh "autopilot needs input: ${issue:-$action}" "${question:-see inbox}" "$inbox_url" || true

@@ -122,6 +122,30 @@ git -C <path> worktree add --no-track \
 `dev` above stands for whichever base 1e gives for that repo, which is `main` for
 `assistants/` and `observability/`.
 
+**A reused worktree must be verifiably fresh, or you do not reuse it.** Before
+dispatching, for each worktree you plan to reuse, establish all three:
+
+```bash
+git -C <worktree> status --porcelain      # must be empty
+git -C <worktree> log --oneline origin/dev..HEAD   # only the plan commit, if any
+git -C <worktree> rev-list --count HEAD..origin/dev  # must be 0 after the rebase below
+```
+
+- **Empty and clean** (nothing uncommitted, nothing stashed, no commits beyond
+  the plan) → rebase it onto fresh `origin/dev` and continue. For a genuinely
+  empty tree that is identical to cutting a new one, so do the cheap thing.
+- **Carries uncommitted work** → this is a previous run's unfinished
+  implementation, not junk. ENG-1133 left **1465 uncommitted lines** in its
+  backend worktree after being killed mid-build; recreating the worktree there
+  would have destroyed a real, expensive build. **Stop** and report it
+  (`NEEDS_HUMAN` headless) naming the files — a human decides whether to
+  commit, stash, or discard.
+- **Rebase does not come out clean** → stop, same as above. Do not force
+  anything, do not delete the branch.
+
+Never resolve staleness by deleting a worktree that has content. The only safe
+recreate is of a tree with nothing in it.
+
 **Rebase whatever you reuse, before dispatching anything.** A plan approved yesterday
 sits on yesterday's `dev`:
 

@@ -258,6 +258,14 @@ hold_lane_lock() {
   local lock_file="$1" secs="$2"
   flock "$lock_file" sleep "$secs" &
   LANE_HOLDER_PID=$!
+  # Wait until the lock is genuinely held before returning: backgrounding
+  # flock and immediately running the cycle is a race, and a race here makes
+  # the test pass for the wrong reason (cycle ran before the lock existed).
+  local i=0
+  while flock -n "$lock_file" true 2>/dev/null; do
+    i=$((i + 1)); [[ "$i" -gt 100 ]] && break
+    sleep 0.05
+  done
 }
 
 count_files() {
@@ -1637,6 +1645,46 @@ rc="$(AP_TEST_POLL_ACTION=none run_case)"
 assert "marker(control): a real owner comment still wakes the poll" \
   [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 1 ]
 unset AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_COMMENT_771
+
+# =============================================================================
+# Case: per-issue lock -- the lane locks cap concurrency but do NOT stop the
+# SAME issue entering two different slots. Claiming is the poll skill's job
+# (a label swap in prose), so a lagged or skipped swap lets the next cycle
+# re-claim the same issue and race two implementers on one worktree. Observed
+# on ENG-1308: polls at 03:50:53 and 03:51:53 both emitted implement for it.
+# =============================================================================
+setup_case
+now_ts="$(date -u +%FT%TZ)"
+# No scan-state seeded on purpose: absent last_poll_ts -> the fallback leg
+# wakes the poll, which is what these two cases need to exercise.
+# Simulate a cycle already acting on ENG-77 by holding its per-issue lock.
+hold_lane_lock "$CASE_AP_HOME/lock.issue.ENG-77" 8
+rc="$(AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-77 AP_TEST_POLL_PLANPATH=/x/p.md AP_TEST_POLL_INBOX=77 run_case)"
+assert "issueLock: exit 0" [ "$rc" -eq 0 ]
+assert "issueLock: poll ran but NO act was dispatched for the in-flight issue" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 1 ]
+kill "$LANE_HOLDER_PID" 2>/dev/null; wait "$LANE_HOLDER_PID" 2>/dev/null
+# Control: with the lock free, the same action DOES dispatch its act.
+setup_case
+rc="$(AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-77 AP_TEST_POLL_PLANPATH=/x/p.md AP_TEST_POLL_INBOX=77 run_case)"
+assert "issueLock(control): lock free -> act dispatched" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -ge 2 ]
+
+# =============================================================================
+# Case: the wrapper's NEEDS_HUMAN echo of status.json's `question` must carry a
+# marker. It is a SEPARATE, LATER comment than the skill's own marked one, so
+# unmarked it becomes the newest and the next scan reads the pipeline's own
+# question as owner feedback -> re-plan -> NEEDS_HUMAN -> echo -> loop.
+# ENG-1308 burned ~$17 in five re-plans on exactly this.
+# =============================================================================
+setup_case
+rc="$(AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-78 AP_TEST_POLL_PLANPATH=/x/p.md AP_TEST_POLL_INBOX=78 \
+  AP_TEST_IMPLEMENT_STATUS=NEEDS_HUMAN AP_TEST_QUESTION="which table should this use" run_case)"
+assert "questionEcho: exit 0" [ "$rc" -eq 0 ]
+assert "questionEcho: the echoed question comment is marked Autopilot:" bash -c \
+  "grep -rl 'Autopilot: needs input' '$CASE_STUB_DIR/gh_calls' >/dev/null"
+assert "questionEcho: the question text is still included" bash -c \
+  "grep -rl 'which table should this use' '$CASE_STUB_DIR/gh_calls' >/dev/null"
 
 if [[ "$FAILURES" -eq 0 ]]; then
   echo "ALL PASS"

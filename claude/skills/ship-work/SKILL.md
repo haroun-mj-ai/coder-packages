@@ -290,6 +290,14 @@ having been dropped by a force-push that raced the merge.
   (and where there was no gate at all), every conflict resolved automatically,
   every fix attempt spent, and what remains for a human. If anything stopped the
   run, lead with that.
+- After a successful merge, remove the worktree and local branch for the issue in
+  every repo that merged — the same never-force rules as everywhere else in this
+  skill: `git -C <repo> worktree remove <path>` (never `--force`) then
+  `git -C <repo> branch -d <branch>` (never `-D`), and only once the branch is
+  actually merged into its base and the worktree is clean. `autopilot/bin/ap-sweep.sh`
+  (`ap sweep`) does exactly this check on a schedule for anything left behind — use
+  it (`ap sweep --yes`) instead of hand-rolling the same check for the periodic
+  cleanup case, or when cleaning up several issues' worktrees at once.
 
 ## Headless mode (--headless)
 

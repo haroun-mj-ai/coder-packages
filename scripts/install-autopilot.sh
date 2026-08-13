@@ -286,7 +286,7 @@ ensure_managed_block "$BASHRC" "$BLOCK_START" "$BLOCK_END" "$BLOCK_BODY" \
 AP_WORK_REPO="${AP_WORK_REPO:-/home/coder/root-for-local}"
 SKILLS_SRC_DIR="$ROOT_DIR/claude/skills"
 SKILLS_DEST_DIR="$AP_WORK_REPO/.claude/skills"
-SKILL_NAMES=(plan-issue implement-plan ship-work autopilot-poll daily-brief autopilot-protocol.md)
+SKILL_NAMES=(plan-issue implement-plan ship-work autopilot-poll daily-brief test-issue autopilot-protocol.md)
 
 if [[ ! -d "$AP_WORK_REPO/.git" ]]; then
   report MISSING "$AP_WORK_REPO is not a git checkout (skipping autopilot skills wiring)"

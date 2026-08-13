@@ -11,13 +11,17 @@ CRONTAB_RENDERED="$AP_HOME/crontab.rendered"
 TMUX_SESSION="autopilot"
 
 usage() {
-  echo "Usage: ap {up [--quiet]|down|status|pause|resume|runs|run|tail|watch|--print-paths}" >&2
+  echo "Usage: ap {up [--quiet]|down|status|pause|resume|runs|run|tail|watch|sweep|--print-paths}" >&2
   echo "  runs [-n N]    List recent acts; live ones are marked LIVE." >&2
   echo "  run  [TARGET]  One act in detail: main-loop model, tokens, tool mix," >&2
   echo "                 status.json, stderr, final message. --timeline for" >&2
   echo "                 every tool call it made." >&2
   echo "  tail [TARGET]  Follow an act as it works, or replay a finished one." >&2
   echo "  watch          tmux pane per live act, each tailing it." >&2
+  echo "  sweep [--yes]  Remove merged+clean wt-eng* worktrees and their local" >&2
+  echo "                 branches. Defaults to --dry-run (report only); pass" >&2
+  echo "                 --yes to actually remove. Never --force, never" >&2
+  echo "                 'branch -D'." >&2
   echo "  TARGET is a session-id prefix, an issue id (ENG-1234), or 'latest'." >&2
   echo "  --print-paths  Debug: render the crontab and print resolved paths" >&2
   echo "                 (script dir, crontab template/rendered, AP_HOME); exits 0." >&2
@@ -32,6 +36,7 @@ cmd_runs() { python3 "$RUNS_PY" list "$@"; }
 cmd_run() { python3 "$RUNS_PY" show "$@"; }
 cmd_tail() { python3 -u "$RUNS_PY" tail "$@"; }
 cmd_watch() { python3 "$RUNS_PY" watch "$@"; }
+cmd_sweep() { "$SCRIPT_DIR/ap-sweep.sh" "$@"; }
 
 session_alive() {
   tmux has-session -t "$TMUX_SESSION" 2>/dev/null
@@ -250,6 +255,7 @@ case "$sub" in
   run) cmd_run "$@" ;;
   tail) cmd_tail "$@" ;;
   watch) cmd_watch "$@" ;;
+  sweep) cmd_sweep "$@" ;;
   --print-paths) cmd_print_paths ;;
   *) usage ;;
 esac

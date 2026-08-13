@@ -1,6 +1,6 @@
 ---
 name: implement-plan
-description: Build an already-reviewed plan from docs/plans/ by dispatching Sonnet implementer agents per work unit, run the real quality gates, audit the tests against the spec, then QA beyond the happy path by deriving the change's blast radius and exercising the features it interacts with, commit, and run roborev. Hands over four running servers — the changed frontend and backend plus an unchanged dev baseline to compare against, reusing any baseline already up. Ends by recommending /ship-work; it never pushes, opens a PR, or merges. Use after the human has approved a plan, or on /implement-plan. Pairs with /plan-issue, which produces the plan. Do NOT use to design, to plan, or to root-cause a bug.
+description: Build an already-reviewed plan from docs/plans/ by dispatching Sonnet implementer agents per work unit, run the real quality gates, audit the tests against the spec, then QA beyond the happy path by deriving the change's blast radius and exercising the features it interacts with, commit, and run roborev. Writes the QA plan as a durable, committed artifact under docs/plans/qa/ carrying the gates' commit SHA and the exact relaunch commands, then stops any servers it started for its own verification rather than leaving them running — /test-issue starts the changed pair on demand later. Ends by recommending /ship-work; it never pushes, opens a PR, or merges. Use after the human has approved a plan, or on /implement-plan. Pairs with /plan-issue, which produces the plan. Do NOT use to design, to plan, or to root-cause a bug.
 ---
 
 # implement-plan
@@ -410,9 +410,28 @@ For backend-only changes there is no browser, but the surface is the same: exerc
 the other call sites scout found, with the tenancy and permission cases above,
 against the local API.
 
-### 8. Write the QA plan
+### 8. Write the QA plan as a durable artifact
 
-The plan the human runs before this reaches staging. Structure it as:
+The plan the human runs before this reaches staging — and, from now on, the one
+artifact `/ship-work` and `/test-issue` read instead of re-deriving what this
+step already computed. Reporting it only in this chat's transcript and in an
+inbox comment meant `/test-issue` had to re-run the blast-radius derivation and
+re-discover the gate results from scratch; the whole saving of computing them
+once here was lost the moment they were never written anywhere durable.
+
+Write it to `<root-worktree>/docs/plans/qa/<eng-id>-qa.md` (create the `qa/`
+directory if it does not exist yet). Start the file with a machine-readable
+header, in this exact order and these exact keys:
+
+```
+Issue: ENG-<id>
+Commit: <the SHA step 4's gates were run against, one per touched repo, e.g. "backend abc1234, frontend def5678">
+Gates: <verbatim pass/fail summary per gate command, e.g. "frontend build+test:run PASS, backend pytest PASS">
+Relaunch: <exact commands to bring the changed pair up on demand — worktree paths, ports, the .env.local copy, the node_modules symlink, and the 5173-5176 CORS window caveat; see step 11>
+PRs: (filled in by ship-work)
+```
+
+Below the header, the same four-section body as before:
 
 1. **Verified here**, with the evidence: what was run or clicked, and the result.
 2. **Needs a human**, and why the agent could not reach it. Be specific rather than
@@ -425,6 +444,23 @@ The plan the human runs before this reaches staging. Structure it as:
 
 Assume the app is live and a regression is visible to customers. State plainly what
 was **not** covered; an honest gap is useful and a silent one is a trap.
+
+Commit the artifact in its own commit on the plan's branch, subject
+`ENG-<id>: add QA plan artifact` — do not fold it into a work-unit commit. It is
+computed after every unit has already landed and been audited, so it never
+shares a reason with an earlier commit, and giving it a dedicated commit means
+`/ship-work`'s later one-line edit to the `PRs:` line (see `ship-work/SKILL.md`
+step 5) touches a file nothing else is mid-editing. Stage it with the explicit
+path, same as step 10's rule.
+
+Still surface it beyond the file, as before: report it in this session's chat
+(step 9), and in headless mode post its header and a one-line pointer to the
+inbox issue, marked `Phase: implement` per the protocol's marker rule (an
+informational note, not a `NEEDS_HUMAN` question) — but the **file is the
+source of truth**; the inbox post and the chat report are courtesy copies of
+it, not the other way around. Headless runs additionally record the artifact's
+absolute path in `status.json`'s `detail`, so the morning review opens it
+directly instead of hunting for it.
 
 ### 9. Stop and report
 
@@ -484,50 +520,45 @@ offer `/roborev-fix`. Note that roborev only sees the committed branch of one
 repo, so its cross-repo findings about the gitignored siblings are usually noise:
 verify the frontend yourself rather than looping on them.
 
-### 11. Leave four servers running: changed, and an unchanged baseline
+### 11. Stop what you started; record how to relaunch it
 
-A run does not end at a committed branch. It ends with servers the human can click,
-because a prose description of a UI change is not reviewable. Hand over **both**:
+This step used to end with four servers left running — changed frontend and
+backend plus an unchanged `dev` baseline — on the theory that a human was about
+to sit down and click through the diff. Under autopilot that theory is false:
+a headless build routinely finishes at 3am and the human looks at 9am, by which
+point those processes are either dead (the workspace recycled, the shell that
+spawned them gone) or stale (serving a commit six rebases old), and the ports
+they squatted bought nothing. Interactive runs have the same problem in miniature
+whenever the human steps away between the build finishing and the review
+starting. So: **implement-plan no longer leaves servers running for handover,
+in either mode.**
 
-1. **Changed** — frontend + backend serving this branch.
-2. **Baseline** — frontend + backend serving unmodified `dev`, so the before/after
-   comparison is live rather than asserted.
+What changes in practice:
 
-**Check for an already-running baseline before starting anything.** A baseline serving
-clean `dev` is shared across runs and there is no reason to have two:
+- Whatever you started for step 7's own QA (the worktree frontend on its
+  5173–5176 port, and a worktree or main-checkout backend per 1c) gets stopped
+  once that QA is done, in this same step. Verify the stop actually happened
+  with `ss -ltnp` before and after, the same way headless mode already did.
+- **Never touch the baseline pair (5173/8000).** This step never starts it —
+  it is shared, long-running infrastructure that predates any single run — so
+  there is nothing of yours to stop there. If you needed a baseline comparison
+  during step 7, you read against whatever was already serving those ports;
+  you did not spin up a second one.
+- Instead of a live server, what gets handed over is the **exact relaunch
+  recipe**: worktree paths, ports, the `.env.local` copy into the worktree
+  backend, the `node_modules` symlink for the worktree frontend (no second
+  `npm install`), and the 5173–5176 CORS-window caveat
+  (`_DEFAULT_CORS_ORIGINS`, `backend/app/main.py:98-101` — a frontend outside
+  that range 404s its API calls and renders a broken page that reads as a bug
+  in the change). Write this recipe into the QA artifact's `Relaunch:` header
+  from step 8 — that is its only home; do not also try to keep it fresh in
+  chat, since chat is exactly the transcript this whole fix moves work out of.
 
-```bash
-ss -ltnp | grep -E ':(5173|5174|5175|5176|8000|8001)\b'   # what is already up
-```
-
-Reuse what you find and say you reused it. Only start what is genuinely missing, and
-never start a second server on a port whose occupant already serves the code you
-wanted. Three constraints make duplicates actively costly here:
-
-- **Frontends must bind 5173–5176.** `_DEFAULT_CORS_ORIGINS`
-  (`backend/app/main.py:98-101`) admits only those four origins, so a frontend anywhere
-  else 404s its API calls and renders a broken page that reads as a bug in the change.
-  Two frontends consume half that range; a stray third starves the next run.
-- **The second backend cannot be `python -m app.main`.** That entrypoint hardcodes
-  `port=8000` (`backend/app/main.py:176`) and will collide. Launch it as
-  `uvicorn app.main:app --port 8001` directly.
-- **Point each frontend at its own backend** with `VITE_BASE_URL` and `VITE_WS_URL`
-  (plus `VITE_BACKEND_HTTPS_URL` if the change touches OAuth). There is no Vite proxy,
-  so the frontend calls an absolute URL and a mispointed pair will silently show
-  baseline data in the changed UI — the same failure mode as step 1c's worktree hazard,
-  one layer up.
-
-Run them detached so they outlive the run, and confirm each is actually serving the
-commit you think it is before handing it over — `git -C <path> rev-parse --short HEAD`
-against the tree each server was started from.
-
-**Reachability:** this is a Coder workspace and Tailscale runs on the client machine,
-so a bare `localhost:5173` is not necessarily openable by the human. Give the access
-path that actually works from the client, and if you could not establish one, say so
-rather than pasting a URL you never verified.
-
-Report them as a table — URL, changed vs baseline, branch and short SHA — and state
-plainly if any of the four is missing and why.
+`/test-issue` is what starts the changed pair later, on demand, reading that
+same `Relaunch:` header rather than guessing the ports and paths anew. That
+handoff is the point: the process that will actually be clicked is started
+minutes before it is used, by the session that is about to use it, instead of
+hours early by a session that has already left.
 
 ### 12. Hand off to `/ship-work`, and do not push
 
@@ -548,8 +579,9 @@ work; ship there.
 **End every run by recommending the next command**, with the plan path filled in:
 
 > Implementation is committed on `<branch>` in `<repos>` and roborev is clean.
-> Changed app: `<url>` (`<branch>` @ `<sha>`). Baseline `dev`: `<url>` (@ `<sha>`)
-> — `<started | reused already-running>`.
+> QA artifact: `docs/plans/qa/<eng-id>-qa.md` (commit `<sha>`, gates `<pass/fail>`).
+> No servers were left running — the changed pair's relaunch commands are in the
+> artifact's `Relaunch:` header for `/test-issue` to use on demand.
 > Nothing has been pushed. Run `/ship-work docs/plans/<plan>.md` to open the PRs
 > and land it on `dev`.
 
@@ -626,20 +658,22 @@ never amended headlessly; that judgement call stays with the human, same as it
 would be blocking in an interactive run.
 
 **Server policy (step 11).** Run the full QA described above, including the
-four-server comparison, exactly as interactive mode does — headless QA is not
-lighter QA. Once QA is done, stop only the **changed-pair** servers this run
-started (the worktree frontend's `vite` process and the worktree backend's
-`uvicorn`/`python -m app.main` process); the baseline pair (5173/8000) always
-stays running — whether it predates this run or this run started it, the
-baseline is a shared convention owned by no single run, and later cycles and
-the owner's morning review reuse it. Leave it up, since other runs and the
-human share it. Record in `status.json`'s `detail`, **and** as a comment on
-the inbox issue, the exact commands to bring the changed pair back up —
-worktree paths, ports, and the literal `vite`/`uvicorn` command lines used —
-so the owner's morning review can relaunch and test with a copy-paste. Verify
-the teardown actually happened with `ss -ltnp` (before/after, or immediately
-after stopping) and note the result in `detail`; a server left bound defeats
-the port-budget point of this whole step.
+comparison against the baseline pair, exactly as interactive mode does —
+headless QA is not lighter QA. Once QA is done, stop the **changed-pair**
+servers this run started for it (the worktree frontend's `vite` process and
+the worktree backend's `uvicorn`/`python -m app.main` process); the baseline
+pair (5173/8000) is never something this run started, so there is nothing of
+yours to stop there either way. Write the exact commands to bring the changed
+pair back up — worktree paths, ports, and the literal `vite`/`uvicorn` command
+lines used — into the QA artifact's `Relaunch:` header, same as interactive
+mode (step 8/11); that is the durable copy. Then record the **artifact's
+absolute path** (not a second copy of the commands) in `status.json`'s
+`detail`, and post the same path as a comment on the inbox issue prefixed
+`Phase: implement` per the protocol's marker rule, so the owner's morning
+review opens one file rather than reassembling commands from two places.
+Verify the teardown actually happened with `ss -ltnp` (before/after, or
+immediately after stopping) and note the result in `detail`; a server left
+bound defeats the point of this whole step.
 
 **`--ports fe=<n>,be=<m>` overrides the port range above.** The orchestrator
 runs several build slots concurrently (`AP_BUILD_SLOTS`), each with its own
@@ -660,7 +694,8 @@ allowlist rather than extending it, which is exactly what lets a `--ports`
 pair outside 5173–5176 work at all; omitting it here is the same broken-page
 failure 1c warns about, just for a different port range. The teardown rule
 is unchanged either way: stop the changed pair after QA, leave the baseline
-alone, and record the relaunch commands with the actual ports used.
+alone, and write the relaunch commands with the actual ports used into the QA
+artifact's `Relaunch:` header.
 
 **End state.** Commit exactly as interactive mode does (step 10: explicit
 paths, only the human's `Co-Authored-By` trailers), and run `roborev` exactly

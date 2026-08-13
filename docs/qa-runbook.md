@@ -3,6 +3,18 @@
 How to take one `ready-to-test` issue from "PRs are open" to "merged", including
 the changed-vs-baseline comparison and the e2e suite.
 
+**Read the QA artifact first.** `/implement-plan` writes one to
+`docs/plans/qa/<eng-id>-qa.md` in the root worktree, and `/ship-work` fills in
+its `PRs:` line once the PRs are open. That file already carries the PR list,
+the exact relaunch commands for the changed pair (ports, worktree paths, the
+`.env.local` copy, the `node_modules` symlink), and the QA checklist (verified
+items, items that need a human, the interaction cases from the blast radius,
+and the edge cases) — everything Steps 1–3 below used to have you rediscover
+by hand. Steps 1–3 are the fallback for when that file does not exist yet (an
+older issue predating this convention); if it exists, skip straight to
+whatever it tells you to run and treat this runbook as a reference for the
+mechanics, not a checklist to redo from scratch.
+
 ## The shape of an issue
 
 One Linear issue is **two or three PRs in three different repos**, not one:
@@ -13,8 +25,9 @@ One Linear issue is **two or three PRs in three different repos**, not one:
 | `JourneyAI-Team/frontend` | the frontend code |
 | `JourneyAI-Team/root-for-local` | the plan doc, runbooks, and any e2e spec |
 
-The root PR is usually **docs only** — do not mistake it for the change. Find
-all of them by branch name:
+The root PR is usually **docs only** — do not mistake it for the change. The QA
+artifact's `PRs:` line already has all of them; only fall back to a fresh
+search by branch name when that line is missing:
 
 ```bash
 for r in journeyai-backend frontend root-for-local; do
@@ -55,6 +68,12 @@ cd /home/coder/root-for-local/backend && set -a && . ./.env.local && set +a
 
 ## Step 1 — bring up the pair you are comparing
 
+Use the QA artifact's `Relaunch:` header (`docs/plans/qa/<eng-id>-qa.md`) — it
+already has the exact commands `/implement-plan` used, worktree paths and
+ports included, so this step is a copy-paste when the artifact exists. What
+follows is the recipe it is built from, and the fallback for when the
+artifact does not exist yet.
+
 The point is a **side-by-side**: the same screen on unchanged `dev` and on the
 change, so a difference is attributable. Baseline stays on 5173/8000; the change
 gets its own ports.
@@ -85,6 +104,12 @@ compare via the API (step 2b).
 
 ## Step 2 — exercise it
 
+The QA artifact's **Interaction cases from the blast radius** section is the
+checklist for what to click beyond the ticket's own happy path — it already
+names the specific neighbouring features to check, so walk that list rather
+than re-deriving it from the diff. Fall back to the plan's *Interaction
+surface* section only when no artifact exists.
+
 ### 2a. UI issues (1135, 1181)
 
 Open both in your browser through the Coder port forward, side by side:
@@ -94,9 +119,10 @@ Open both in your browser through the Coder port forward, side by side:
 
 Log in with your own account, then walk the ticket's actual user path — not a
 smoke test. For each, confirm the change appears on the changed port and does
-**not** on the baseline, then check the neighbours the plan's *Interaction
-surface* section names (that section exists precisely so you know what else to
-click).
+**not** on the baseline, then check the neighbours named in the QA artifact's
+**Interaction cases** section (or the plan's *Interaction surface* section on
+the fallback path) — that section exists precisely so you know what else to
+click.
 
 ### 2b. Backend-only issues
 

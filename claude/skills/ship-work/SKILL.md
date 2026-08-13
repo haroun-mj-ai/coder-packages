@@ -137,10 +137,42 @@ pattern is literally written here. A hit whose only match is the regex source in
 pattern definition or a test fixture, before treating it as hard stop 3. Never
 loosen the pattern to make a hit go away.
 
-### 3. Local gates before remote gates
+### 3. Local gates before remote gates — reuse `/implement-plan`'s result when it is still valid
 
-Run them yourself rather than trusting that `/implement-plan` did, and report
-verbatim output. Failing locally is far cheaper than failing in CI.
+Do not blindly re-run what the previous phase already ran. `/implement-plan`
+writes a QA artifact at `docs/plans/qa/<eng-id>-qa.md` whose header names the
+exact commit the gates ran against and their pass/fail result — read it first:
+
+```bash
+cat docs/plans/qa/<eng-id>-qa.md | head -6   # Issue / Commit / Gates / Relaunch / PRs
+```
+
+**Skip re-running a repo's gates** only when all of the following hold:
+
+- the artifact exists and its header parses (`Issue:`, `Commit:`, `Gates:` all
+  present);
+- the current `HEAD` of that repo's worktree/branch matches the SHA the header
+  recorded for it exactly (`git -C <path> rev-parse HEAD`);
+- the header's `Gates:` line records that repo's gates as passing.
+
+State this explicitly in the report when it applies: *"gates reused from
+`docs/plans/qa/<eng-id>-qa.md`, HEAD unchanged at `<sha>`."* This is safe
+specifically because the artifact pins the exact commit the gates were run
+against — if `HEAD` still equals that commit, nothing has changed since they
+ran, so re-running would reproduce the same result at the cost of a full test
+suite.
+
+**Re-run in full whenever any of the following holds** — this is the mandatory
+fallback, not an edge case to special-case away:
+
+- any touched repo's `HEAD` differs from the SHA the header recorded (a rebase
+  in step 6, or a fixup commit, moves `HEAD` and invalidates the pin);
+- the artifact is missing, or its header is missing or unparseable;
+- the header records any gate as failing.
+
+A stale green is worse than a slow gate: a rebase or a fix commit changes the
+SHA the artifact was written against, so a green result recorded there says
+nothing about the code actually about to be pushed. When in doubt, re-run.
 
 ```bash
 cd frontend && npm run lint && npx tsc --noEmit && npm run test:coverage && npm run build
@@ -148,7 +180,13 @@ cd backend  && poetry run pytest
 ```
 
 Mirror what CI runs, not what is convenient: frontend CI runs `test:coverage`, not
-`test:run`, and it runs `tsc --noEmit` separately from `build`.
+`test:run`, and it runs `tsc --noEmit` separately from `build`. Note also that this
+step's own gate list (`lint`, `tsc --noEmit`, `test:coverage`, `build`) is a
+superset of `/implement-plan`'s (`build`, `test:run`) for frontend — even a
+freshly reused SHA never skips `lint`, `tsc --noEmit`, or `test:coverage`
+unless the artifact's `Gates:` line explicitly names those as having passed
+too. If the artifact only ever records the narrower implement-plan gate set,
+treat this repo's gates as unrecorded and run the full CI-mirroring set here.
 
 Known noise, which is not a reason to stop: backend endpoint tests failing in
 isolation on uninitialized Beanie, and the `test_specs_phase3`/`phase4` failures
@@ -192,6 +230,17 @@ of them before merging any, so a reviewer can see the change as one thing.
   work `Done`.
 - cross-link the sibling PRs by URL when a ticket spans repos, and state the
   required landing order in each body.
+
+**Once every PR is open, fill the QA artifact's `PRs:` line.** Edit
+`docs/plans/qa/<eng-id>-qa.md`'s header — replace `PRs: (filled in by
+ship-work)` with the opened URLs, one line, e.g. `PRs: backend
+<url>, frontend <url>, root <url>` — and commit that single-line change on its
+own, `ENG-<id>: record PR URLs in QA artifact`, staged with the explicit path.
+This is the **only** edit `/ship-work` makes to the artifact: everything else
+in the file (the four QA sections, the `Commit:`/`Gates:`/`Relaunch:` lines) is
+`/implement-plan`'s to write, and this skill does not second-guess or
+re-derive them. `/test-issue` later reads this same line instead of
+re-discovering PR numbers through `gh pr list`.
 
 ### 6. Rebase, and keep rebasing
 

@@ -60,7 +60,7 @@ Exact shape, every key present on every write:
   "plan_path": "<abs path or null>",
   "pr_urls": [],
   "question": "<string or null>",
-  "detail": "<short free text: assumptions, relaunch commands, denial strings>"
+  "detail": "<short free text: assumptions, the QA artifact path, denial strings>"
 }
 ```
 
@@ -71,10 +71,15 @@ Exact shape, every key present on every write:
 - `pr_urls`: `[]` unless `phase: ship` succeeded; then the opened PR URL(s).
 - `question`: the exact question posted to the inbox on `NEEDS_HUMAN`, or
   `null` otherwise.
-- `detail`: short free text — documented-default assumptions taken, relaunch
-  commands for stopped servers, the permission-denial string on `FAILED`,
-  or any other one-liner the wrapper or the morning brief should surface.
-  Not a substitute for `question` or the inbox post; both still happen.
+- `detail`: short free text — documented-default assumptions taken, the
+  permission-denial string on `FAILED`, or any other one-liner the wrapper or
+  the morning brief should surface. On an `implement` phase `DONE`, this is
+  where the **QA artifact's absolute path** goes
+  (`docs/plans/qa/<eng-id>-qa.md` in the root worktree — see
+  `implement-plan/SKILL.md` step 8): that file, not `detail`, carries the
+  relaunch commands, the gates' commit SHA, and the QA checklist, so `detail`
+  only needs to point at it rather than duplicate it. Not a substitute for
+  `question` or the inbox post; both still happen.
 
 ## Inbox contract
 

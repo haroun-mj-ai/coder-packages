@@ -23,12 +23,34 @@ testing turns up a real bug, report it and stop — do not silently patch it her
 
 ## Instructions
 
-### 1. Assemble the picture
+### 1. Read the QA artifact first — do not re-derive what it already computed
 
 If given `next` or no argument, list the inbox (`$AP_INBOX_REPO`, from `ap-env.sh`)
 for open issues labelled `ready-to-test` and take the oldest by creation date.
 
-Find every PR for the issue by branch, across all three repos:
+`/implement-plan` already wrote a durable QA artifact for this issue at
+`docs/plans/qa/<eng-id>-qa.md` in the root worktree, and `/ship-work` already
+filled in its `PRs:` line once the PRs were open. Read that file **before**
+touching `gh` at all:
+
+- `PRs:` gives the PR list per repo directly — no `gh pr list` search needed.
+- `Relaunch:` gives the exact commands to bring the changed pair up — worktree
+  paths, ports, the `.env.local` copy, the `node_modules` symlink, and the
+  CORS-window caveat — so step 3 below is a copy-paste, not a rediscovery.
+- The four QA sections (**Verified here**, **Needs a human**, **Interaction
+  cases from the blast radius**, **Edge cases**) are this skill's checklist.
+  **Your job in steps 4–6 is to execute that checklist, not to re-derive it.**
+  Do not re-run the blast-radius derivation (`/implement-plan` step 6 already
+  dispatched a `scout` for this and paid for it once) — walk the **Needs a
+  human** and **Interaction cases** sections item by item instead. Items
+  already marked **Verified here** get spot-checked at most — pick one or two
+  to confirm the artifact's claim still holds, do not repeat the whole list
+  wholesale; repeating work that already has evidence is the exact
+  duplication this fix removes.
+
+**Fall back to the old `gh`-search path only when the artifact is missing, or
+exists but has no `PRs:` line** (an older plan predating this convention, or a
+partially-written artifact):
 
 ```bash
 for r in journeyai-backend frontend root-for-local; do
@@ -41,12 +63,11 @@ done
 one of the code PRs — it carries the plan doc, runbooks, and any e2e spec, and its
 absence of a frontend or backend diff is expected, not a red flag.
 
-Read the plan file. Its path is either the inbox issue's `Plan file: <abs path>`
-line, or, if working from a local worktree already, the newest matching file in
-`docs/plans/` in the root worktree. Pull out its **Verification** and
-**Interaction surface** sections — these two sections drive everything that
-follows: Verification says what to run, Interaction surface says what else to
-click besides the new thing itself.
+If the artifact itself is missing entirely, also read the plan file (its path is
+either the inbox issue's `Plan file: <abs path>` line, or the newest matching
+file in `docs/plans/` in the root worktree) and pull its **Verification** and
+**Interaction surface** sections as the fallback checklist — this is the same
+information the artifact would otherwise have carried forward.
 
 **Classify the issue** before doing anything else:
 
@@ -131,9 +152,12 @@ ss -ltn | grep -E ':(5173|8000)'
 
 ### 3. Stand up the comparison
 
-Follow the runbook's Step 1 exactly. Baseline stays on 5173/8000, reused if already
-running rather than restarted. The change gets its own pair, by convention fe 5174+,
-be 8001+, from this issue's worktrees.
+Use the QA artifact's `Relaunch:` header from step 1 to bring the changed pair
+up — it names the exact worktree paths and ports `/implement-plan` used, so
+this is a copy-paste rather than a rediscovery. Fall back to the runbook's
+Step 1 (same recipe, by convention fe 5174+/be 8001+) only when the artifact
+was missing or had no usable `Relaunch:` line. Baseline stays on 5173/8000,
+reused if already running rather than restarted, either way.
 
 **Backend-only issues skip the frontend half of this step entirely** — there is
 nothing to compare visually, so no `npx vite` for either side.
@@ -188,9 +212,12 @@ the real test credentials. For each screen you touch, screenshot both sides as
   comparison meaningful; a screenshot of only one side is weak evidence
 - the page body does not scroll horizontally at the widths you check
 
-Then walk the plan's **Interaction surface** list, one item at a time, on the
-changed port: this is exactly the set of neighbouring features the plan's author
-flagged as worth checking, not a smoke test of the whole app.
+Then walk the QA artifact's **Interaction cases from the blast radius** section
+(or, on the fallback path, the plan's **Interaction surface** list), one item
+at a time, on the changed port: this is exactly the set of neighbouring
+features `/implement-plan`'s `scout` dispatch already flagged as worth
+checking, not a smoke test of the whole app, and not a list to re-derive from
+the diff yourself.
 
 ### 5. Run the issue's e2e spec, if one exists
 
@@ -217,13 +244,18 @@ your testing, the issue simply has none.
 Short and evidence-led:
 
 - **Verified here**, with the evidence — the diff, the screenshot pair, the passing
-  spec output.
-- **Needs a human** — anything only a person can judge (does the screenshot
-  actually look right, is the copy correct, is the UX acceptable) and anything the
-  environment blocked (the seeded-password blocker, a missing credential).
-- **Contradicts the plan** — anything the plan's Verification or Interaction
-  surface section claimed that you found to be false. Lead with this if it exists;
-  it is the most important thing you will report.
+  spec output. Includes the spot-checked items from the artifact's own
+  **Verified here** section (say which ones you spot-checked, not that you
+  re-ran all of them).
+- **Needs a human** — the artifact's own **Needs a human** section, executed:
+  for each item, either resolve it now with evidence, or confirm it is still
+  genuinely blocked and why (the seeded-password blocker, a missing
+  credential). Anything only a person can judge (does the screenshot actually
+  look right, is the copy correct, is the UX acceptable) belongs here too.
+- **Contradicts the artifact** — anything the QA artifact's sections (or, on
+  the fallback path, the plan's Verification or Interaction surface section)
+  claimed that you found to be false. Lead with this if it exists; it is the
+  most important thing you will report.
 
 ### 7. Hand off
 

@@ -107,3 +107,14 @@ if [[ -n "${_AP_ZLIB:-}" || -n "${_AP_GCCLIB:-}" ]]; then
   export LD_LIBRARY_PATH="${_AP_ZLIB:+$_AP_ZLIB:}${_AP_GCCLIB:+$_AP_GCCLIB:}${LD_LIBRARY_PATH:-}"
 fi
 unset _AP_ZLIB _AP_GCCLIB
+
+# Playwright: the browsers Playwright downloads itself are Ubuntu-built and
+# cannot run here (20 missing system libs; lending them nix libs makes them
+# crash with "stack smashing detected" instead -- a glibc mismatch). The nix
+# playwright-driver.browsers build DOES run, so ~/.local/share/pw-browsers
+# holds symlinks from the revision names this Playwright expects to the nix
+# ones. Without this, every browser QA attempt fails and the agent wastes the
+# run rediscovering it.
+if [[ -d "$HOME/.local/share/pw-browsers" ]]; then
+  export PLAYWRIGHT_BROWSERS_PATH="$HOME/.local/share/pw-browsers"
+fi

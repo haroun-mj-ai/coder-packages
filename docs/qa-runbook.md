@@ -117,22 +117,23 @@ cd /home/coder/root-for-local/tests/e2e
 npx playwright test tests/cockpit/<spec>.spec.ts --project=chromium
 ```
 
-**Blocked today, two reasons** — fix these once and the suite works forever:
+**Browser QA works as of 2026-08-13.** Playwright's own downloaded browsers
+are Ubuntu-built and cannot run here (20 missing system libs; lending them nix
+libs makes them crash with "stack smashing detected" instead — a glibc
+mismatch). The fix in place: `nix profile install nixpkgs#playwright-driver.browsers`,
+with `~/.local/share/pw-browsers` symlinking the revision names Playwright
+1.58.2 expects onto the nix builds, and `PLAYWRIGHT_BROWSERS_PATH` exported by
+`ap-env.sh`. Verified: `chromium.launch()` succeeds.
 
-1. **Chromium cannot start.** The browser is downloaded but 20 system libraries
-   are missing (`libX11`, `libatk`, `libcairo`, `libcups`, `libasound`, …).
-   `npx playwright install-deps` needs apt, which this box does not have; the
-   nix route is `nix profile install nixpkgs#playwright-driver.browsers` plus
-   `PLAYWRIGHT_BROWSERS_PATH` pointing at it.
-2. **No login the suite can use.** 26 users exist in the 27018 database but none
-   has a password we know (hashes came from the migrated environment), and
-   registration is invite-only so `global-setup.ts` cannot bootstrap one. Seed a
-   known password for `e2e-test@meetjourney.ai` using the backend's own hashing
-   function, then put it in `tests/e2e/.env.e2e` (already written, with the
-   correct hosts).
+**One blocker left — no login the suite can use.** 26 users exist in the 27018
+database but none has a password we know (hashes came from the migrated
+environment), and registration is invite-only so `global-setup.ts` cannot
+bootstrap one. Seed a known password for `e2e-test@meetjourney.ai` using the
+backend's own hashing function; `tests/e2e/.env.e2e` already has the correct
+hosts.
 
-Until then, e2e specs are committed and compile-checked but never executed —
-which is exactly what the "needs a human" sections in the PRs have been saying.
+Until that seed exists, specs are committed and compile-checked but never
+executed — which is what the "needs a human" sections have been reporting.
 
 ## Step 4 — merge
 

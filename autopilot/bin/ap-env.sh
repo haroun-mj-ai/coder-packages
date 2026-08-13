@@ -29,6 +29,17 @@ export NTFY_TOPIC="${NTFY_TOPIC:-}"
 export SLACK_WEBHOOK_URL="${SLACK_WEBHOOK_URL:-}"
 export AP_MAX_ISSUES_PER_DAY="${AP_MAX_ISSUES_PER_DAY:-3}"
 export AP_MAX_DAY_COST_USD="${AP_MAX_DAY_COST_USD:-50}"
+
+# Informational only (not enforced -- `ap status` reports against it, nothing
+# auto-pauses on it). The account's weekly Claude usage pool is shared between
+# this pipeline and interactive Claude Code sessions, so this is the
+# pipeline's own carved-out SHARE of that pool, not the whole thing -- leave
+# headroom for interactive use and estimate error. Default assumes a Max 5x
+# plan (~$523/week API-equivalent per Anthropic's own estimate) with ~60% of
+# that going to the pipeline. Both the ledger's `cost` field (see append_ledger
+# in ap-cycle.sh) and this figure are Claude Code's own `total_cost_usd` --
+# same basis as the $523 estimate, so they're directly comparable.
+export AP_MAX_WEEK_COST_USD="${AP_MAX_WEEK_COST_USD:-310}"
 export AP_TZ="${AP_TZ:-UTC}"
 export AP_INBOX_REPO="${AP_INBOX_REPO:-haroun-mj-ai/autopilot-inbox}"
 # Minutes between the pre-scan gate's fallback full poll -- pure insurance
@@ -46,6 +57,16 @@ export AP_FULL_POLL_INTERVAL_MIN="${AP_FULL_POLL_INTERVAL_MIN:-360}"
 # label on the inbox issue, or an owner comment whose first line is exactly
 # `auto`. See autopilot-protocol.md's inbox contract.
 export AP_AUTO_APPROVE="${AP_AUTO_APPROVE:-0}"
+
+# Poll decider: "model" (default) invokes the haiku /autopilot-poll skill
+# every cycle, same as always -- no behaviour change until this is flipped.
+# "deterministic" calls ap-decide.sh instead: every step the poll makes is a
+# label query, a first-line marker check, an exact-word match, a regex, a
+# priority ordering, or a label swap -- no judgement a model call buys
+# anything for -- and ap-decide.sh implements those exact tiers in bash/
+# Python against live `gh` data for $0. Compare the two with `ap decide`
+# before flipping this; see autopilot/README.md's "poll modes" section.
+export AP_POLL_MODE="${AP_POLL_MODE:-model}"
 
 # Marker inherited by every claude process autopilot spawns; the user's
 # global Stop hook checks it to avoid phone-pinging on headless cycles.
@@ -101,6 +122,13 @@ export AP_LIMIT_COOLDOWN_MIN="${AP_LIMIT_COOLDOWN_MIN:-60}"
 # backend unimportable: no pytest, no local API, no e2e. Two separate autopilot
 # runs each burned ~$5 rediscovering this and both misdiagnosed it as libstdc++.
 # Exported here so every act inherits it.
+#
+# NOT the primary fix as of 2026-08-13: LD_LIBRARY_PATH doesn't reliably
+# survive every invocation path (cron/tmux/headless-claude/fresh-worktree), and
+# nix's own ld.so ignores it in some of those anyway. The real fix is
+# journey/backend/scripts/fix-nix-native-libs.sh, run by `make setup-local`
+# after every `poetry install` -- see the backend-pytest-workspace-limits
+# memory. This export is left in as harmless defense-in-depth, not the fix.
 _AP_ZLIB="$(echo /nix/store/*zlib*/lib | tr ' ' '\n' | while read -r d; do [ -e "$d/libz.so.1" ] && { echo "$d"; break; }; done)"
 _AP_GCCLIB="$(echo /nix/store/*gcc*-lib/lib | tr ' ' '\n' | while read -r d; do [ -e "$d/libstdc++.so.6" ] && { echo "$d"; break; }; done)"
 if [[ -n "${_AP_ZLIB:-}" || -n "${_AP_GCCLIB:-}" ]]; then

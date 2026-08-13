@@ -342,6 +342,17 @@ substitute for it.
 
 ### 6. Derive the blast radius before doing any QA
 
+**Check the plan's header first.** If it reads `**Scope:** Light`
+(`plan-issue`'s short-form template), this step and the next still apply —
+the QA doc's machine-readable header contract in step 8 is not optional — but
+do them proportionally: skip the scout dispatch below and instead state
+yourself, in one line, what you checked for other consumers of the changed
+file(s) (a grep for the changed symbol is enough for a genuinely self-contained
+change). A light-scoped plan whose change turns out to have a real interaction
+surface once you look was mis-scoped as light — say so, treat the rest of this
+step and step 7 as written for a full plan, and flag it in the QA doc rather
+than forcing the short form over a real surface.
+
 The happy path is the easy half and the tests already cover it. What breaks in
 production here is **interaction**: something else reads the same data, renders in
 the same shell, or shares the same cache, and nobody thought to look. You cannot
@@ -455,7 +466,11 @@ Relaunch: <exact commands to bring the changed pair up on demand — worktree pa
 PRs: (filled in by ship-work)
 ```
 
-Below the header, the same four-section body as before:
+Below the header, the same four-section body as before — keep all four
+headings even for a light-scoped plan, since `/test-issue` walks them as its
+checklist (its own step reads "Interaction cases from the blast radius" and
+"Edge cases" by name), so a missing heading breaks it where a short,
+honest one under it does not:
 
 1. **Verified here**, with the evidence: what was run or clicked, and the result.
 2. **Needs a human**, and why the agent could not reach it. Be specific rather than
@@ -463,8 +478,13 @@ Below the header, the same four-section body as before:
    writes cannot be exercised, an integration has no local credentials, a cron has
    not fired, staging data differs.
 3. **Interaction cases from the blast radius**, named individually with the feature
-   that could break, not summarised as "check related features".
-4. **The edge cases from the plan**, plus any the QA pass added.
+   that could break, not summarised as "check related features". For a
+   light-scoped plan with a genuinely empty blast radius, one line — "none:
+   self-contained change, checked via `grep -rn <symbol>`" — is the honest
+   content of this section, not a gap to pad out.
+4. **The edge cases from the plan**, plus any the QA pass added. For a light
+   plan without an Edge cases section, one line on what would make this fail
+   (or "none beyond the happy path") is enough.
 
 Assume the app is live and a regression is visible to customers. State plainly what
 was **not** covered; an honest gap is useful and a silent one is a trap.

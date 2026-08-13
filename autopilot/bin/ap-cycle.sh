@@ -729,34 +729,57 @@ fi
 
 log "scan: waking poll ($wake_reason) busy-lanes=${busy_lanes:-none}"
 
-# --- Stage 1: poll (haiku) --------------------------------------------------
+# --- Stage 1: poll (haiku, or the deterministic decider) -------------------
+# AP_POLL_MODE=deterministic replaces the haiku /autopilot-poll call with
+# ap-decide.sh, which implements the exact same tiers/keywords/claim rules
+# against live `gh` data for $0 -- see ap-decide.sh's header comment. Default
+# stays "model": no behaviour change until the owner flips it. Compare the
+# two with `ap decide` before flipping (see autopilot/README.md).
 
-POLL_SCHEMA='{"type":"object","properties":{"action":{"type":"string","enum":["plan","implement","replan","ship","none"]},"issue":{"type":"string"},"planPath":{"type":"string"},"inboxIssue":{"type":"number"},"feedback":{"type":"string"}},"required":["action"]}'
+poll_json=""
 
-# Tells the poll skill which lanes are currently occupied by an act in a
-# DIFFERENT, still-running cycle, so it skips tiers whose action would target
-# a busy lane rather than emitting one the wrapper would just have to reject
-# (see the lane-lock acquisition below). Omitted entirely when no lane is
-# busy.
-poll_prompt="/autopilot-poll"
-[[ -n "$busy_lanes" ]] && poll_prompt="$poll_prompt --busy-lanes $busy_lanes"
-# Global auto-approve only -- per-issue (`auto` label or an `auto` comment)
-# the skill reads itself from the labels/comments it already fetches.
-[[ "$AP_AUTO_APPROVE" == "1" ]] && poll_prompt="$poll_prompt --auto-approve"
+if [[ "${AP_POLL_MODE:-model}" == "deterministic" ]]; then
+  decide_rc=0
+  poll_json="$("$SCRIPT_DIR/ap-decide.sh" --claim --busy "$busy_lanes" 2>>"$AP_HOME/logs/cycle.log")" || decide_rc=$?
+  if [[ $decide_rc -ne 0 || -z "$poll_json" ]]; then
+    log "ap-decide.sh invocation failed rc=$decide_rc"
+    poll_json='{"action":"none"}'
+  fi
+  poll_cost=0
+  poll_session="deterministic"
+  poll_model_for_ledger="none"
+else
+  POLL_SCHEMA='{"type":"object","properties":{"action":{"type":"string","enum":["plan","implement","replan","ship","none"]},"issue":{"type":"string"},"planPath":{"type":"string"},"inboxIssue":{"type":"number"},"feedback":{"type":"string"}},"required":["action"]}'
 
-poll_rc=0
-poll_output="$(claude -p "$poll_prompt" --model "$POLL_MODEL" --settings "$SETTINGS_PATH" --output-format json --json-schema "$POLL_SCHEMA" 2>>"$AP_HOME/logs/cycle.log")" || poll_rc=$?
+  # Tells the poll skill which lanes are currently occupied by an act in a
+  # DIFFERENT, still-running cycle, so it skips tiers whose action would target
+  # a busy lane rather than emitting one the wrapper would just have to reject
+  # (see the lane-lock acquisition below). Omitted entirely when no lane is
+  # busy.
+  poll_prompt="/autopilot-poll"
+  [[ -n "$busy_lanes" ]] && poll_prompt="$poll_prompt --busy-lanes $busy_lanes"
+  # Global auto-approve only -- per-issue (`auto` label or an `auto` comment)
+  # the skill reads itself from the labels/comments it already fetches.
+  [[ "$AP_AUTO_APPROVE" == "1" ]] && poll_prompt="$poll_prompt --auto-approve"
 
-if [[ $poll_rc -ne 0 ]]; then
-  log "poll invocation failed rc=$poll_rc"
-  append_ledger "" "poll" "FAILED" 0 "unknown" "$POLL_MODEL"
-  flock -u 9
-  exit 0
-fi
+  poll_rc=0
+  poll_output="$(claude -p "$poll_prompt" --model "$POLL_MODEL" --settings "$SETTINGS_PATH" --output-format json --json-schema "$POLL_SCHEMA" 2>>"$AP_HOME/logs/cycle.log")" || poll_rc=$?
 
-poll_json="$(json_field "$poll_output" ".structured_output")"
-if [[ -z "$poll_json" || "$poll_json" == "null" ]]; then
-  poll_json="$(json_field "$poll_output" ".result")"
+  if [[ $poll_rc -ne 0 ]]; then
+    log "poll invocation failed rc=$poll_rc"
+    append_ledger "" "poll" "FAILED" 0 "unknown" "$POLL_MODEL"
+    flock -u 9
+    exit 0
+  fi
+
+  poll_json="$(json_field "$poll_output" ".structured_output")"
+  if [[ -z "$poll_json" || "$poll_json" == "null" ]]; then
+    poll_json="$(json_field "$poll_output" ".result")"
+  fi
+
+  poll_cost="$(json_field "$poll_output" ".total_cost_usd")"
+  poll_session="$(json_field "$poll_output" ".session_id")"
+  poll_model_for_ledger="$POLL_MODEL"
 fi
 
 action_peek="$(json_field "$poll_json" ".action")"
@@ -780,9 +803,7 @@ plan_path="$(json_field "$poll_json" ".planPath")"
 inbox_issue="$(json_field "$poll_json" ".inboxIssue")"
 feedback="$(json_field "$poll_json" ".feedback")"
 
-poll_cost="$(json_field "$poll_output" ".total_cost_usd")"
-poll_session="$(json_field "$poll_output" ".session_id")"
-append_ledger "$issue" "poll" "${action:-none}" "${poll_cost:-0}" "${poll_session:-unknown}" "$POLL_MODEL"
+append_ledger "$issue" "poll" "${action:-none}" "${poll_cost:-0}" "${poll_session:-unknown}" "$poll_model_for_ledger"
 
 if [[ -z "$action" || "$action" == "none" ]]; then
   log "poll: no action"

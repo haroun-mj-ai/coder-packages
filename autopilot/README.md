@@ -66,6 +66,9 @@ what you need:
   (see "Two consecutive failures" below) waits before clearing itself. `0`
   disables auto-resume entirely, so every pause then waits for a human,
   same as before this existed.
+- `AP_POLL_MODE` (default `model`) — `model` runs the haiku `/autopilot-poll`
+  skill every cycle; `deterministic` runs `ap-decide.sh` instead, for $0. See
+  "Poll modes" below before flipping this.
 
 At least one of `NTFY_TOPIC` / `SLACK_WEBHOOK_URL` must be set for pings to
 actually go anywhere; unconfigured, `ap-notify.sh` just logs to
@@ -206,6 +209,47 @@ in flight" reason.
 Budgets are the other brake: `AP_MAX_ISSUES_PER_DAY` and
 `AP_MAX_DAY_COST_USD` in `~/.autopilot/env`, checked against the day's ledger
 before every acting cycle.
+
+## Poll modes
+
+Every cycle's poll step decides the single next action for that cycle
+(triage of the private inbox) and, if there is one, claims it (a label
+swap). `AP_POLL_MODE` in `~/.autopilot/env` picks how that decision gets
+made:
+
+- **`model`** (default) — invokes the `/autopilot-poll` skill on a haiku
+  `claude -p` call, same as always. This is judgement-shaped prose: it reads
+  the inbox, reasons about which tier applies, and emits a JSON decision.
+  Costs real money every cycle it runs (~$0.13/poll observed), even on the
+  ~25% of polls that decide nothing.
+- **`deterministic`** — calls `autopilot/bin/ap-decide.sh --claim` instead.
+  Every step the poll makes is mechanical — a label query, a first-line
+  marker check (`Plan file:`/`Phase:`/`Autopilot:`), an exact-word match
+  (`go`/`auto`), a regex (`ENG-\d+`), a priority ordering, or a label swap —
+  so `ap-decide.sh` implements the exact same tiers as
+  `claude/skills/autopilot-poll/SKILL.md` in bash + Python against live
+  `gh` data, for $0. It also makes the claim (the label swap) enforced
+  rather than advisory: the model poll's claim is prose that can lag or be
+  skipped, which is how two implementers raced on the same worktree for
+  ENG-1308 (two consecutive polls both emitted `implement` for it).
+
+Compare the two before flipping the switch:
+
+```bash
+ap decide     # runs ap-decide.sh --dry-run against the REAL inbox, no
+              # writes, and pretty-prints the decision plus a one-line
+              # reason per tier it evaluated
+```
+
+Run `ap decide` for a while side by side with the live `model`-mode pipeline
+and confirm it would have made the same call on the same inbox state before
+setting `AP_POLL_MODE=deterministic` in `~/.autopilot/env`. The two
+implementations are kept in step deliberately (`autopilot-poll/SKILL.md`
+says so at its top) — if you change one tier's rule, change the other.
+`ap-decide.sh` never touches Linear (no credential available to it — the
+Linear claim on tier 5's new-delegation path now happens inside
+`/plan-issue --headless` itself, at the start of its run, whichever poll
+mode chose it).
 
 ## Troubleshooting
 

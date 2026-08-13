@@ -5,10 +5,25 @@ description: Decides and claims the single next autopilot action for this cycle 
 
 # autopilot-poll
 
+**Only used when `AP_POLL_MODE=model`** (the default, for now). Every step
+below is mechanical — a label query, a first-line marker check, an
+exact-word match, a regex, a priority ordering, or a label swap — which is
+exactly why `autopilot/bin/ap-decide.sh` exists: it implements these same
+tiers deterministically, for $0, and `AP_POLL_MODE=deterministic` calls it
+instead of this skill. **The two must be kept in step** — a tier/keyword/
+claim-rule change here needs the matching change in `ap-decide.sh` (and its
+test, `autopilot/tests/test_decide.sh`), and vice versa. Note also that this
+skill's own Linear-claim reference below (tier 5) is stale in one respect:
+the Linear claim now happens inside `/plan-issue --headless` itself, at the
+start of its run, not here — see `plan-issue/SKILL.md`'s headless section
+and `autopilot-protocol.md`'s Linear footprint. Neither poll implementation
+writes to Linear; `ap-decide.sh` in particular has no Linear credential to
+do it with.
+
 Reads the private inbox (`$AP_INBOX_REPO`) — the only channel the owner uses
 to delegate work — decides the single next action for this autopilot cycle,
-claims it (label swap and, where relevant, a Linear claim), and emits that
-decision as JSON. Nothing else. The three real skills (`/plan-issue`,
+claims it (a label swap only — no Linear write, see the note above), and
+emits that decision as JSON. Nothing else. The three real skills (`/plan-issue`,
 `/implement-plan`, `/ship-work`) do the actual work in a later stage of the
 same cycle; this skill only triages and claims.
 
@@ -119,7 +134,8 @@ those markers, or the next cycle will read it as the owner talking.
    - Extract `planPath` from the newest `Plan file: <absolute path>` line on
      the issue (body or comments, per the protocol's inbox contract). If no
      such line exists, fall back to listing `docs/plans/*<eng-id-lowercase>*.md`
-     in the root worktrees (`/home/coder/root-for-local/wt-*/docs/plans/`)
+     in the root worktrees (`/home/coder/root-for-local/wt-*-root/docs/plans/`
+     — the plan-issue worktree naming convention, e.g. `wt-eng1133-root/`)
      and the main checkout, newest first, and take the first hit. If neither
      the `Plan file:` line nor the fallback listing yields a path that
      actually exists on disk, do not emit `implement`: swap the label to
@@ -189,9 +205,11 @@ those markers, or the next cycle will read it as the owner talking.
      Continue the scan — do not emit an action for this item.
    - **Match found** → claim it with a single call:
      `gh issue edit <n> --repo "$AP_INBOX_REPO" --remove-label Queued --add-label planning`,
-     claim on Linear per the protocol's Linear footprint (`assignee: me`,
-     `state: In Progress`), and emit
-     `{"action":"plan","issue":"ENG-<id>","inboxIssue":<n>}`. If the title
+     and emit `{"action":"plan","issue":"ENG-<id>","inboxIssue":<n>}`. Do
+     **not** make the Linear claim here — this skill has no reliable Linear
+     credential in every environment it runs in; `/plan-issue --headless`
+     makes that claim itself, at the start of its run, per the protocol's
+     Linear footprint. If the title
      carries a note after the id, or the issue body is non-empty, include it
      as `"feedback":"<note text>"` in the same emit so `/plan-issue` sees it
      as context.
@@ -220,8 +238,9 @@ hours, or the directory is absent/empty) → the claim is stale:
   ties every time).
 - At most one actionable item touched per invocation, ever — this skill
   never emits more than one action, and never claims two issues.
-- **Label swaps (and the Linear claim in tier 4) happen before emitting the
-  JSON.** This makes a crash after the swap indistinguishable from a normal
+- **Label swaps happen before emitting the JSON** (this skill makes no
+  Linear write at all — see tier 5's note above). This makes a crash after
+  the swap indistinguishable from a normal
   in-progress claim: the 3h stale-claim sweep on a later cycle is what
   recovers it. Never emit first and swap after — that would risk a double
   claim if the emit succeeds but the swap is lost.

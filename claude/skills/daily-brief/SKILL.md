@@ -28,7 +28,7 @@ with the Read tool). Shape:
   "now": "<ISO ts>",
   "ledger": [ {"ts": "...", "issue": "ENG-123 or null", "phase": "poll|plan|replan|implement|ship", "status": "...", "cost": 0.0, "session_id": "..."}, ... ],
   "inbox": [ {"number": 1, "title": "...", "labels": [{"name": "..."}], "url": "..."}, ... ],
-  "budget": {"max_issues": 3, "max_cost": 50, "today_cost": 0.0, "today_issues": 0},
+  "budget": {"max_issues": 3, "max_cost": 50, "today_cost": 0.0, "today_issues": 0, "max_week_cost": 310, "week_cost": 0.0},
   "health": {"newest_entry_age_min": 5, "paused": false, "scheduler_alive": true}
 }
 ```
@@ -105,7 +105,12 @@ quiet day still reports something.
   `failed` comment, which this skill cannot read) — say so plainly ("see
   inbox issue for the error") rather than inventing one.
 - **Spend** — always present: `budget.today_cost` vs `budget.max_cost`, and
-  `budget.today_issues` vs `budget.max_issues`.
+  `budget.today_issues` vs `budget.max_issues`. Also report `budget.week_cost`
+  vs `budget.max_week_cost` (this pipeline's carved-out share of the account's
+  weekly Claude usage pool — the rest is reserved for interactive use, so
+  `week_cost` alone approaching `max_week_cost` is a real signal even though
+  it's well under the account's full weekly allotment). Flag it if
+  `week_cost` exceeds `max_week_cost`.
 - **Health** — always present: warn if `health.newest_entry_age_min` is
   `null` (no ledger activity ever) or greater than 60 (scheduler gap); warn
   if `health.paused` is true (autopilot is paused); warn if
@@ -113,8 +118,8 @@ quiet day still reports something.
   Otherwise report "ok".
 
 A day with zero ledger activity and an empty inbox still prints Spend
-(`$0.00 / $<max_cost>`, `0 / $<max_issues>` issues) and Health (whichever
-warnings apply, or "ok").
+(`$0.00 / $<max_cost>`, `0 / $<max_issues>` issues, week `$<week_cost> /
+$<max_week_cost>`) and Health (whichever warnings apply, or "ok").
 
 ## Output
 

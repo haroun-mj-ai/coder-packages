@@ -1686,6 +1686,55 @@ assert "questionEcho: the echoed question comment is marked Autopilot:" bash -c 
 assert "questionEcho: the question text is still included" bash -c \
   "grep -rl 'which table should this use' '$CASE_STUB_DIR/gh_calls' >/dev/null"
 
+# =============================================================================
+# AP_POLL_MODE=deterministic, case A: empty inbox -> ap-decide.sh (invoked at
+# its real absolute path, not through the stubbed PATH) does the deciding
+# itself, purely off the stubbed `gh`. Proven two ways: no claude call for
+# the poll (a --json-schema call never appears), and the gh stub recorded a
+# call carrying ap-decide.py's own distinctive tier1/2 query shape
+# (--json number,title,labels, which the pre-scan gate itself never asks
+# for). action=none on an empty inbox -> no act stage either, so claude is
+# never invoked AT ALL this cycle.
+# =============================================================================
+setup_case
+rc="$(AP_POLL_MODE=deterministic run_case)"
+assert "detMode(A): exit 0" [ "$rc" -eq 0 ]
+assert "detMode(A): claude never invoked (deterministic poll + action=none)" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 0 ]
+assert "detMode(A): gh was asked ap-decide.py's tier1/2 query shape" bash -c \
+  "grep -rl 'number,title,labels' '$CASE_STUB_DIR/gh_calls' >/dev/null"
+ledger="$(today_ledger)"
+assert "detMode(A): poll ledger row has session_id=deterministic" bash -c \
+  "grep -q '\"session_id\":\"deterministic\"' '$ledger' 2>/dev/null || grep -q '\"session_id\": \"deterministic\"' '$ledger'"
+assert "detMode(A): poll ledger row has model=none" bash -c \
+  "grep -q '\"model\":\"none\"' '$ledger' 2>/dev/null || grep -q '\"model\": \"none\"' '$ledger'"
+
+# =============================================================================
+# AP_POLL_MODE=deterministic, case B: a ship-pending issue with a resolvable
+# plan file -> ap-decide.sh itself performs the ship-pending -> shipping
+# claim (no model poll did it), and the wrapper still dispatches the ship
+# act exactly as it would for the model poll's "ship" action. Proves
+# deterministic mode drives the SAME downstream act pipeline, and that the
+# poll step itself never touches claude (only the act stage does, and that
+# call carries no --json-schema).
+# =============================================================================
+setup_case
+mkdir -p "$CASE_WORK_REPO/docs/plans"
+touch "$CASE_WORK_REPO/docs/plans/eng-900-thing.md"
+export AP_TEST_GH_ISSUES_SHIP_PENDING='[{"number":900,"title":"ENG-900: thing","labels":[{"name":"ship-pending"}]}]'
+export AP_TEST_GH_COMMENT_900='[]'
+rc="$(AP_POLL_MODE=deterministic run_case)"
+unset AP_TEST_GH_ISSUES_SHIP_PENDING AP_TEST_GH_COMMENT_900
+assert "detMode(B): exit 0" [ "$rc" -eq 0 ]
+assert "detMode(B): exactly one claude call (the ship act; no model poll call)" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 1 ]
+assert "detMode(B): that one claude call is NOT the --json-schema poll shape" bash -c \
+  "! grep -qx -- '--json-schema' '$CASE_STUB_DIR/claude_calls/1.args'"
+assert "detMode(B): ap-decide.sh itself swapped ship-pending -> shipping" bash -c \
+  "grep -rl '^ship-pending$' '$CASE_STUB_DIR/gh_calls' | xargs -r grep -l '^shipping$' >/dev/null"
+assert "detMode(B): act call targets ship-work for ENG-900" bash -c \
+  "grep -q 'ship-work.*ENG-900\|ENG-900.*ship-work' '$CASE_STUB_DIR/claude_calls/1.args' || grep -q 'ship-work' '$CASE_STUB_DIR/claude_calls/1.args'"
+
 if [[ "$FAILURES" -eq 0 ]]; then
   echo "ALL PASS"
   exit 0

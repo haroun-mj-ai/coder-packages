@@ -11,7 +11,7 @@ CRONTAB_RENDERED="$AP_HOME/crontab.rendered"
 TMUX_SESSION="autopilot"
 
 usage() {
-  echo "Usage: ap {up [--quiet]|down|status|pause|resume|runs|run|tail|watch|sweep|--print-paths}" >&2
+  echo "Usage: ap {up [--quiet]|down|status|pause|resume|runs|run|tail|watch|sweep|decide|--print-paths}" >&2
   echo "  runs [-n N]    List recent acts; live ones are marked LIVE." >&2
   echo "  run  [TARGET]  One act in detail: main-loop model, tokens, tool mix," >&2
   echo "                 status.json, stderr, final message. --timeline for" >&2
@@ -22,6 +22,11 @@ usage() {
   echo "                 branches. Defaults to --dry-run (report only); pass" >&2
   echo "                 --yes to actually remove. Never --force, never" >&2
   echo "                 'branch -D'." >&2
+  echo "  decide         Run the deterministic decider (ap-decide.sh --dry-run)" >&2
+  echo "                 against the REAL inbox, no writes, and pretty-print the" >&2
+  echo "                 decision plus a one-line reason per tier it evaluated --" >&2
+  echo "                 for comparing against what AP_POLL_MODE=model actually" >&2
+  echo "                 chose before flipping to AP_POLL_MODE=deterministic." >&2
   echo "  TARGET is a session-id prefix, an issue id (ENG-1234), or 'latest'." >&2
   echo "  --print-paths  Debug: render the crontab and print resolved paths" >&2
   echo "                 (script dir, crontab template/rendered, AP_HOME); exits 0." >&2
@@ -37,6 +42,37 @@ cmd_run() { python3 "$RUNS_PY" show "$@"; }
 cmd_tail() { python3 -u "$RUNS_PY" tail "$@"; }
 cmd_watch() { python3 "$RUNS_PY" watch "$@"; }
 cmd_sweep() { "$SCRIPT_DIR/ap-sweep.sh" "$@"; }
+
+# `ap decide` runs the deterministic decider in --dry-run (no gh writes,
+# ever) against the REAL inbox, and pretty-prints the decision plus its
+# per-tier trace, so the owner can compare it against what the model poll
+# actually chose on live data before flipping AP_POLL_MODE. See
+# autopilot/README.md's "poll modes" section.
+cmd_decide() {
+  local out_file err_file
+  out_file="$(mktemp)"
+  err_file="$(mktemp)"
+  "$SCRIPT_DIR/ap-decide.sh" --dry-run >"$out_file" 2>"$err_file"
+
+  echo "decision (dry-run -- no gh writes were performed):"
+  python3 -c '
+import json, sys
+try:
+    print(json.dumps(json.load(sys.stdin), indent=2))
+except Exception:
+    print(sys.stdin.read(), end="")
+' <"$out_file" | sed 's/^/  /'
+
+  echo
+  echo "reasoning (one line per tier evaluated):"
+  if [[ -s "$err_file" ]]; then
+    sed 's/^/  /' "$err_file"
+  else
+    echo "  (no trace produced)"
+  fi
+
+  rm -f "$out_file" "$err_file"
+}
 
 session_alive() {
   tmux has-session -t "$TMUX_SESSION" 2>/dev/null
@@ -226,6 +262,45 @@ except Exception:
   else
     echo "  (no entries yet today)"
   fi
+
+  # Rolling 7-day cost, across whatever daily ledger files exist -- not a
+  # calendar week, just "last 7 files on disk" (simplest thing that's still
+  # useful; ledgers roll daily and old ones aren't pruned). Informational
+  # only: nothing auto-pauses on AP_MAX_WEEK_COST_USD, this just reports
+  # against it. See ap-env.sh for why this is a SHARE of the account's pool,
+  # not the whole thing.
+  local week_files week_cost
+  # Ledger filenames are our own YYYY-MM-DD.jsonl, never contain whitespace
+  # or globbing metacharacters -- ls+word-splitting is safe here.
+  # shellcheck disable=SC2012
+  week_files="$(ls -1t "$AP_HOME"/runs/*.jsonl 2>/dev/null | head -7)"
+  if [[ -n "$week_files" ]]; then
+    if command -v jq >/dev/null 2>&1; then
+      # shellcheck disable=SC2086
+      week_cost="$(jq -s '[.[] | .cost] | add // 0' $week_files 2>/dev/null)"
+    else
+      # shellcheck disable=SC2086
+      week_cost="$(python3 - $week_files <<'PYEOF'
+import json, sys
+cost = 0.0
+for path in sys.argv[1:]:
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            cost += float(d.get("cost") or 0)
+print(cost)
+PYEOF
+)"
+    fi
+    printf "week cost: \$%.2f / \$%s (last %d daily ledgers, share of the account's weekly pool -- see ap-env.sh)\n" \
+      "${week_cost:-0}" "$AP_MAX_WEEK_COST_USD" "$(wc -w <<<"$week_files")"
+  fi
 }
 
 cmd_pause() {
@@ -256,6 +331,7 @@ case "$sub" in
   tail) cmd_tail "$@" ;;
   watch) cmd_watch "$@" ;;
   sweep) cmd_sweep "$@" ;;
+  decide) cmd_decide "$@" ;;
   --print-paths) cmd_print_paths ;;
   *) usage ;;
 esac

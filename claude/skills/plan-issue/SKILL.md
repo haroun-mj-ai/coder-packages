@@ -46,9 +46,10 @@ negotiable:
   for a restart rather than falling back to an inline model override, which would
   silently run at this session's effort level.
 
-Budget discipline: at most 3 explorers, one exploration round, one critic. If the
-task is small enough to hold in one head, say so and skip the fan-out rather than
-performing it for appearances.
+Budget discipline: at most 3 explorers, one exploration round, one critic — and
+for a task small enough to hold in one head, none of the above. See step 1c
+for exactly where that line is and what to write instead of performing the
+full fan-out for appearances.
 
 ## Instructions
 
@@ -152,6 +153,40 @@ ls docs/plans/completed/ 2>/dev/null | grep -i <keyword>   # dir may not exist y
 and skim `docs/guides/architecture/features/CATALOG.md` for the feature area (the
 docs reorg moved it; `docs/features/` no longer exists).
 
+### 1c. Size the task before spending on it
+
+Not every ticket needs the full machinery below. Before orienting or exploring,
+decide out loud whether this is a **light** task or a **full** one, and say
+which and why in one line before continuing.
+
+**Light** — a single file, or a small handful in one repo; no new endpoint,
+schema, model field, or migration; no cross-repo touch; no architectural
+decision to make; you could already write "what changed and why" in one
+paragraph without having read any code yet. A typo or copy fix, a config or
+constant change, a null-check the ticket already names a `path:line` for, a
+one-line validation tweak, restoring a regression the ticket already
+diagnosed. **Full** — everything else, including anything you are unsure
+about: when genuinely unsure, default to full. The fan-out budget in "Why this
+shape" already caps the downside of going full on something small; a
+wrongly-skipped critic is more expensive to fix later than a critic that
+found nothing.
+
+**Light changes skip steps 2b, 3, and 5 outright** — no worktree fan-out, no
+explorers, no critic. Still do step 0 (drift check, it's free) and step 2's
+scout only if you do not already know which repo/area is in play from the
+ticket itself. Write the plan directly in the main checkout — no worktree
+needed; `/implement-plan` creates one itself if none exists (its own step
+1b). Use `plan-template-light.md`, not the full template, for step 4: problem,
+the fix's `path:line` if you have it, the one test that proves it, nothing
+else. Skip step 5 (critic) entirely — there is nothing at this size for a
+critic to review that you could not already see yourself. Steps 1, 6
+(no-op, since there is no critic output), 7, and 8 still apply as written.
+
+If step 3 or step 5 would have been skipped for a task that turns out to have
+a real interaction surface once you start writing the plan, that is a sign it
+was mis-scoped as light — say so and go full rather than forcing the short
+template over a real design decision.
+
 ### 2. Orient cheaply with one scout
 
 Before deciding what to explore, dispatch a single `scout` (haiku) to answer the
@@ -176,6 +211,8 @@ numbers. Nothing downstream may quote a scout line number as evidence; that come
 from the explorers in step 3, which read fresh worktrees.
 
 ### 2b. One worktree per involved repo, cut from fresh `dev`
+
+Skipped for a task step 1c sized light.
 
 Now that the ticket id exists and the scout has named the repos, give the explorers
 a clean tree to read. Always the root repo, since it will hold the plan doc, plus one
@@ -217,6 +254,8 @@ own worktree rather than one for root.
 
 ### 3. Fan out 2 to 3 explorers, in a single message
 
+Skipped for a task step 1c sized light.
+
 One message with multiple `Agent` calls so they run concurrently. Give each a
 disjoint question. The usual split:
 
@@ -255,8 +294,9 @@ naming the edge cases, and deciding what is out of scope.
 
 Write it **inside the root worktree**, at
 `<root-worktree>/docs/plans/YYYY-MM-DD-eng-<id>-<slug>.md` (or
-`YYYY-MM-DD-<slug>.md` under `--no-issue`), following `plan-template.md` next to
-this file. Then commit it there on the feature branch:
+`YYYY-MM-DD-<slug>.md` under `--no-issue`), following `plan-template.md` next
+to this file — or `plan-template-light.md` if step 1c sized this task light.
+Then commit it there on the feature branch:
 
 ```bash
 git -C <root-worktree> add docs/plans/<plan>.md
@@ -272,7 +312,8 @@ file to archive.
 If step 0 showed zero drift and no worktree was created, write it in the main
 checkout as before, and say that the plan is untracked.
 
-Non-negotiable parts:
+Non-negotiable parts (full template; a light-scoped plan's shorter sections
+already fold the intent of these in, see `plan-template-light.md`):
 
 - **Evidence.** Every claim about current behavior carries a `path:line`. A plan
   whose claims cannot be checked cannot be dry-run reviewed.
@@ -296,6 +337,8 @@ Non-negotiable parts:
   in the branch name, the commit subject, and the plan's own header.
 
 ### 5. Dry-run the plan against reality
+
+Skipped for a task step 1c sized light.
 
 Dispatch **one** `plan-critic` with the plan file path and the ticket's
 requirement. It labels each claim VERIFIED / WRONG / MISSING and lists the gaps.
@@ -411,16 +454,27 @@ committed plan in place — same plan file, same branch, a new commit, not a
 new file. Post the revised plan markdown to the inbox as a comment, the same
 way a fresh plan is posted.
 
+**Linear claim, first thing:** at the **start** of a headless run (before any
+exploration or drafting), claim the issue on Linear — `assignee: me`,
+`state: In Progress` — per the protocol's Linear footprint. This skill is
+where that write lives, not the poll: whichever poll mode picked this issue
+(the model `/autopilot-poll` skill, or the deterministic `ap-decide.sh`), the
+Linear claim happens here. `ap-decide.sh` in particular has no Linear
+credential to make it with — the API key backing the old poll-side claim was
+revoked, and the MCP is OAuth'd per interactive Claude Code session, neither
+of which a headless cron act can use — so this skill is the only place left
+that can make it, and it does so unconditionally on every headless run this
+skill starts, `--feedback` re-plans included (re-claiming an already-claimed
+issue is a harmless no-op).
+
 **End state:** commit the plan exactly as step 4 already does in interactive
 mode. Then create or update the inbox issue with the **full** plan markdown
 (body on create, comment on update), prefixed with the line `Plan file:
 <absolute path>` per the protocol's inbox contract, label it `plan-review`,
 and write `status.json` with `status: DONE`, `phase: "plan"`, and `plan_path`
-set. Stop
-there — do not begin `/implement-plan`. Step 7's Linear plan-summary comment
-is interactive-only and is skipped headlessly; the Linear claim (`assignee:
-me`, `state: In Progress`) still happens, per the protocol's Linear
-footprint.
+set. Stop there — do not begin `/implement-plan`. Step 7's Linear
+plan-summary comment is interactive-only and is skipped headlessly; the
+Linear claim already happened at the start of this run, per above.
 
 **Blocking open question in the plan itself** (step 4's `BLOCKING` marker,
 survives the dry-run in step 5-6): still post the plan to the inbox, but

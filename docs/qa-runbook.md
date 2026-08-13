@@ -161,6 +161,26 @@ hosts.
 Until that seed exists, specs are committed and compile-checked but never
 executed — which is what the "needs a human" sections have been reporting.
 
+### Playwright gotchas on this box (all four cost a run to find)
+
+1. **Browsers**: Playwright's own downloads are Ubuntu-built and cannot run
+   here. Use the nix ones — `nix profile install nixpkgs#playwright-driver.browsers`
+   plus `~/.local/share/pw-browsers` symlinking the revision names Playwright
+   expects. `ap-env.sh` exports `PLAYWRIGHT_BROWSERS_PATH`.
+2. **Full chrome, not the headless shell**: `chrome-headless-shell` launches but
+   its renderer dies the instant it paints the real app — a successful `goto`
+   followed by "Target page, context or browser has been closed". `ap-env.sh`
+   exports `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` at the full chrome binary.
+   Code that calls `chromium.launch()` directly (e.g. `global-setup.ts`) does
+   not read that env var — it needs `executablePath` passed explicitly.
+3. **dotenv eats `#`**: an unquoted `E2E_TEST_USER_PASSWORD=E2eTest!Journey#2026xQ`
+   is truncated at the `#`, so login 401s while the same credential works from
+   curl. Quote every value containing `#` in `.env.e2e`.
+4. **The suite needs a real login**: registration is invite-only, so
+   `global-setup.ts`'s fallback 403s. Seed a known password onto an existing
+   user with the backend's own `get_password_hash` (done for
+   `e2e-test@meetjourney.ai`).
+
 ## Step 4 — merge
 
 ```bash

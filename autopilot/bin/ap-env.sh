@@ -118,3 +118,14 @@ unset _AP_ZLIB _AP_GCCLIB
 if [[ -d "$HOME/.local/share/pw-browsers" ]]; then
   export PLAYWRIGHT_BROWSERS_PATH="$HOME/.local/share/pw-browsers"
 fi
+
+# Playwright must use FULL chrome, not chrome-headless-shell. The headless
+# shell launches but its renderer dies the moment it paints the real app
+# ("Target page, context or browser has been closed" right after a successful
+# goto); full chrome renders it fine. Playwright picks the shell by default for
+# headless chromium, so point it at the full binary explicitly.
+_AP_PW_CHROME="$(echo "$HOME"/.local/share/pw-browsers/chromium-*/chrome-linux64/chrome 2>/dev/null | tr ' ' '\n' | head -1)"
+if [[ -x "${_AP_PW_CHROME:-}" ]]; then
+  export PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH="$_AP_PW_CHROME"
+fi
+unset _AP_PW_CHROME

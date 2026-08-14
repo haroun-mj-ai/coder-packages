@@ -144,6 +144,42 @@ assert "tail-text: surfaces the model's own explanation" \
 assert "tail-text: unknown session prints empty, not an error" \
   bash -c "[ -z \"\$(python3 '$RUNS_PY' tail-text does-not-exist 2>/dev/null)\" ]"
 
+# --- retry: manual re-queue for a FAILED act, backend for the dashboard's
+# [r]etry action -- gh is stubbed so this never touches a real repo --------
+FAKE_BIN="$(mktemp -d)"
+GH_LOG="$FIX/gh.log"
+: >"$GH_LOG"
+cat >"$FAKE_BIN/gh" <<GHSTUB
+#!/usr/bin/env bash
+echo "gh \$*" >>"$GH_LOG"
+if [ "\$1" = "issue" ] && [ "\$2" = "list" ]; then
+  echo "77"
+fi
+GHSTUB
+chmod +x "$FAKE_BIN/gh"
+export AP_INBOX_REPO="fake/inbox"
+
+out="$(PATH="$FAKE_BIN:$PATH" python3 "$RUNS_PY" retry ENG-2 2>&1)"
+assert "retry: re-queues a FAILED implement act to plan-review" \
+  grep -q 'plan-review' <<<"$out"
+assert "retry: reports the resolved inbox issue number" \
+  grep -q 'issue #77' <<<"$out"
+assert "retry: calls gh issue edit with the right labels" \
+  grep -q -- '--add-label plan-review --remove-label building' "$GH_LOG"
+assert "retry: posts an explanatory comment" \
+  grep -q 'issue comment 77' "$GH_LOG"
+assert "retry: refuses a non-FAILED target" \
+  bash -c "PATH='$FAKE_BIN:$PATH' python3 '$RUNS_PY' retry ENG-1 2>&1 | grep -qi 'not FAILED'"
+assert "retry: refuses an unknown target" \
+  bash -c "! PATH='$FAKE_BIN:$PATH' python3 '$RUNS_PY' retry nope-nope 2>/dev/null"
+
+# --- sessions: non-interactive dashboard invocation must not hang ----------
+out="$(echo | python3 "$RUNS_PY" sessions 2>&1)"
+assert "sessions: non-interactive invocation prints the table and returns" \
+  grep -q 'ISSUE' <<<"$out"
+assert "sessions: lists the FAILED implement row" \
+  grep -q 'ENG-2 .*implement .*FAILED' <<<"$out"
+
 # --- resolution failure ------------------------------------------------------
 python3 "$RUNS_PY" show ZZZ-404 >/dev/null 2>&1
 assert "show: unknown target exits non-zero" [ "$?" -ne 0 ]

@@ -393,6 +393,116 @@ def brief(block):
     return name
 
 
+def age_str(ts_str):
+    when = ts(ts_str)
+    if not when:
+        return "-"
+    secs = int((datetime.now(timezone.utc) - when).total_seconds())
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m"
+    if secs < 86400:
+        return f"{secs // 3600}h"
+    return f"{secs // 86400}d"
+
+
+def _dashboard_rows():
+    """Every live act, plus each OTHER issue's most recent finished outcome
+    (so a FAILED/DONE/NEEDS_HUMAN act doesn't just disappear from the
+    dashboard once its window is gone) -- one row per issue, live wins."""
+    live = live_acts()
+    live_issues = {a["target"] for a in live if a.get("target")}
+    by_issue = {}
+    for r in ledger_rows(days=7):
+        if r.get("phase") == "poll" or not r.get("issue") or r["issue"] in live_issues:
+            continue
+        by_issue[r["issue"]] = r  # ledger_rows() is chronological -- last write wins
+    rows = [{"kind": "live", "issue": a["target"], "phase": a["phase"], "status": "LIVE",
+              "note": "parked (needs input)" if a["parked"] else
+                      ("interactive" if a["window"] else "headless"),
+              "rec": a}
+            for a in sorted(live, key=lambda a: a["target"] or "")]
+    rows += [{"kind": "done", "issue": iss, "phase": r.get("phase"),
+               "status": r.get("status"), "note": f"{age_str(r.get('ts'))} ago", "rec": r}
+             for iss, r in sorted(by_issue.items(), key=lambda kv: kv[1].get("ts", ""))]
+    return rows
+
+
+def _print_dashboard(rows):
+    if not rows:
+        print("no live or recent acts")
+        return
+    print(f"{'#':>2}  {'ISSUE':<10} {'PHASE':<10} {'STATUS':<8} NOTE")
+    for i, row in enumerate(rows, 1):
+        print(f"{i:>2}  {row['issue'] or '-':<10} {(row['phase'] or '-'):<10} "
+              f"{row['status']:<8} {row['note']}")
+
+
+def _session_detail(row):
+    """Detail + contextual action for one dashboard row -- the 'button' the
+    owner asked for: LIVE acts can be paused (or replied to, if parked);
+    FAILED ones show why (from the transcript, not just the empty
+    stdout/stderr a persistent act leaves behind -- see tail-text) and can
+    be retried."""
+    issue, kind, rec = row["issue"], row["kind"], row["rec"]
+    print(f"\n=== {issue or '?'}  (phase={row['phase']}, status={row['status']}) ===")
+    t = transcript(rec.get("session_id"))
+    if t:
+        s = summarize(t)
+        print(f"model: {main_model(s)}   requests: {s['reqs']}   subagents: {s['subagents']}")
+        if s.get("final"):
+            print(f"latest message: {s['final'][:600]}")
+    else:
+        print("(no transcript found)")
+
+    if kind == "live":
+        if rec.get("parked"):
+            print("\nparked -- waiting on a reply.")
+            msg = input("type a reply to send (blank = back): ").strip()
+            if msg:
+                ok, lines = continue_act(issue, msg)
+                print("\n".join(lines))
+        elif rec.get("window"):
+            print(f"\nlive, interactive, in tmux window '{rec['window']}'.")
+            if input("[p]ause  [b]ack: ").strip().lower() == "p":
+                ok, lines = interrupt_act(issue)
+                print("\n".join(lines))
+        else:
+            print("\nheadless (oneshot mode) -- no interactive session to pause.")
+    elif row["status"] == "FAILED":
+        if input("\n[r]etry (re-queue to its pre-phase label)  [b]ack: ").strip().lower() == "r":
+            ok, lines = retry_act(issue)
+            print("\n".join(lines))
+    else:
+        input("\n[b]ack: ")
+
+
+def cmd_sessions(args):
+    """`ap sessions` -- interactive dashboard over every live act plus each
+    other issue's most recent finished outcome. Select a row for detail and,
+    when applicable, a one-key action (pause a live act, reply to a parked
+    one, retry a failed one) instead of hand-crafting tmux/gh commands."""
+    if not sys.stdin.isatty():
+        _print_dashboard(_dashboard_rows())
+        return 0
+    while True:
+        rows = _dashboard_rows()
+        _print_dashboard(rows)
+        try:
+            choice = input("\nselect # for detail/actions (Enter to refresh, q to quit): ").strip()
+        except EOFError:
+            return 0
+        if choice.lower() == "q":
+            return 0
+        if not choice:
+            continue
+        if not choice.isdigit() or not (1 <= int(choice) <= len(rows)):
+            print("not a valid selection")
+            continue
+        _session_detail(rows[int(choice) - 1])
+
+
 def cmd_list(args):
     live = {a["session_id"]: a for a in live_acts() if a["session_id"]}
     rows = [r for r in ledger_rows(days=args.days) if r.get("phase") != "poll"] \
@@ -453,50 +563,125 @@ def cmd_tail_text(args):
     return 0
 
 
-def cmd_interrupt(args):
-    """`ap pause-act <target>` -- send Claude Code's own interrupt (Escape)
-    into a live persistent act's tmux window. Stops it mid-turn without
-    losing the session/context (unlike a NEEDS_HUMAN park, nothing is
-    written to status.json and no reply is expected) -- `ap resume-act`
-    later picks the same session back up exactly where it left off.
-    Only meaningful for AP_ACT_LAUNCH_MODE=persistent acts: a oneshot
-    `claude -p` act has no interactive pane to interrupt."""
-    kind, rec = resolve(args.target)
+def interrupt_act(target):
+    """Send Claude Code's own interrupt (Escape) into a live persistent act's
+    tmux window. Stops it mid-turn without losing the session/context
+    (unlike a NEEDS_HUMAN park, nothing is written to status.json and no
+    reply is expected) -- continue_act() later picks the same session back
+    up exactly where it left off. Only meaningful for
+    AP_ACT_LAUNCH_MODE=persistent acts: a oneshot `claude -p` act has no
+    interactive pane to interrupt. Returns (ok, message_lines)."""
+    kind, rec = resolve(target)
     if kind != "live" or not rec or not rec.get("window"):
-        print(f"no live, interactive (persistent-mode) act matches '{args.target}' -- "
-              "a oneshot act has no session to interrupt", file=sys.stderr)
-        return 1
+        return False, [f"no live, interactive (persistent-mode) act matches '{target}' -- "
+                        "a oneshot act has no session to interrupt"]
     window = rec["window"]
     subprocess.run(["tmux", "send-keys", "-t", f"{AP_TMUX_SESSION}:{window}", "Escape"],
                    check=False)
-    print(f"interrupted {window} (issue {rec.get('target') or '?'}, phase {rec.get('phase')})")
-    print(f"resume: ap resume-act {args.target} [\"<message>\"]  "
-          f"(or attach: tmux attach -t {AP_TMUX_SESSION})")
-    print("note: this does NOT release the act's build/ship/plan lane lock -- unlike "
-          "a NEEDS_HUMAN park, the ap-cycle.sh process that dispatched it is still "
-          "polling for status.json, so its slot stays occupied the whole time it's paused")
-    return 0
+    return True, [
+        f"interrupted {window} (issue {rec.get('target') or '?'}, phase {rec.get('phase')})",
+        f"resume: ap resume-act {target} [\"<message>\"]  (or attach: tmux attach -t {AP_TMUX_SESSION})",
+        "note: this does NOT release the act's build/ship/plan lane lock -- unlike "
+        "a NEEDS_HUMAN park, the ap-cycle.sh process that dispatched it is still "
+        "polling for status.json, so its slot stays occupied the whole time it's paused",
+    ]
+
+
+def continue_act(target, message):
+    """Inject a message into a live, interrupted (or otherwise idle) act's
+    tmux window. Two SEPARATE send-keys calls, not text+Enter in one --
+    Claude Code's TUI does not reliably submit otherwise (same fix
+    ap-resume.sh's reply injection needed, caught only by live testing; see
+    autopilot README). Returns (ok, message_lines)."""
+    kind, rec = resolve(target)
+    if kind != "live" or not rec or not rec.get("window"):
+        return False, [f"no live, interactive (persistent-mode) act matches '{target}'"]
+    window = rec["window"]
+    text = message or "continue"
+    tmux_target = f"{AP_TMUX_SESSION}:{window}"
+    subprocess.run(["tmux", "send-keys", "-t", tmux_target, "--", text], check=False)
+    time.sleep(1)
+    subprocess.run(["tmux", "send-keys", "-t", tmux_target, "Enter"], check=False)
+    return True, [f"resumed {window} with: {text}"]
+
+
+def cmd_interrupt(args):
+    ok, lines = interrupt_act(args.target)
+    for line in lines:
+        print(line, file=sys.stdout if ok else sys.stderr)
+    return 0 if ok else 1
 
 
 def cmd_continue(args):
-    """`ap resume-act <target> [message]` -- inject a message into a live,
-    interrupted (or otherwise idle) act's tmux window. Two SEPARATE
-    send-keys calls, not text+Enter in one -- Claude Code's TUI does not
-    reliably submit otherwise (same fix ap-resume.sh's reply injection
-    needed, caught only by live testing; see autopilot README)."""
-    kind, rec = resolve(args.target)
-    if kind != "live" or not rec or not rec.get("window"):
-        print(f"no live, interactive (persistent-mode) act matches '{args.target}'",
-              file=sys.stderr)
-        return 1
-    window = rec["window"]
-    text = args.message or "continue"
-    target = f"{AP_TMUX_SESSION}:{window}"
-    subprocess.run(["tmux", "send-keys", "-t", target, "--", text], check=False)
-    time.sleep(1)
-    subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], check=False)
-    print(f"resumed {window} with: {text}")
-    return 0
+    ok, lines = continue_act(args.target, args.message)
+    for line in lines:
+        print(line, file=sys.stdout if ok else sys.stderr)
+    return 0 if ok else 1
+
+
+REQUEUE_MAP = {
+    "plan": ("Queued", "planning"),
+    "replan": ("Queued", "planning"),
+    "implement": ("plan-review", "building"),
+    "ship": ("ship-pending", "shipping"),
+}
+
+
+def inbox_issue_for(eng_id):
+    """GitHub inbox issue number for a Linear id, via title search -- the
+    ledger only ever stores the Linear id (e.g. ENG-1308), never the GitHub
+    issue number, so this is the same lookup a human would do by hand."""
+    repo = os.environ.get("AP_INBOX_REPO", "")
+    if not repo or not eng_id:
+        return None
+    try:
+        out = subprocess.run(
+            ["gh", "issue", "list", "--repo", repo, "--search", f"{eng_id} in:title",
+             "--json", "number", "-q", ".[0].number"],
+            capture_output=True, text=True, timeout=15).stdout.strip()
+        return int(out) if out.isdigit() else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def retry_act(target):
+    """Manually re-queue a FAILED act to the label it started from -- the
+    same requeue ap-cycle.sh's own external-failure classifier already does
+    automatically for a recognized signature (see the ENG-1308 usage-limit
+    mislabel this was built alongside). Works for ANY FAILED act, not just
+    external-signature ones: a human deciding to retry despite a real error
+    is a legitimate call this tool shouldn't second-guess. Returns
+    (ok, message_lines)."""
+    kind, rec = resolve(target)
+    if kind == "live":
+        return False, [f"'{target}' is still LIVE, not failed -- nothing to retry "
+                        "(see ap pause-act/ap resume-act for a live act)"]
+    if kind != "done" or not rec:
+        return False, [f"no act matches '{target}'"]
+    if rec.get("status") != "FAILED":
+        return False, [f"'{target}' is {rec.get('status')}, not FAILED -- nothing to retry"]
+    phase = rec.get("phase")
+    add, remove = REQUEUE_MAP.get(phase, (None, None))
+    if not add:
+        return False, [f"don't know how to re-queue phase '{phase}'"]
+    eng_id = rec.get("issue")
+    num = inbox_issue_for(eng_id) if eng_id else None
+    if not num:
+        return False, [f"could not resolve a GitHub inbox issue for '{eng_id}'"]
+    repo = os.environ.get("AP_INBOX_REPO", "")
+    subprocess.run(["gh", "issue", "edit", str(num), "--repo", repo,
+                    "--add-label", add, "--remove-label", remove], check=False)
+    subprocess.run(["gh", "issue", "comment", str(num), "--repo", repo, "--body",
+                    f"Autopilot: manually re-queued via `ap retry` (was FAILED, phase {phase})."],
+                   check=False)
+    return True, [f"re-queued {eng_id} (issue #{num}): {remove} -> {add}"]
+
+
+def cmd_retry(args):
+    ok, lines = retry_act(args.target)
+    for line in lines:
+        print(line, file=sys.stdout if ok else sys.stderr)
+    return 0 if ok else 1
 
 
 def cmd_cost(args):
@@ -733,6 +918,13 @@ def main():
     p.add_argument("target", nargs="?", default="latest")
     p.add_argument("message", nargs="?", default="continue")
     p.set_defaults(fn=cmd_continue)
+
+    p = sub.add_parser("retry", help="re-queue a FAILED act to its pre-phase label")
+    p.add_argument("target", nargs="?", default="latest")
+    p.set_defaults(fn=cmd_retry)
+
+    p = sub.add_parser("sessions", help="interactive dashboard: list, inspect, act")
+    p.set_defaults(fn=cmd_sessions)
 
     a = ap.parse_args()
     sys.exit(a.fn(a) or 0)

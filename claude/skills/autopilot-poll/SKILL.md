@@ -134,7 +134,7 @@ those markers, or the next cycle will read it as the owner talking.
    - Extract `planPath` from the newest `Plan file: <absolute path>` line on
      the issue (body or comments, per the protocol's inbox contract). If no
      such line exists, fall back to listing `docs/plans/*<eng-id-lowercase>*.md`
-     in the root worktrees (`/home/coder/root-for-local/wt-*-root/docs/plans/`
+     in the root worktrees (`$AP_WORK_REPO/wt-*-root/docs/plans/`
      — the plan-issue worktree naming convention, e.g. `wt-eng1133-root/`)
      and the main checkout, newest first, and take the first hit. If neither
      the `Plan file:` line nor the fallback listing yields a path that

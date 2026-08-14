@@ -43,7 +43,7 @@ With no argument, look in the **root worktrees first**, since `/plan-issue` now
 commits the plan there rather than leaving it untracked in the main checkout:
 
 ```bash
-ls -t /home/coder/root-for-local/wt-eng*-root/docs/plans/*.md 2>/dev/null
+ls -t <root-repo>/wt-eng*-root/docs/plans/*.md 2>/dev/null   # <root-repo>: this repo's absolute path, `git -C . rev-parse --show-toplevel`
 ls -t docs/plans/*.md                                    # main checkout, older plans
 ```
 
@@ -115,7 +115,7 @@ same form, and **`--no-track` is mandatory** or the branch's upstream becomes
 ```bash
 git -C <path> fetch origin --quiet
 git -C <path> worktree add --no-track \
-  /home/coder/root-for-local/wt-eng<id>-<suffix> \
+  <root-repo>/wt-eng<id>-<suffix> \
   -b haroun/eng-<id>-<slug> origin/dev
 ```
 
@@ -177,7 +177,7 @@ the header of
 `tests/e2e/tests/cockpit/cockpit-queue-detail-no-horizontal-clip.spec.ts`:
 
 ```bash
-cd /home/coder/root-for-local/wt-eng<id>-fe
+cd <root-repo>/wt-eng<id>-fe
 ln -s ../frontend/node_modules node_modules      # no second npm install
 npx vite --port 5175 --strictPort
 ```
@@ -259,7 +259,7 @@ planning conversation and will not see the other units' reports:
   for `backend/`, `poetry run pytest <the relevant path>`;
 - the local-environment facts it would otherwise waste turns rediscovering:
   `poetry run` strips `PYTHONPATH` and the venv is at
-  `/home/coder/root-for-local/.venv` (the *outer* tree, not `backend/`), so
+  `<root-repo>/.venv` (the *outer* tree, not `backend/`), so
   seed and one-off scripts run via that `.venv/bin/python` with an absolute
   `PYTHONPATH` rather than through `poetry run`; the local
   backend runs as `python -m app.main` with no hot reload, so a restart is needed

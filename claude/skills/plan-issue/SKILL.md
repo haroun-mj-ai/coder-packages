@@ -191,10 +191,12 @@ template over a real design decision.
 
 Before deciding what to explore, dispatch a single `scout` (haiku) to answer the
 mechanical question: **which of the repos are in play, and where does this area
-live?** The four repos are separate git checkouts as siblings:
-`/home/coder/root-for-local` (root: docs, tests/e2e, scripts),
-`backend/`, `frontend/`, `assistants/`. Only root is tracked by this repo's git;
-the others are gitignored siblings with their own history.
+live?** The four repos are separate git checkouts as siblings: this repo's own
+root (docs, tests/e2e, scripts — call its absolute path `<root-repo>` below,
+resolved with `git -C . rev-parse --show-toplevel` rather than hardcoded, since
+it differs per machine), `backend/`, `frontend/`, `assistants/`. Only root is
+tracked by this repo's git; the others are gitignored siblings with their own
+history.
 
 Confirm branch state yourself, per repo, using absolute paths:
 
@@ -229,7 +231,7 @@ If a matching worktree exists, use it and say so. Otherwise:
 
 ```bash
 git -C <repo> worktree add --no-track \
-  /home/coder/root-for-local/wt-eng<id>-<suffix> \
+  <root-repo>/wt-eng<id>-<suffix> \
   -b haroun/eng-<id>-<slug> origin/dev
 ```
 

@@ -47,8 +47,11 @@ merge of something half-understood.
 ## Repo map
 
 MCP calls need `owner`/`repo`; the local paths are gitignored siblings.
+`<root-repo>` below is this repo's own absolute path — resolve with
+`git -C . rev-parse --show-toplevel` rather than hardcoding, since it differs
+per machine.
 
-- root `/home/coder/root-for-local` → `JourneyAI-Team/root-for-local`, base `dev`
+- root `<root-repo>` → `JourneyAI-Team/root-for-local`, base `dev`
 - `backend/` → `JourneyAI-Team/journeyai-backend`, base `dev`
 - `frontend/` → `JourneyAI-Team/frontend`, base `dev`
 - `assistants/` → `JourneyAI-Team/assistants`, base `main`

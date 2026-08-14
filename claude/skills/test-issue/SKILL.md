@@ -163,16 +163,18 @@ reused if already running rather than restarted, either way.
 nothing to compare visually, so no `npx vite` for either side.
 
 ```bash
+# $AP_WORK_REPO: this repo's absolute path (set by ap-env.sh; default
+# /home/coder/root-for-local, but never hardcode it -- differs per machine).
 # BASELINE (unchanged dev) -- check first, only start if not already up
-cd /home/coder/root-for-local/frontend && npx vite --port 5173 --strictPort &
-cd /home/coder/root-for-local/backend  && poetry run uvicorn app.main:app --port 8000 &
+cd "$AP_WORK_REPO/frontend" && npx vite --port 5173 --strictPort &
+cd "$AP_WORK_REPO/backend"  && poetry run uvicorn app.main:app --port 8000 &
 
 # CHANGED (this issue's worktrees)
-cd /home/coder/root-for-local/wt-eng<ID>-fe
+cd "$AP_WORK_REPO/wt-eng<ID>-fe"
 ln -s ../frontend/node_modules node_modules      # no second npm install
 npx vite --port 5175 --strictPort &
 
-cd /home/coder/root-for-local/wt-eng<ID>-be
+cd "$AP_WORK_REPO/wt-eng<ID>-be"
 cp ../backend/.env.local .env.local              # worktrees have no env file
 poetry run uvicorn app.main:app --port 8002 &
 ```
@@ -224,7 +226,7 @@ the diff yourself.
 Check whether the root PR touched `tests/e2e/tests/**`. If it did:
 
 ```bash
-cd /home/coder/root-for-local/tests/e2e
+cd "$AP_WORK_REPO/tests/e2e"
 npx playwright test tests/cockpit/<spec>.spec.ts --project=chromium
 ```
 

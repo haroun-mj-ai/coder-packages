@@ -1365,22 +1365,38 @@ case "$final_status" in
     if [[ -n "${LAST_ACT_STDERR_FILE:-}" && -f "$LAST_ACT_STDERR_FILE" ]]; then
       stderr_tail="$(tail -n 20 "$LAST_ACT_STDERR_FILE")"
     fi
+    # Persistent-mode acts have no -p JSON blob, so LAST_ACT_OUTPUT is always
+    # empty and stderr rarely carries anything useful (interactive claude
+    # doesn't write to it the way -p does) -- both classifier inputs below
+    # are effectively blind for this launch mode. The transcript itself is
+    # usually NOT blind (e.g. the model's own "cut off by a session usage
+    # limit" explanation lives there, not in stderr), so pull its final
+    # message in too. This is exactly the gap that mislabeled ENG-1308
+    # `failed` instead of re-queuing it on 2026-08-14: an external usage-limit
+    # interruption with nothing in stdout/stderr to classify it by.
+    transcript_tail=""
+    if [[ -n "${LAST_ACT_SESSION_ID:-}" ]]; then
+      transcript_tail="$(python3 "$SCRIPT_DIR/ap-runs.py" tail-text "$LAST_ACT_SESSION_ID" 2>>"$AP_HOME/logs/cycle.log" | tail -c 4000)"
+    fi
     failure_body="STDERR (last 20 lines):
 ${stderr_tail:-<empty>}
 
 STDOUT (tail):
-${stdout_tail:-no output captured}"
+${stdout_tail:-no output captured}${transcript_tail:+
 
-    # failure_signature: the full stderr+stdout of the failing run, used to
-    # classify EVERY failure below -- both "was this caused by something
-    # outside our control" (EXTERNAL_SIGNATURE_REGEX, this reconcile branch)
-    # and "should the auto-pause tag itself usage-limit" (further down). One
-    # classifier, two consumers -- a session/rate/quota trip that looks
-    # external here should also be the thing that makes the pause
-    # self-clearing.
-    failure_signature="${stderr_tail:-} ${LAST_ACT_OUTPUT:-}"
+TRANSCRIPT (final message):
+$transcript_tail}"
+
+    # failure_signature: the full stderr+stdout+transcript-tail of the
+    # failing run, used to classify EVERY failure below -- both "was this
+    # caused by something outside our control" (EXTERNAL_SIGNATURE_REGEX,
+    # this reconcile branch) and "should the auto-pause tag itself
+    # usage-limit" (further down). One classifier, two consumers -- a
+    # session/rate/quota trip that looks external here should also be the
+    # thing that makes the pause self-clearing.
+    failure_signature="${stderr_tail:-} ${LAST_ACT_OUTPUT:-} ${transcript_tail:-}"
     if [[ -n "${LAST_ACT_STDERR_FILE:-}" && -f "$LAST_ACT_STDERR_FILE" ]]; then
-      failure_signature="$(cat "$LAST_ACT_STDERR_FILE" 2>/dev/null) ${LAST_ACT_OUTPUT:-}"
+      failure_signature="$(cat "$LAST_ACT_STDERR_FILE" 2>/dev/null) ${LAST_ACT_OUTPUT:-} ${transcript_tail:-}"
     fi
     # EXTERNAL_SIGNATURE_REGEX: causes that are not a bug in the plan or the
     # code -- the owner's own usage/session limit, a provider-side rate/quota

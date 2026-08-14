@@ -437,6 +437,22 @@ def cmd_model(args):
     return 0
 
 
+def cmd_tail_text(args):
+    """The act's own final assistant message, plain text, printed bare. For
+    ap-cycle.sh's persistent-mode FAILED reconcile: a persistent act has no
+    captured stdout/stderr to build its external-failure-signature classifier
+    from (that's -p mode's `--output-format json` blob, which doesn't exist
+    here), but the transcript itself often says exactly what happened -- e.g.
+    the model's own "cut off by a session usage limit" line. Without this, a
+    real usage-limit interruption in persistent mode falls through to a
+    plain, misleading `failed` label instead of being re-queued like the
+    same failure would be in oneshot mode (this is the bug that mislabeled
+    ENG-1308 as `failed` instead of re-queuing it on 2026-08-14)."""
+    t = transcript(args.session_id)
+    print((summarize(t).get("final") if t else "") or "")
+    return 0
+
+
 def cmd_interrupt(args):
     """`ap pause-act <target>` -- send Claude Code's own interrupt (Escape)
     into a live persistent act's tmux window. Stops it mid-turn without
@@ -704,6 +720,10 @@ def main():
     p = sub.add_parser("model", help="the act's own model for one session's transcript")
     p.add_argument("session_id")
     p.set_defaults(fn=cmd_model)
+
+    p = sub.add_parser("tail-text", help="the act's own final assistant message, plain text")
+    p.add_argument("session_id")
+    p.set_defaults(fn=cmd_tail_text)
 
     p = sub.add_parser("interrupt", help="pause a live persistent act mid-turn (resumable)")
     p.add_argument("target", nargs="?", default="latest")

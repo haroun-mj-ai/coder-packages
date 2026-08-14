@@ -127,6 +127,23 @@ assert "model: reports the main loop's model, not the subagent's" \
 assert "cost: unknown session prints 0, not an error" \
   bash -c "[ \"\$(python3 '$RUNS_PY' cost does-not-exist 2>/dev/null)\" = '0' ]"
 
+# --- tail-text: backend for ap-cycle.sh's persistent-mode FAILED reconcile --
+# A persistent act has no -p JSON blob, so stdout/stderr are blind to the
+# EXTERNAL_SIGNATURE_REGEX classifier -- this is what mislabeled ENG-1308
+# `failed` instead of re-queuing it on 2026-08-14, a real usage-limit
+# interruption with nothing in stdout/stderr to classify it by. tail-text
+# pulls the act's own final assistant message instead, which usually isn't
+# blind (the model explains what happened, in-transcript).
+SID_LIMIT="eeeeeeee-1111-2222-3333-444444444444"
+cat >"$AP_PROJECTS_DIR/proj/$SID_LIMIT.jsonl" <<T4
+{"type":"assistant","timestamp":"2026-08-14T16:00:00Z","message":{"id":"msg_limit","model":"claude-sonnet-5","content":[{"type":"text","text":"Both implementer agents were cut off by a session usage limit (external cause, not a plan defect)."}],"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":1}}}
+T4
+out="$(python3 "$RUNS_PY" tail-text "$SID_LIMIT" 2>&1)"
+assert "tail-text: surfaces the model's own explanation" \
+  grep -qi 'session usage limit' <<<"$out"
+assert "tail-text: unknown session prints empty, not an error" \
+  bash -c "[ -z \"\$(python3 '$RUNS_PY' tail-text does-not-exist 2>/dev/null)\" ]"
+
 # --- resolution failure ------------------------------------------------------
 python3 "$RUNS_PY" show ZZZ-404 >/dev/null 2>&1
 assert "show: unknown target exits non-zero" [ "$?" -ne 0 ]

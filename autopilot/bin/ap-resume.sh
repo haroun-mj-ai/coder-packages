@@ -106,20 +106,82 @@ window_alive() {
   tmux list-windows -t "$AP_TMUX_SESSION" -F '#{window_name}' 2>/dev/null | grep -qx "$1"
 }
 
-# park_registry_write <inbox-issue> <issue> <phase> <lane> <window> <run_dir> <plan_path> <fe_port> <be_port> <question>
+# Same pid -> ~/.claude/sessions/<pid>.json join ap-cycle.sh's run_claude()
+# uses -- resolves the live claude session id from a window name.
+session_id_for_window() {
+  local w="$1" pane_pid
+  pane_pid="$(tmux list-panes -t "$AP_TMUX_SESSION:$w" -F '#{pane_pid}' 2>/dev/null | head -1)"
+  [[ -z "$pane_pid" ]] && return 0
+  json_field "$(cat "${AP_SESSIONS_DIR:-$HOME/.claude/sessions}/$pane_pid.json" 2>/dev/null)" ".sessionId"
+}
+
+# ledger_path/append_ledger -- same shape and O_APPEND-is-safe reasoning as
+# ap-cycle.sh's copy (see there for the full comment); duplicated rather
+# than sourced for the same reason window_alive/park_registry_write already
+# are here. Without this, every act that gets parked-and-resumed (GitHub
+# reply or manual tmux attach) would vanish from `ap runs`/`ap status`
+# entirely once its window is torn down -- a blind spot on exactly the acts
+# this feature exists to support, not just an inaccurate cost figure.
+ledger_path() {
+  echo "$AP_HOME/runs/$(TZ="$AP_TZ" date +%F).jsonl"
+}
+
+append_ledger() {
+  local issue="$1" phase="$2" status="$3" cost="$4" session_id="$5" model="${6:-}"
+  local ts ledger_file
+  ts="$(date -u +%FT%TZ)"
+  ledger_file="$(ledger_path)"
+  mkdir -p "$(dirname "$ledger_file")"
+  python3 - "$ts" "$issue" "$phase" "$status" "$cost" "$session_id" "$model" >>"$ledger_file" <<'PYEOF'
+import json, sys
+ts, issue, phase, status, cost, session_id, model = sys.argv[1:8]
+try:
+    cost_val = float(cost) if cost not in ("", "null") else 0.0
+except ValueError:
+    cost_val = 0.0
+line = {
+    "ts": ts,
+    "issue": issue if issue not in ("", "null") else None,
+    "phase": phase,
+    "status": status,
+    "cost": cost_val,
+    "session_id": session_id if session_id not in ("", "null") else "unknown",
+    "model": model if model not in ("", "null") else None,
+}
+print(json.dumps(line))
+PYEOF
+}
+
+# cost/model for a still-live session's transcript-so-far, same estimate
+# ap-cycle.sh's run_claude() now uses for a persistent-mode act -- see
+# ap-runs.py's `cost`/`model` subcommands.
+cost_for_session() {
+  local sid="$1" v
+  [[ -z "$sid" ]] && { echo "0"; return; }
+  v="$(python3 "$SCRIPT_DIR/ap-runs.py" cost "$sid" 2>>"$AP_HOME/logs/cycle.log")"
+  [[ "$v" =~ ^[0-9.]+$ ]] && echo "$v" || echo "0"
+}
+
+model_for_session() {
+  local sid="$1"
+  [[ -z "$sid" ]] && { echo ""; return; }
+  python3 "$SCRIPT_DIR/ap-runs.py" model "$sid" 2>>"$AP_HOME/logs/cycle.log"
+}
+
+# park_registry_write <inbox-issue> <issue> <phase> <lane> <window> <session_id> <run_dir> <plan_path> <fe_port> <be_port> <question>
 # Same shape ap-cycle.sh's own park_registry_write writes -- kept as a
 # single definition here (not duplicated per call site) since this script
 # writes it from three places: re-parking after a resumed NEEDS_HUMAN, and
 # parking the chained ship dispatch below.
 park_registry_write() {
-  local p_inbox="$1" p_issue="$2" p_phase="$3" p_lane="$4" p_window="$5" \
-        p_run_dir="$6" p_plan_path="$7" p_fe="$8" p_be="$9" p_question="${10}"
+  local p_inbox="$1" p_issue="$2" p_phase="$3" p_lane="$4" p_window="$5" p_session_id="$6" \
+        p_run_dir="$7" p_plan_path="$8" p_fe="$9" p_be="${10}" p_question="${11}"
   mkdir -p "$AP_HOME/parked"
   python3 - "$AP_HOME/parked/$p_inbox.json" "$p_inbox" "$p_issue" "$p_phase" "$p_lane" \
-    "$p_window" "$p_run_dir" "$p_plan_path" "$p_fe" "$p_be" "$(date -u +%FT%TZ)" "$p_question" <<'PY'
+    "$p_window" "$p_session_id" "$p_run_dir" "$p_plan_path" "$p_fe" "$p_be" "$(date -u +%FT%TZ)" "$p_question" <<'PY'
 import json, os, sys
-(path, inbox_issue, issue, phase, lane, window,
- run_dir, plan_path, fe_port, be_port, parked_at, question) = sys.argv[1:13]
+(path, inbox_issue, issue, phase, lane, window, session_id,
+ run_dir, plan_path, fe_port, be_port, parked_at, question) = sys.argv[1:14]
 # Preserve last_relayed_comment_id across the overwrite -- same reasoning as
 # ap-cycle.sh's copy of this function: losing it makes an already-handled
 # comment look new again and re-inject into a session now parked on a
@@ -134,7 +196,7 @@ except Exception:
     pass
 d = {"inbox_issue": int(inbox_issue) if inbox_issue.isdigit() else inbox_issue,
      "issue": issue or None, "phase": phase or None, "lane": lane or None,
-     "window": window or None, "session_id": None,
+     "window": window or None, "session_id": session_id or None,
      "run_dir": run_dir or None, "plan_path": plan_path or None,
      "ports": {"fe": fe_port, "be": be_port} if fe_port else None,
      "parked_at": parked_at, "question": question or None,
@@ -146,12 +208,17 @@ os.replace(tmp, path)
 PY
 }
 
-# launch_window_and_wait <window> <prompt> <model> -- fresh dispatch (not a
-# resume): clears status.json first exactly like ap-cycle.sh's run_claude()
-# does, launches the window, and blocks until a NEW status.json exists or
-# the window disappears. Sets status_json/final_status globals.
+# launch_window_and_wait <window> <prompt> <model> <ledger-issue> <ledger-phase> --
+# fresh dispatch (not a resume): clears status.json first exactly like
+# ap-cycle.sh's run_claude() does, launches the window, and blocks until a
+# NEW status.json exists or the window disappears. Sets
+# status_json/final_status/launch_session_id globals, and appends this
+# dispatch's own ledger row (mirroring run_claude()'s one-row-per-invocation
+# behavior in ap-cycle.sh) -- this is the chained-ship dispatch's only
+# ledger entry, so skipping it would leave that phase invisible to `ap
+# runs`/`ap status` even though a real session ran and spent real tokens.
 launch_window_and_wait() {
-  local window="$1" prompt="$2" model="$3"
+  local window="$1" prompt="$2" model="$3" ledger_issue="$4" ledger_phase="$5"
   rm -f "$status_file"
   tmux new-window -t "$AP_TMUX_SESSION" -n "$window" -d -- \
     bash -c 'exec env CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="$1" claude --settings "$2" --model "$3" "$4"' \
@@ -165,6 +232,9 @@ launch_window_and_wait() {
   [[ -f "$status_file" ]] && status_json="$(cat "$status_file")"
   final_status="$(json_field "$status_json" ".status")"
   [[ -z "$final_status" ]] && final_status="FAILED"
+  launch_session_id="$(session_id_for_window "$window")"
+  append_ledger "$ledger_issue" "$ledger_phase" "$final_status" \
+    "$(cost_for_session "$launch_session_id")" "$launch_session_id" "$model"
 }
 
 # Same non-destructive probe-then-flock idiom ap-cycle.sh's lane_free() uses.
@@ -218,6 +288,13 @@ if [[ -z "$window" ]] || ! window_alive "$window"; then
   fi
   exit 0
 fi
+
+# Same session throughout every park/resume cycle -- resolved once here (not
+# trusted from the registry, which historically hardcoded this to null) and
+# reused for both re-parking (so session_id survives a re-park) and this
+# resumed act's own ledger row below.
+session_id="$(session_id_for_window "$window")"
+model="$(model_for_session "$session_id")"
 
 # Re-acquire the act's original lane slot, same pattern ap-cycle.sh's own
 # initial dispatch uses (probe lowest-first). Never drop the reply if none
@@ -324,6 +401,14 @@ status_json=""
 final_status="$(json_field "$status_json" ".status")"
 [[ -z "$final_status" ]] && final_status="FAILED"
 
+# One ledger row for THIS resumed act's own outcome, regardless of which of
+# DONE/NEEDS_HUMAN/FAILED it landed on -- mirrors ap-cycle.sh's run_claude(),
+# which logs once per invocation no matter the status. Without this, a
+# parked-and-resumed act (GitHub reply or manual tmux attach) is invisible
+# to `ap runs`/`ap status` entirely, not just missing its cost.
+append_ledger "${issue:-}" "${phase:-unknown}" "$final_status" \
+  "$(cost_for_session "$session_id")" "$session_id" "$model"
+
 # Debounce before tearing down, same reasoning as ap-cycle.sh's run_claude().
 teardown_window() {
   local w="$1"
@@ -356,7 +441,7 @@ case "$final_status" in
       else
         launch_window_and_wait "$ship_window" \
           "/ship-work $plan_path --headless --no-merge --ports fe=$fe_port,be=$be_port --run-dir $run_dir" \
-          "${AP_SHIP_MODEL:-sonnet}"
+          "${AP_SHIP_MODEL:-sonnet}" "${issue:-}" ship
         log "chained ship in $ship_window finished with status=$final_status"
         case "$final_status" in
           DONE)
@@ -370,7 +455,7 @@ case "$final_status" in
 
 $question" >>"$AP_HOME/logs/cycle.log" 2>&1 || true
             ap-notify.sh "autopilot needs input: ${issue:-ENG-$inbox_issue}" "${question:-see inbox}" "$inbox_url" || true
-            park_registry_write "$inbox_issue" "$issue" ship build "$ship_window" "$run_dir" "$plan_path" "$fe_port" "$be_port" "$question"
+            park_registry_write "$inbox_issue" "$issue" ship build "$ship_window" "$launch_session_id" "$run_dir" "$plan_path" "$fe_port" "$be_port" "$question"
             exit 0
             ;;
           *)
@@ -392,7 +477,7 @@ $question" >>"$AP_HOME/logs/cycle.log" 2>&1 || true
     ap-notify.sh "autopilot needs input: ${issue:-ENG-$inbox_issue}" "${question:-see inbox}" "$inbox_url" || true
     # Re-park under the SAME window (still alive) -- everything is unchanged
     # from the original entry except parked_at/question.
-    park_registry_write "$inbox_issue" "$issue" "$phase" "$lane" "$window" "$run_dir" "$plan_path" "$fe_port" "$be_port" "$question"
+    park_registry_write "$inbox_issue" "$issue" "$phase" "$lane" "$window" "$session_id" "$run_dir" "$plan_path" "$fe_port" "$be_port" "$question"
     ;;
 
   *)

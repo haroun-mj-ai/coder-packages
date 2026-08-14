@@ -112,6 +112,21 @@ out="$(python3 "$RUNS_PY" show ENG-1 --timeline 2>&1)"
 assert "show --timeline: renders the tool call with its argument" \
   grep -q 'Bash(command=git status)' <<<"$out"
 
+# --- cost/model: backend for ap-cycle.sh's/ap-resume.sh's persistent-mode
+# ledger rows, which have no -p JSON blob to read total_cost_usd from ------
+# SID_OK: opus main loop (in=10,out=20,cache_r=500,cache_w=100, no 1h/5m
+# breakdown -> assumed 5m rate) + a sonnet subagent (in=5,out=7,cache_r=50).
+# Hand-computed at the published per-Mtok rates: opus 0.004275 + sonnet
+# 0.000135 = 0.00441 exactly.
+out="$(python3 "$RUNS_PY" cost "$SID_OK" 2>/dev/null)"
+assert "cost: estimates from token usage x published rates" \
+  bash -c "[ \"\$1\" = '0.004410' ]" _ "$out"
+out="$(python3 "$RUNS_PY" model "$SID_OK" 2>&1)"
+assert "model: reports the main loop's model, not the subagent's" \
+  bash -c "[ \"\$1\" = 'opus-5' ]" _ "$out"
+assert "cost: unknown session prints 0, not an error" \
+  bash -c "[ \"\$(python3 '$RUNS_PY' cost does-not-exist 2>/dev/null)\" = '0' ]"
+
 # --- resolution failure ------------------------------------------------------
 python3 "$RUNS_PY" show ZZZ-404 >/dev/null 2>&1
 assert "show: unknown target exits non-zero" [ "$?" -ne 0 ]

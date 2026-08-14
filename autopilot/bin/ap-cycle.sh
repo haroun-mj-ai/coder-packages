@@ -1254,16 +1254,23 @@ run_claude() {
     cost="$(json_field "$out" ".total_cost_usd")"
     session_id="$(json_field "$out" ".session_id")"
   elif [[ -n "$LAST_ACT_WINDOW" ]] && window_alive "$LAST_ACT_WINDOW"; then
-    # No -p JSON blob in persistent mode, so no total_cost_usd is available
-    # here -- recorded as 0 (a known gap; see autopilot/README.md). Session
-    # id comes from the pane's own pid -> ~/.claude/sessions/<pid>.json,
-    # the same registry ap-runs.py already reads.
+    # No -p JSON blob in persistent mode, so total_cost_usd isn't handed to
+    # us directly -- session id comes from the pane's own pid ->
+    # ~/.claude/sessions/<pid>.json (the same registry ap-runs.py already
+    # reads), then `ap-runs.py cost` reconstructs an estimate from that
+    # session's own transcript (token usage x published per-model rates).
+    # An estimate, not the real billed figure -- see autopilot/README.md.
     local pane_pid
     pane_pid="$(tmux list-panes -t "$AP_TMUX_SESSION:$LAST_ACT_WINDOW" -F '#{pane_pid}' 2>/dev/null | head -1)"
     if [[ -n "$pane_pid" ]]; then
       session_id="$(json_field "$(cat "${AP_SESSIONS_DIR:-$HOME/.claude/sessions}/$pane_pid.json" 2>/dev/null)" ".sessionId")"
     fi
     LAST_ACT_SESSION_ID="$session_id"
+    if [[ -n "$session_id" ]]; then
+      local estimated_cost
+      estimated_cost="$(python3 "$SCRIPT_DIR/ap-runs.py" cost "$session_id" 2>>"$AP_HOME/logs/cycle.log")"
+      [[ "$estimated_cost" =~ ^[0-9.]+$ ]] && cost="$estimated_cost"
+    fi
     if [[ "$st" == "DONE" || "$st" == "FAILED" ]]; then
       # Short debounce before tearing down: status.json is itself the last
       # tool call the skill makes, so the transcript is already complete by

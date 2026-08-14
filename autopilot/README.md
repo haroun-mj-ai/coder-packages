@@ -187,10 +187,24 @@ already exited cleanly after committing the plan):
 Set `AP_ACT_LAUNCH_MODE=oneshot` to restore the original behavior exactly: a
 `claude -p` process that exits on any terminal state (including a blocking
 question), with a later reply always starting a fresh invocation instead of
-resuming a live one. One real gap in `persistent` mode worth knowing: the
-ledger's `cost` column reads `0` for these acts (no `-p --output-format json`
-blob to read `total_cost_usd` from) — `ap status`'s week-cost tracking will
-undercount actual spend as a result; `oneshot` mode doesn't have this gap.
+resuming a live one.
+
+`persistent` mode has no `-p --output-format json` blob to read
+`total_cost_usd` from, so its ledger rows' `cost` column is an **estimate**,
+not the billed figure: `ap-cycle.sh`/`ap-resume.sh` resolve the act's session
+id from its tmux pane's pid and call `ap-runs.py cost <session-id>`, which
+sums that session's own transcript usage (including subagents, priced at
+their own model) against published per-Mtok rates (`MODEL_PRICING` in
+`bin/ap-runs.py`). It's priced per request at the model that request
+actually ran on, so a session mixing a pinned main model with a cheaper
+subagent model is not misattributed to one rate — an unrecognized model name
+is left out of the total and reported to `cycle.log` rather than guessed at.
+Cache-write tokens are priced at the 1h/5m rate Anthropic actually billed
+(from the transcript's own `cache_creation` breakdown), falling back to the
+5m rate only when a transcript predates that breakdown. This is still an
+estimate, not the ground truth `-p` mode gets directly from the API — treat
+`ap status`'s week-cost tracking as approximate for any act that ran in
+`persistent` mode, `oneshot` mode has no such gap.
 
 ## Concurrent builds (and ships)
 

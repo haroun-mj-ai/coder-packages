@@ -228,7 +228,7 @@ def summarize(t):
     s = {"reqs": 0, "models": {}, "main_models": {}, "in": 0, "out": 0,
          "cache_r": 0, "cache_w": 0, "tools": {}, "tool_errors": 0,
          "api_errors": 0, "first": None, "last": None, "run_dir": "",
-         "final": "", "subagents": 0}
+         "final": "", "subagents": 0, "by_model": {}}
     seen = set()
     for f in [t] + subagent_files(t):
         s["subagents"] += 1 if f != t else 0
@@ -275,7 +275,65 @@ def summarize(t):
             s["out"] += u.get("output_tokens", 0)
             s["cache_r"] += u.get("cache_read_input_tokens", 0)
             s["cache_w"] += u.get("cache_creation_input_tokens", 0)
+            # Per-model buckets (split cache-write by TTL) so estimate_cost()
+            # can price each request at its own model's rate -- a session mixing
+            # a main model with cheaper subagent models must not all get priced
+            # as one, and 1h vs 5m cache writes are billed at different rates.
+            cc = u.get("cache_creation")
+            bm = s["by_model"].setdefault(
+                m, {"in": 0, "out": 0, "cache_r": 0, "cache_w_1h": 0, "cache_w_5m": 0})
+            bm["in"] += u.get("input_tokens", 0)
+            bm["out"] += u.get("output_tokens", 0)
+            bm["cache_r"] += u.get("cache_read_input_tokens", 0)
+            if cc:
+                bm["cache_w_1h"] += cc.get("ephemeral_1h_input_tokens", 0)
+                bm["cache_w_5m"] += cc.get("ephemeral_5m_input_tokens", 0)
+            else:
+                # Older/simpler usage shape has no 1h/5m breakdown, just the
+                # flat total -- assume the 5m (non-opted-in) rate rather than
+                # silently dropping the cache-write cost entirely, since a
+                # write premium is usually the single biggest cost driver.
+                bm["cache_w_5m"] += u.get("cache_creation_input_tokens", 0)
     return s
+
+
+# USD per million tokens, standard service tier, base input/output rates.
+# Cache write = 2x base input (1h TTL) or 1.25x base input (5m TTL); cache
+# read = 0.1x base input -- Anthropic's published multipliers. Matched by
+# substring against the model string (e.g. "claude-opus-5" contains "opus").
+MODEL_PRICING = {
+    "opus": {"in": 15.0, "out": 75.0},
+    "sonnet": {"in": 3.0, "out": 15.0},
+    "haiku": {"in": 0.80, "out": 4.0},
+}
+
+
+def _price_for(model):
+    m = (model or "").lower()
+    for key, p in MODEL_PRICING.items():
+        if key in m:
+            return p
+    return None
+
+
+def estimate_cost(s):
+    """USD estimate from a summarize() result's per-model token buckets.
+    Returns (total, skipped_models) -- a model this table doesn't recognize
+    is left out of the total rather than guessed at, and reported back so
+    the caller can say the estimate is partial instead of silently wrong."""
+    total = 0.0
+    skipped = []
+    for model, b in (s.get("by_model") or {}).items():
+        p = _price_for(model)
+        if not p:
+            skipped.append(model)
+            continue
+        total += b["in"] * p["in"] / 1e6
+        total += b["out"] * p["out"] / 1e6
+        total += b["cache_r"] * (p["in"] * 0.1) / 1e6
+        total += b["cache_w_1h"] * (p["in"] * 2.0) / 1e6
+        total += b["cache_w_5m"] * (p["in"] * 1.25) / 1e6
+    return total, skipped
 
 
 def resolve(target):
@@ -363,6 +421,37 @@ def cmd_list(args):
               f"{s['reqs']:4} {sid[:8]:9} {col('dim', 'pid ' + str(a['pid']))}")
     if not rows and not live:
         print(col("dim", "  (no acts recorded)"))
+
+
+def cmd_model(args):
+    """The act's own model (main_model(), not counting subagents) for one
+    session's transcript, printed bare. Same motivation as cmd_cost: a
+    resumed act's ledger row needs this field populated same as every other
+    row -- it's how a pipeline silently running the wrong model gets noticed
+    (see append_ledger's comment in ap-cycle.sh)."""
+    t = transcript(args.session_id)
+    print(main_model(summarize(t)) if t else "")
+    return 0
+
+
+def cmd_cost(args):
+    """Estimated USD cost for one session's transcript, printed to stdout as
+    a bare number (for a bash caller to capture directly). This exists for
+    AP_ACT_LAUNCH_MODE=persistent acts, which have no -p JSON blob to read
+    total_cost_usd from -- ap-cycle.sh calls this right after an act ends so
+    the ledger's cost column isn't just a silent 0 (see autopilot/README.md).
+    """
+    t = transcript(args.session_id)
+    if not t:
+        print("0")
+        print(f"cost: no transcript found for session {args.session_id}", file=sys.stderr)
+        return 0
+    total, skipped = estimate_cost(summarize(t))
+    print(f"{total:.6f}")
+    if skipped:
+        print(f"cost: unpriced model(s) excluded from estimate: {', '.join(skipped)}",
+              file=sys.stderr)
+    return 0
 
 
 def cmd_show(args):
@@ -558,6 +647,14 @@ def main():
 
     p = sub.add_parser("watch", help="tmux pane per live act")
     p.set_defaults(fn=cmd_watch)
+
+    p = sub.add_parser("cost", help="estimated USD cost for one session's transcript")
+    p.add_argument("session_id")
+    p.set_defaults(fn=cmd_cost)
+
+    p = sub.add_parser("model", help="the act's own model for one session's transcript")
+    p.add_argument("session_id")
+    p.set_defaults(fn=cmd_model)
 
     a = ap.parse_args()
     sys.exit(a.fn(a) or 0)

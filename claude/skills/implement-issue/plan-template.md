@@ -78,8 +78,8 @@ break naive implementations:
 ## Interaction surface
 
 What else touches what this change touches. Name it here at plan time, because it
-is cheaper to design for than to discover during QA, and `/implement-plan` will
-derive this list from the diff anyway. From exploration, with `path:line`:
+is cheaper to design for than to discover during QA, and `/implement-issue`'s
+Phase B will derive this list from the diff anyway. From exploration, with `path:line`:
 
 - **Other consumers** of every function, component, hook, endpoint, model field, or
   query key being changed. A changed TanStack Query key serves stale data to views
@@ -96,7 +96,7 @@ Say "none" only after checking, and say what you checked.
 ## Risks and open questions
 
 - **BLOCKING**: <question that must be answered before code is written>.
-  `/implement-plan` will refuse to run while this is unresolved.
+  `/implement-issue`'s Phase B will refuse to run while this is unresolved.
 - Non-blocking: <thing to decide during or after the build>, with the assumption
   being proceeded on if unanswered.
 

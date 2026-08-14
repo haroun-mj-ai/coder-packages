@@ -6,7 +6,7 @@
 - **Repos touched:** <repo>
 - **Date:** YYYY-MM-DD
 
-Used only for tasks sized "light" per plan-issue's step 1c: a single file or a
+Used only for tasks tiered "Light" per implement-issue's Phase A step 2: a single file or a
 small handful in one repo, no new endpoint/schema/model field/migration, no
 cross-repo touch, no architectural decision. If writing this and the change
 turns out to have a real interaction surface, stop and switch to

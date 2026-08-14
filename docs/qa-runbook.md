@@ -60,10 +60,10 @@ source /home/coder/coder-packages/autopilot/bin/ap-env.sh
 #    environment, not from pydantic settings). It must also be LF, not CRLF.
 cd /home/coder/root-for-local/backend && set -a && . ./.env.local && set +a
 
-# 3. the databases are NOT on localhost — the docker daemon is the host's, so
-#    published ports live behind the bridge. .env.local already points at:
-#      mongo  host.docker.internal:27018   (27017 is a DIFFERENT, EMPTY stack)
-#      redis  host.docker.internal:6380
+# 3. the databases are on plain localhost (Coder template uses host networking
+#    as of 2026-08-13). .env.local already points at localhost:27017/:6379.
+#    If you see a host.docker.internal or 172.17.0.1 address anywhere, it's
+#    stale from before the template change — revert to localhost.
 ```
 
 ## Step 1 — bring up the pair you are comparing

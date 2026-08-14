@@ -639,12 +639,12 @@ human guessing whether the work is shippable.
 These cost two runs ~$10 to rediscover and were both misdiagnosed; do not
 re-derive them.
 
-- **Databases are not on `localhost`.** The docker daemon belongs to the host,
-  so published container ports are reachable via `host.docker.internal` (the
-  bridge gateway), never `localhost`. The populated stack is
-  **mongo `host.docker.internal:27018`** and **redis `:6380`** — the plain
-  `mongodb`/`redis` containers on 27017/6379 hold an EMPTY `journeyai` db.
-  `backend/.env.local` points at the right ones as of 2026-08-12.
+- **Databases are on plain `localhost`.** The Coder template was changed to
+  host networking on 2026-08-13, so `localhost:27017` (mongo) and
+  `localhost:6379` (redis) work directly — no gateway address needed.
+  `backend/.env.local` points at these. If you see `host.docker.internal` or
+  `172.17.0.1` anywhere, it's stale from before the template change; revert
+  to `localhost`.
 - **Native libs need `LD_LIBRARY_PATH`.** `import numpy` fails with
   `libz.so.1: cannot open shared object file` (it is zlib, NOT libstdc++),
   which cascades through `qdrant_client` → `grpc` and makes `app.main`

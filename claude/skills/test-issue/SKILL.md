@@ -135,12 +135,12 @@ fix.
 source /home/coder/coder-packages/autopilot/bin/ap-env.sh
 ```
 
-Then check reachability of the two databases (they are NOT on `localhost` — the
-docker daemon is the host's):
+Then check reachability of the two databases (plain `localhost` — the Coder
+template uses host networking as of 2026-08-13):
 
 ```bash
-nc -zv host.docker.internal 27018   # mongo (27017 is a DIFFERENT, empty stack)
-nc -zv host.docker.internal 6380    # redis
+nc -zv localhost 27017   # mongo
+nc -zv localhost 6379    # redis
 ```
 
 And check whether the baseline ports (5173 frontend, 8000 backend) are already up —

@@ -657,27 +657,19 @@ scan_parked_replies() {
       comment_body="$(json_field "$comment_json" ".[-1].body")"
       [[ -z "$comment_body" ]] && comment_body="$comment_first_line"
       log "scan: parked issue $num has a fresh reply (comment $comment_id), backgrounding ap-resume.sh"
-      # Record BEFORE backgrounding, unconditionally and directly on the
-      # registry file -- NOT through scan-state's commit_scan_state, whose
-      # "only commit pending inbox state when this cycle's poll action was
-      # none" logic exists for a different signal (at-most-one-poll-action
-      # per cycle) that doesn't apply here: ap-resume.sh runs independently
-      # of whatever the poll decides this cycle.
-      python3 - "$f" "$comment_id" <<'PY'
-import json, os, sys
-path, comment_id = sys.argv[1], int(sys.argv[2])
-try:
-    with open(path) as fh:
-        d = json.load(fh)
-except Exception:
-    d = {}
-d["last_relayed_comment_id"] = comment_id
-tmp = path + ".tmp"
-with open(tmp, "w") as fh:
-    json.dump(d, fh)
-os.replace(tmp, path)
-PY
-      nohup "$SCRIPT_DIR/ap-resume.sh" "$num" "$comment_body" >>"$AP_HOME/logs/cycle.log" 2>&1 &
+      # Do NOT mark last_relayed_comment_id here. ap-resume.sh itself marks
+      # it, and only once it has actually committed to injecting (acquired
+      # the resume lock, confirmed the window alive, acquired a lane slot) --
+      # never here, before we know any of that succeeded. Marking it
+      # pre-emptively was a real bug: if ap-resume.sh then bailed on "no free
+      # slot right now" (a normal, expected, retry-later condition -- the
+      # same shape as every other busy-lane skip in this file), the comment
+      # would have been silently treated as consumed forever, since nothing
+      # would make comment_id > recorded_id true again. Passing $comment_id
+      # through lets ap-resume.sh mark it at the right moment; every cycle
+      # until then just re-backgrounds a cheap, harmless ap-resume.sh retry
+      # (its own lock.resume.<n> makes a second concurrent one a fast no-op).
+      nohup "$SCRIPT_DIR/ap-resume.sh" "$num" "$comment_body" "$comment_id" >>"$AP_HOME/logs/cycle.log" 2>&1 &
       disown
     fi
   done
@@ -1120,6 +1112,19 @@ park_registry_write() {
 import json, sys
 (path, inbox_issue, issue, phase, lane, window, session_id,
  run_dir, plan_path, fe_port, be_port, parked_at, question) = sys.argv[1:14]
+# Preserve last_relayed_comment_id across a re-park if this issue was
+# already parked once before (a resume that led straight back to another
+# NEEDS_HUMAN). Losing it here would make the OLD comment that triggered
+# the first resume look "new" again on the next scan and get re-injected
+# into a session now waiting on a completely different question -- the
+# exact "circling back on the same issue" failure mode this registry
+# exists to prevent, not cause.
+last_relayed = None
+try:
+    with open(path) as f:
+        last_relayed = json.load(f).get("last_relayed_comment_id")
+except Exception:
+    pass
 d = {
     "inbox_issue": int(inbox_issue) if inbox_issue.isdigit() else inbox_issue,
     "issue": issue or None,
@@ -1132,6 +1137,7 @@ d = {
     "ports": {"fe": fe_port, "be": be_port} if fe_port else None,
     "parked_at": parked_at,
     "question": question or None,
+    "last_relayed_comment_id": last_relayed,
 }
 tmp = path + ".tmp"
 with open(tmp, "w") as f:

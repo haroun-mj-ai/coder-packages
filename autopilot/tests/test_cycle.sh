@@ -1936,6 +1936,42 @@ assert "persist(C): exit 0" [ "$rc" -eq 0 ]
 assert "persist(C): claude was never invoked at all (parked issue's comment did not even wake the poll)" \
   [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 0 ]
 
+# --- persist(D): ap-resume.sh must NOT mark a comment consumed when it bails
+# on "no free slot" -- this is a real bug that was caught and fixed while
+# testing this feature live: scan_parked_replies used to mark
+# last_relayed_comment_id BEFORE knowing whether ap-resume.sh would actually
+# inject, so a busy lane silently dropped the reply forever instead of
+# retrying (the same "no free slot -> retry next cycle" shape every other
+# busy-lane skip in this file already has). Invoke ap-resume.sh directly
+# (not through the backgrounded scan_parked_replies path, to avoid timing
+# flakiness) with both build slots deliberately held busy.
+setup_case
+mkdir -p "$CASE_AP_HOME/parked" "$CASE_AP_HOME/.test-tmux"
+cat >"$CASE_AP_HOME/parked/604.json" <<'EOF'
+{"inbox_issue": 604, "issue": "ENG-PD", "phase": "implement", "lane": "build",
+ "window": "act_build_1_ENG-PD_implement", "run_dir": "/tmp/does-not-matter",
+ "plan_path": "docs/plans/x.md", "ports": {"fe": "5174", "be": "8001"},
+ "parked_at": "2026-08-14T00:00:00Z", "question": "which approach?"}
+EOF
+# Fake tmux window "alive" so ap-resume.sh gets past the window_alive gate.
+echo "99999" >"$CASE_AP_HOME/.test-tmux/act_build_1_ENG-PD_implement.meta"
+hold_lane_lock "$CASE_AP_HOME/lock.build.1" 3; slot1_holder="$LANE_HOLDER_PID"
+hold_lane_lock "$CASE_AP_HOME/lock.build.2" 3; slot2_holder="$LANE_HOLDER_PID"
+AP_HOME="$CASE_AP_HOME" AP_WORK_REPO="$CASE_WORK_REPO" AP_TEST_STUB_DIR="$CASE_STUB_DIR" \
+AP_TMUX_SESSION=ap-test-should-never-be-real AP_BUILD_SLOTS=2 \
+PATH="$CASE_STUB_DIR:$PATH" \
+  bash "$BIN_DIR/ap-resume.sh" 604 "go with option B" 9001 \
+  >"$CASE_AP_HOME/resume-d.stdout.log" 2>"$CASE_AP_HOME/resume-d.stderr.log"
+resume_rc=$?
+wait "$slot1_holder" "$slot2_holder" 2>/dev/null
+assert "persist(D): ap-resume.sh exits 0 even when it bails" [ "$resume_rc" -eq 0 ]
+assert "persist(D): registry entry still exists (not dropped)" \
+  [ -f "$CASE_AP_HOME/parked/604.json" ]
+assert "persist(D): last_relayed_comment_id was NOT set (comment 9001 not consumed)" bash -c \
+  "python3 -c \"import json; d=json.load(open('$CASE_AP_HOME/parked/604.json')); assert d.get('last_relayed_comment_id') is None, d\""
+assert "persist(D): cycle.log records the 'no free slot' bail reason" \
+  bash -c "grep -q 'no free slot' '$CASE_AP_HOME/logs/cycle.log'"
+
 if [[ "$FAILURES" -eq 0 ]]; then
   echo "ALL PASS"
   exit 0

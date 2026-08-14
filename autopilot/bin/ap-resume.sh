@@ -38,8 +38,11 @@ source "$SCRIPT_DIR/ap-env.sh"
 
 SETTINGS_PATH="$(cd "$SCRIPT_DIR/.." && pwd)/settings/autopilot.json"
 
-inbox_issue="${1:?usage: ap-resume.sh <inbox-issue> [<reply-text>]}"
+inbox_issue="${1:?usage: ap-resume.sh <inbox-issue> [<reply-text>] [<comment-id>]}"
 reply_text="${2:-}"
+comment_id="${3:-}"
+
+mkdir -p "$AP_HOME/logs"
 
 log() {
   echo "$(date -u +%FT%TZ) resume[$inbox_issue]: $*" >>"$AP_HOME/logs/cycle.log"
@@ -117,12 +120,25 @@ park_registry_write() {
 import json, os, sys
 (path, inbox_issue, issue, phase, lane, window,
  run_dir, plan_path, fe_port, be_port, parked_at, question) = sys.argv[1:13]
+# Preserve last_relayed_comment_id across the overwrite -- same reasoning as
+# ap-cycle.sh's copy of this function: losing it makes an already-handled
+# comment look new again and re-inject into a session now parked on a
+# different question. Applies both to a re-park after a resumed
+# NEEDS_HUMAN, and to the chained-ship park (a new window, same inbox
+# issue's comment thread).
+last_relayed = None
+try:
+    with open(path) as f:
+        last_relayed = json.load(f).get("last_relayed_comment_id")
+except Exception:
+    pass
 d = {"inbox_issue": int(inbox_issue) if inbox_issue.isdigit() else inbox_issue,
      "issue": issue or None, "phase": phase or None, "lane": lane or None,
      "window": window or None, "session_id": None,
      "run_dir": run_dir or None, "plan_path": plan_path or None,
      "ports": {"fe": fe_port, "be": be_port} if fe_port else None,
-     "parked_at": parked_at, "question": question or None}
+     "parked_at": parked_at, "question": question or None,
+     "last_relayed_comment_id": last_relayed}
 tmp = path + ".tmp"
 with open(tmp, "w") as f:
     json.dump(d, f)
@@ -260,6 +276,33 @@ if [[ -n "$reply_text" ]]; then
   sleep 1
   tmux send-keys -t "$AP_TMUX_SESSION:$window" Enter
   log "injected reply into $window"
+  # Mark the triggering comment consumed HERE, now that injection has
+  # actually happened -- not in ap-cycle.sh's scan_parked_replies before
+  # this script even ran. Marking it there was a real bug: every bail-out
+  # above (no free slot, lock busy, window gone) is meant to be retried on
+  # a later cycle, exactly like every other busy-lane skip in this
+  # pipeline, but pre-marking would have made "no free slot" silently drop
+  # the reply forever instead of retrying -- the same class of caught-live
+  # bug this whole feature exists to avoid, not introduce.
+  if [[ -n "$comment_id" ]]; then
+    python3 - "$registry_file" "$comment_id" <<'PY'
+import json, os, sys
+path, cid = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        d = json.load(f)
+except Exception:
+    d = {}
+try:
+    d["last_relayed_comment_id"] = int(cid)
+except ValueError:
+    pass
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(d, f)
+os.replace(tmp, path)
+PY
+  fi
 else
   log "no reply text (manual-resume reconcile) -- polling for whatever it's already moved to"
 fi

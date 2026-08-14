@@ -378,6 +378,31 @@ bullet under `--no-claim`.
   only surfacing it in chat. They answer in Linear anyway, and this stops you
   being the relay while the work sits idle.
 
+### 7a. Mirror into kata
+
+Linear stays the source of truth for the ticket and its status; kata is a
+**local** step-ledger for this workspace that `/implement-plan` resumes and
+`/ship-work` eventually closes with evidence, so progress survives a session
+dying mid-build. Skip under `--no-issue` unless asked to track it anyway, in
+which case key it by the slug instead of an ENG id.
+
+- `kata search "ENG-<id>" --agent` first — a `--feedback` re-plan may already
+  have one from an earlier run of this same skill. Reuse it; do not create a
+  second one.
+- If none exists: `kata create "ENG-<id>: <title>" --body "<plan path>"
+  --idempotency-key "ENG-<id>" --agent`.
+- Either way: `kata meta set <ref> work.attention ok --agent`, and
+  `kata meta set <ref> work.branch haroun/eng-<id>-<slug> --agent` now that
+  step 2b's branch exists.
+- If a **BLOCKING** open question survived the dry-run (steps 5-6): also
+  `kata meta set <ref> work.attention needs-human --agent` and
+  `kata meta set <ref> work.attention_msg "<the blocking question, one
+  line>" --agent`, matching the Linear comment already required above.
+- Report the kata ref in step 8's hand-back, alongside the Linear id/URL.
+- If kata is not installed, or errors for any reason other than "no match,"
+  note it in the hand-back and continue — this is best-effort local
+  tracking, never a reason to stop the actual plan.
+
 ### 8. Hand back and stop
 
 Report to the human:
@@ -387,6 +412,7 @@ Report to the human:
   checkout and looking for it there is the obvious wrong guess;
 - every worktree path and branch created or reused, and that `/implement-plan` will
   **reuse** them rather than cut a second set;
+- the kata ref from step 7a, alongside the Linear id/URL already reported;
 - the work unit list with their repos, so the shape of the build is visible
   without opening the file;
 - anything `BLOCKING`, stated as a direct question;
@@ -469,6 +495,15 @@ that can make it, and it does so unconditionally on every headless run this
 skill starts, `--feedback` re-plans included (re-claiming an already-claimed
 issue is a harmless no-op).
 
+**Kata mirroring joins the same start-of-run claim.** Step 7a is
+interactive-only (step 7, which it follows, is skipped headlessly) — headlessly,
+do the same search/create-if-absent and `work.branch`/`work.attention ok`
+calls at this same point instead, unconditionally, `--feedback` re-plans
+included. `kata` needs no permission-profile ask beyond the allow-listed
+`Bash(kata *)`; if it errors for any reason other than "no match," record a
+one-line note in `status.json`'s `detail` and continue — never let it block
+or fail the run.
+
 **End state:** commit the plan exactly as step 4 already does in interactive
 mode. Then create or update the inbox issue with the **full** plan markdown
 (body on create, comment on update), prefixed with the line `Plan file:
@@ -481,4 +516,7 @@ Linear claim already happened at the start of this run, per above.
 **Blocking open question in the plan itself** (step 4's `BLOCKING` marker,
 survives the dry-run in step 5-6): still post the plan to the inbox, but
 label it `needs-input` instead of `plan-review`, and write `status.json` with
-`status: NEEDS_HUMAN` and `question` set to the blocking question's text.
+`status: NEEDS_HUMAN` and `question` set to the blocking question's text. Also
+set `kata meta set <ref> work.attention needs-human --agent` and
+`work.attention_msg` to the same question, per step 7a — clear it back to
+`ok` on whichever later run resolves it.

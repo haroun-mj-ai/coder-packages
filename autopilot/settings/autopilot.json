@@ -19,6 +19,7 @@
       "Bash(git -C *)",
       "Bash(gh issue *)",
       "Bash(gh api *)",
+      "Bash(kata *)",
       "Bash(gh pr view *)",
       "Bash(gh pr checks *)",
       "Bash(gh run *)",

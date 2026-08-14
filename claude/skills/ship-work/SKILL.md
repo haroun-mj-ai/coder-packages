@@ -342,6 +342,14 @@ having been dropped by a force-push that raced the merge.
   (and where there was no gate at all), every conflict resolved automatically,
   every fix attempt spent, and what remains for a human. If anything stopped the
   run, lead with that.
+- Close the kata issue (`kata search "ENG-<id>" --agent` to find the ref
+  `/plan-issue` created and `/implement-plan` kept open): `kata close <ref>
+  --done --message "<what shipped>" --commit <merge-sha> --agent`, one call
+  per merged repo's commit if they differ, or the root's if only one applies.
+  This is the one skill in the chain that actually closes it, since "done"
+  for a local step-ledger means merged, matching why Linear's `Staging` only
+  happens here too. If kata is unavailable or the ref can't be found, note it
+  in the final report and continue — never let it block the merge itself.
 - After a successful merge, remove the worktree and local branch for the issue in
   every repo that merged — the same never-force rules as everywhere else in this
   skill: `git -C <repo> worktree remove <path>` (never `--force`) then
@@ -381,7 +389,10 @@ inbox issue, prefixed with the line `Phase: ship` per the protocol's
 ask→fallback rule, swap its label `shipping` → `needs-input` (the wrapper
 already swapped `building` → `shipping` before invoking this phase), and
 write `status.json` with `status: NEEDS_HUMAN`, `phase: "ship"`, and
-`question` set to that same text.
+`question` set to that same text. Also `kata meta set <ref> work.attention
+needs-human --agent` and `work.attention_msg` to the same stop reason —
+`/implement-plan`'s step 1 rule covers the mechanics; this is that same
+signal, at this phase.
 Never continue past a hard stop headlessly — the interactive rule ("stop,
 report, do not proceed to the next repo") holds unchanged; headless mode only
 changes where the stop is reported.
@@ -395,7 +406,10 @@ comment, success or failure; the PR link(s) live on the inbox issue only.
 Never `Staging` headlessly (`Staging` means merged, and headless ship-work
 never merges) and never `Done` (a reviewer sets that, same as interactive).
 Write `status.json` with `status: "DONE"`, `phase: "ship"`, and `pr_urls`
-filled with every opened PR URL.
+filled with every opened PR URL. Leave the kata issue **open**, `work.attention
+ok` — headless ship-work never merges, so it never reaches step 9's close
+either; that stays for whichever later interactive `/ship-work` run actually
+merges.
 
 Plan archiving (`docs/plans/` → `docs/plans/completed/`) does **not** happen
 under `--headless` — it stays exactly where step 9 leaves it today, performed

@@ -67,6 +67,23 @@ for r in . backend frontend assistants; do git -C "$r" status -sb; done
 Uncommitted unrelated work in a target repo is a stop-and-ask, not something to
 work around.
 
+**Resume kata tracking.** `kata search "ENG-<id>" --agent` — `/plan-issue`
+already created this ticket's kata issue at claim time (its own step 7a);
+reuse it, do not create a second one. `kata meta set <ref> work.attention ok
+--agent` now that a build is starting. If none exists yet (a plan predating
+this convention, or `--no-issue`), create one:
+`kata create "ENG-<id>: <title>" --body "<plan path>" --idempotency-key
+"ENG-<id>" --agent`. Kata is a local step-ledger only — the plan file and
+Linear remain the sources of truth for the design and the ticket; point at
+them from kata rather than duplicating their content. Whenever this step (or
+step 3, or the stop conditions below) would end in a stop-and-ask
+interactively or a `NEEDS_HUMAN`/`FAILED` `status.json` headlessly, also set
+`kata meta set <ref> work.attention stuck|needs-human --agent` plus a
+one-line `work.attention_msg`, and clear it back to `ok` once whichever later
+run resolves it — never leave the signal stale. If kata is unavailable or
+errors for any reason other than "no match," note it and continue; this is
+best-effort tracking, never a reason to stop the build.
+
 ### 1a. Find out who else is working here
 
 Concurrent Claude Code sessions on this repo are normal, not exceptional. Run
@@ -279,7 +296,10 @@ But when a report says the spec is wrong, a hook does not exist, or the change
 does not fit: **stop that repo's chain and bring it here.** Decide yourself
 whether the plan changes, amend the plan file if it does, and record the change
 in its Design review section. An implementer improvising around a bad spec is the
-exact failure this two-phase split exists to prevent.
+exact failure this two-phase split exists to prevent. This is exactly the kind
+of stop step 1's kata rule covers — signal `work.attention` before doing
+anything else, so a coordinator or the human sees it without reading the
+transcript.
 
 ### 4. Quality gates, run from this session
 
@@ -619,6 +639,10 @@ budget, and landing the PRs in dependency order.
 Two skills that both push are two skills that disagree about what state the branch
 is in, so the seam is deliberate: commit here, because roborev needs committed
 work; ship there.
+
+Leave the kata issue **open**, `work.attention ok` — do not close it. Closing
+with evidence is `/ship-work`'s call to make (its own step 9), once the code
+is actually merged, not this skill's.
 
 **End every run by recommending the next command**, with the plan path filled in:
 

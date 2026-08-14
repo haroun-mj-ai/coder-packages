@@ -26,6 +26,16 @@ cd "$WORK_REPO" || exit 1
 
 mkdir -p "$AP_HOME" "$AP_HOME/runs" "$AP_HOME/logs"
 
+# window_alive <window-name> -> rc 0 if that window still exists in the
+# autopilot tmux session, rc 1 otherwise (including "tmux/session not up",
+# which is always "not alive" here rather than an error worth surfacing).
+# Defined this early (rather than down by run_claude()) because the
+# manual-resume sweep in Stage 0.5 needs it too.
+window_alive() {
+  local name="$1"
+  tmux list-windows -t "$AP_TMUX_SESSION" -F '#{window_name}' 2>/dev/null | grep -qx "$name"
+}
+
 log() {
   echo "$(date -u +%FT%TZ) $*" >>"$AP_HOME/logs/cycle.log"
 }
@@ -539,11 +549,22 @@ inbox_list_needs_input="$(gh issue list --repo "$AP_INBOX_REPO" --state open --l
 # plan). A signal whose lane is currently busy is skipped entirely: not
 # recorded as pending, so it is neither acted on nor marked seen -- it
 # re-fires next cycle once the lane frees.
+# is_parked <inbox-issue> -> rc 0 if a live parked-registry entry exists for
+# it -- the only legal next action for such an issue is `resume`
+# (scan_parked_replies below), never a fresh claim/replan/implement/ship.
+# This is the direct extension of the ENG-1308 per-issue-lock fix to cover
+# the parked interval, when no flock is held (the process that would hold
+# it exited at park time -- see run_claude()'s persistent-mode branch).
+is_parked() {
+  [[ -f "$AP_HOME/parked/$1.json" ]]
+}
+
 scan_inbox_comments() {
   local numbers="$1" fixed_lane="$2"
   [[ -z "$numbers" ]] && return
   while IFS= read -r num; do
     [[ -z "$num" ]] && continue
+    is_parked "$num" && continue
     # Ascending order (sort/direction are ignored on this endpoint); fetch a
     # full page and let extract_newest_comment take the last element. Inbox
     # threads are short; >100 comments would need pagination we skip for now.
@@ -599,6 +620,102 @@ scan_inbox_comments() {
 
 scan_inbox_comments "$(extract_issue_numbers "${inbox_list_plan_review:-[]}" | sort -un)" ""
 scan_inbox_comments "$(extract_issue_numbers "${inbox_list_needs_input:-[]}" | sort -un)" "plan"
+
+# --- Parked-act replies: relay directly, never through the poll -----------
+# scan_parked_replies -- for every currently-parked act (persistent mode
+# only; empty dir in oneshot mode, so this is a no-op there), check whether
+# a fresh, unmarked (owner) comment landed on its inbox issue since it
+# parked (or since whichever reply was last relayed) and if so, background
+# ap-resume.sh to inject it directly into the still-live window. Never sets
+# `wake=true`: routing a reply to an already-parked act needs no
+# poll/claim judgement call at all -- the live session's own next turn
+# interprets it with full context, which is the entire efficiency point of
+# parking instead of re-deriving from the plan file.
+scan_parked_replies() {
+  [[ -d "$AP_HOME/parked" ]] || return
+  local f num comment_json comment_line comment_id comment_first_line recorded_id comment_body
+  for f in "$AP_HOME"/parked/*.json; do
+    [[ -e "$f" ]] || continue
+    num="$(basename "$f" .json)"
+    comment_json="$(gh api "repos/$AP_INBOX_REPO/issues/$num/comments?per_page=100" 2>>"$AP_HOME/logs/cycle.log")"
+    [[ -z "$comment_json" ]] && continue
+    comment_line="$(extract_newest_comment "$comment_json")"
+    [[ -z "$comment_line" ]] && continue
+    comment_id="${comment_line%%$'\t'*}"
+    comment_first_line="${comment_line#*$'\t'}"
+    # Same agent-authored-marker check as scan_inbox_comments -- a comment
+    # this pipeline wrote itself (the NEEDS_HUMAN echo, a `Plan file:` post)
+    # is never owner input, parked act or not.
+    if [[ "$comment_first_line" == "Plan file:"* \
+       || "$comment_first_line" == "Phase:"* \
+       || "$comment_first_line" == "Autopilot:"* ]]; then
+      continue
+    fi
+    recorded_id="$(json_field "$(cat "$f" 2>/dev/null)" ".last_relayed_comment_id")"
+    recorded_id="${recorded_id:-0}"
+    if [[ "$comment_id" =~ ^[0-9]+$ ]] && [[ "$comment_id" -gt "$recorded_id" ]] 2>/dev/null; then
+      comment_body="$(json_field "$comment_json" ".[-1].body")"
+      [[ -z "$comment_body" ]] && comment_body="$comment_first_line"
+      log "scan: parked issue $num has a fresh reply (comment $comment_id), backgrounding ap-resume.sh"
+      # Record BEFORE backgrounding, unconditionally and directly on the
+      # registry file -- NOT through scan-state's commit_scan_state, whose
+      # "only commit pending inbox state when this cycle's poll action was
+      # none" logic exists for a different signal (at-most-one-poll-action
+      # per cycle) that doesn't apply here: ap-resume.sh runs independently
+      # of whatever the poll decides this cycle.
+      python3 - "$f" "$comment_id" <<'PY'
+import json, os, sys
+path, comment_id = sys.argv[1], int(sys.argv[2])
+try:
+    with open(path) as fh:
+        d = json.load(fh)
+except Exception:
+    d = {}
+d["last_relayed_comment_id"] = comment_id
+tmp = path + ".tmp"
+with open(tmp, "w") as fh:
+    json.dump(d, fh)
+os.replace(tmp, path)
+PY
+      nohup "$SCRIPT_DIR/ap-resume.sh" "$num" "$comment_body" >>"$AP_HOME/logs/cycle.log" 2>&1 &
+      disown
+    fi
+  done
+}
+scan_parked_replies
+
+# --- Manual tmux-attach resumes: detect and reconcile ----------------------
+# sweep_manual_resumes -- a parked act's window can be resumed by the owner
+# attaching to it directly (`tmux attach -t autopilot`) and typing an
+# answer, entirely bypassing ap-resume.sh and the bookkeeping it would have
+# done. That's a deliberate feature of using a real pty, not a bug -- but it
+# means nothing has yet reconciled the lane/issue locks or cleaned up the
+# registry for it. Detect this for every parked entry with no resume
+# currently in flight (lane_free on its own lock.resume.<n>): if its
+# status.json has moved off NEEDS_HUMAN (a new terminal or re-parked
+# state), or its window is simply gone, hand it to ap-resume.sh with no
+# reply text -- same reconcile path, it just has nothing new to inject.
+sweep_manual_resumes() {
+  [[ -d "$AP_HOME/parked" ]] || return
+  local f num registry_json run_dir window cur_status
+  for f in "$AP_HOME"/parked/*.json; do
+    [[ -e "$f" ]] || continue
+    num="$(basename "$f" .json)"
+    lane_free "$AP_HOME/lock.resume.$num" || continue
+    registry_json="$(cat "$f" 2>/dev/null)"
+    run_dir="$(json_field "$registry_json" ".run_dir")"
+    window="$(json_field "$registry_json" ".window")"
+    [[ -z "$run_dir" || -z "$window" ]] && continue
+    cur_status=""
+    [[ -f "$run_dir/status.json" ]] && cur_status="$(json_field "$(cat "$run_dir/status.json")" ".status")"
+    if [[ "$cur_status" != "NEEDS_HUMAN" ]] || ! window_alive "$window"; then
+      log "scan: parked issue $num looks manually resumed (status=${cur_status:-missing}) -- reconciling via ap-resume.sh"
+      nohup "$SCRIPT_DIR/ap-resume.sh" "$num" "" >>"$AP_HOME/logs/cycle.log" 2>&1 &
+      disown
+    fi
+  done
+}
+sweep_manual_resumes
 
 # --- Auto-approve leg (Change C): a plan-review issue is a build-lane
 # approval signal even with NO new owner comment when auto-approve applies
@@ -783,6 +900,7 @@ else
 fi
 
 action_peek="$(json_field "$poll_json" ".action")"
+inbox_issue_peek="$(json_field "$poll_json" ".inboxIssue")"
 # The poll ran (didn't crash) -- commit scan findings, but only as much as
 # the poll actually consumed. The poll takes at most ONE action per cycle:
 # when it acted, the label swap it performed is the real bookkeeping, and
@@ -791,16 +909,36 @@ action_peek="$(json_field "$poll_json" ".action")"
 # until the insurance poll). When the poll found nothing actionable (none),
 # commit everything so non-actionable signals stop re-waking us every
 # minute. Either way last_poll_ts refreshes.
+#
+# BUT the ONE signal the poll DID consume must still be marked seen here --
+# not left for a later cycle, and not marked via the "none" branch above
+# (which never runs for an actionable poll). Filter each pending file down
+# to just the consumed issue's line, from the SAME data the scan already
+# collected this cycle (no extra gh call, no re-fetch race). Missing this
+# is exactly the bug hit live on ENG-1308 (2026-08-14): a "discard the
+# worktrees" comment was consumed by a replan, never marked seen, and a
+# later cycle saw it as still-new and replanned AGAIN with the same stale
+# feedback -- burning a redundant run and, worse, clobbering the label back
+# over a genuinely new NEEDS_HUMAN question that had landed in between.
 if [[ "$action_peek" == "none" ]]; then
   commit_scan_state "$scan_state_path" "$pending_inbox_tsv" "$pending_new_intake_txt" "$(date -u +%FT%TZ)" "$pending_ship_pending_txt"
 else
-  commit_scan_state "$scan_state_path" /dev/null /dev/null "$(date -u +%FT%TZ)" /dev/null
+  consumed_inbox_tsv="$(mktemp)"
+  consumed_new_intake_txt="$(mktemp)"
+  consumed_ship_pending_txt="$(mktemp)"
+  if [[ -n "$inbox_issue_peek" && "$inbox_issue_peek" =~ ^[0-9]+$ ]]; then
+    grep -m1 -P "^${inbox_issue_peek}\t" "$pending_inbox_tsv" >"$consumed_inbox_tsv" 2>/dev/null || :
+    grep -m1 -x "$inbox_issue_peek" "$pending_new_intake_txt" >"$consumed_new_intake_txt" 2>/dev/null || :
+    grep -m1 -x "$inbox_issue_peek" "$pending_ship_pending_txt" >"$consumed_ship_pending_txt" 2>/dev/null || :
+  fi
+  commit_scan_state "$scan_state_path" "$consumed_inbox_tsv" "$consumed_new_intake_txt" "$(date -u +%FT%TZ)" "$consumed_ship_pending_txt"
+  rm -f "$consumed_inbox_tsv" "$consumed_new_intake_txt" "$consumed_ship_pending_txt"
 fi
 
-action="$(json_field "$poll_json" ".action")"
+action="$action_peek"
 issue="$(json_field "$poll_json" ".issue")"
 plan_path="$(json_field "$poll_json" ".planPath")"
-inbox_issue="$(json_field "$poll_json" ".inboxIssue")"
+inbox_issue="$inbox_issue_peek"
 feedback="$(json_field "$poll_json" ".feedback")"
 
 append_ledger "$issue" "poll" "${action:-none}" "${poll_cost:-0}" "${poll_session:-unknown}" "$poll_model_for_ledger"
@@ -943,11 +1081,79 @@ act_model() {
   esac
 }
 
+# window_name_for <phase> -> the tmux window name this act's persistent
+# session runs in, e.g. act_plan_ENG-1234_plan, act_build_1_ENG-1234_implement,
+# act_ship_2_ENG-1234_ship. Reads act_lane/build_slot/ship_slot/issue -- all
+# already-set globals by the time any act runs (the lane-lock acquisition
+# above sets them before dispatching). One window name scheme, so `ap
+# status`/`ap runs` (see ap-runs.py) can parse lane/slot/phase/issue back out
+# of it without a second source of truth.
+#
+# Underscore-separated, NOT dot-separated: tmux's own target syntax is
+# session:window.pane, so a window name containing dots gets misparsed by
+# tmux itself the moment anything (kill-window, send-keys, list-panes)
+# targets it by name -- caught live, not theoretically, when a first version
+# of this used dots and `tmux capture-pane -t "autopilot:act.plan.ENG-1.plan"`
+# failed with "can't find pane". Underscores are never special to tmux.
+window_name_for() {
+  local phase="$1"
+  case "$act_lane" in
+    plan)  printf 'act_plan_%s_%s' "${issue:-unknown}" "$phase" ;;
+    build) printf 'act_build_%s_%s_%s' "${build_slot:-0}" "${issue:-unknown}" "$phase" ;;
+    ship)  printf 'act_ship_%s_%s_%s' "${ship_slot:-0}" "${issue:-unknown}" "$phase" ;;
+    *)     printf 'act_unknown_%s_%s' "${issue:-unknown}" "$phase" ;;
+  esac
+}
+
+# park_registry_write <inbox-issue> <question> -- persists everything a
+# later `ap-resume.sh` (or the manual-resume sweep) needs to re-acquire this
+# act's slot and inject a reply into its still-live window. Called only from
+# Stage 3's NEEDS_HUMAN branch, only in persistent mode.
+park_registry_write() {
+  local inbox_issue="$1" question="$2"
+  mkdir -p "$AP_HOME/parked"
+  local now_ts
+  now_ts="$(date -u +%FT%TZ)"
+  python3 - "$AP_HOME/parked/$inbox_issue.json" "$inbox_issue" "${issue:-}" \
+    "${final_phase:-}" "${act_lane:-}" "${LAST_ACT_WINDOW:-}" "${LAST_ACT_SESSION_ID:-}" \
+    "${AP_RUN_DIR:-}" "${plan_path:-}" "${fe_port:-}" "${be_port:-}" "$now_ts" "$question" <<'PY'
+import json, sys
+(path, inbox_issue, issue, phase, lane, window, session_id,
+ run_dir, plan_path, fe_port, be_port, parked_at, question) = sys.argv[1:14]
+d = {
+    "inbox_issue": int(inbox_issue) if inbox_issue.isdigit() else inbox_issue,
+    "issue": issue or None,
+    "phase": phase or None,
+    "lane": lane or None,
+    "window": window or None,
+    "session_id": session_id or None,
+    "run_dir": run_dir or None,
+    "plan_path": plan_path or None,
+    "ports": {"fe": fe_port, "be": be_port} if fe_port else None,
+    "parked_at": parked_at,
+    "question": question or None,
+}
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(d, f)
+import os
+os.replace(tmp, path)
+PY
+}
+
+# park_registry_remove <inbox-issue> -- called once an act resumes and
+# reaches its next terminal (or re-parked -- see park_registry_write again)
+# state. Removing this is what tells the parked-issue filter in the scan
+# legs below that the issue is claimable again.
+park_registry_remove() {
+  rm -f "$AP_HOME/parked/$1.json"
+}
+
 run_claude() {
   # run_claude <phase> <prompt-arg...>  -- appends ledger row for this call
   local phase="$1"; shift
   local rc=0
-  local out
+  local out=""
   local model
   model="$(act_model "$phase")"
   local stderr_file="$AP_RUN_DIR/$phase.stderr"
@@ -961,17 +1167,58 @@ run_claude() {
   # read $AP_RUN_DIR from its environment; --run-dir hands it the path as
   # literal prompt text (see autopilot-protocol.md).
   set -- "$1 --run-dir $AP_RUN_DIR" "${@:2}"
-  # Act runs park long test suites in background tasks; the -p harness kills
-  # the session after its background-wait ceiling (default 10 min), which is
-  # how a healthy 28-min implement died with no result record. Give acts a
-  # 60-min ceiling (override via AP_BG_WAIT_CEILING_MS).
   log "act: phase=$phase model=$model"
-  out="$(CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="${AP_BG_WAIT_CEILING_MS:-3600000}" \
-    claude -p "$@" --model "$model" --settings "$SETTINGS_PATH" --output-format json 2>"$stderr_file")" || rc=$?
-  cat "$stderr_file" >>"$AP_HOME/logs/cycle.log" 2>/dev/null || true
-  local cost session_id st
-  cost="$(json_field "$out" ".total_cost_usd")"
-  session_id="$(json_field "$out" ".session_id")"
+
+  LAST_ACT_WINDOW=""
+  LAST_ACT_SESSION_ID=""
+
+  if [[ "$AP_ACT_LAUNCH_MODE" == "oneshot" ]]; then
+    # Exactly today's behavior: one-shot claude -p, blocks on process exit,
+    # no tmux window, no parking possible -- NEEDS_HUMAN just ends the run,
+    # same as always.
+    #
+    # Act runs park long test suites in background tasks; the -p harness
+    # kills the session after its background-wait ceiling (default 10 min),
+    # which is how a healthy 28-min implement died with no result record.
+    # Give acts a 60-min ceiling (override via AP_BG_WAIT_CEILING_MS).
+    out="$(CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="${AP_BG_WAIT_CEILING_MS:-3600000}" \
+      claude -p "$@" --model "$model" --settings "$SETTINGS_PATH" --output-format json 2>"$stderr_file")" || rc=$?
+    cat "$stderr_file" >>"$AP_HOME/logs/cycle.log" 2>/dev/null || true
+  else
+    # Persistent: launch as a real interactive `claude` session (no -p) in
+    # its own tmux window, so a NEEDS_HUMAN stop can park alive instead of
+    # exiting. Launched via `bash -c 'exec claude ...'` rather than directly,
+    # so stderr can still be redirected to a file the same way -p's -- exec
+    # replaces the shell with claude in place, so #{pane_pid} is still
+    # unambiguously the claude process, not the wrapping shell.
+    local window launch_ok=true
+    window="$(window_name_for "$phase")"
+    LAST_ACT_WINDOW="$window"
+    if window_alive "$window"; then
+      log "act: window $window already exists -- refusing to launch a duplicate (stale window from a prior crash?), treating this act as FAILED"
+      launch_ok=false
+    else
+      tmux new-window -t "$AP_TMUX_SESSION" -n "$window" -d -- \
+        bash -c 'exec env CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="$1" claude --settings "$2" --model "$3" "$4" 2>"$5"' \
+        _ "${AP_BG_WAIT_CEILING_MS:-3600000}" "$SETTINGS_PATH" "$model" "$1" "$stderr_file"
+    fi
+    if [[ "$launch_ok" == true ]]; then
+      # Poll for the skill's own status.json (any status -- DONE, FAILED, or
+      # NEEDS_HUMAN all just end this loop; Stage 3 below decides what each
+      # one means) or the window disappearing with none written (a crash).
+      while true; do
+        [[ -f "$status_file" ]] && break
+        if ! window_alive "$window"; then
+          log "act: window $window disappeared before writing status.json -- treating as crash"
+          break
+        fi
+        sleep 5
+      done
+    fi
+    cat "$stderr_file" >>"$AP_HOME/logs/cycle.log" 2>/dev/null || true
+  fi
+
+  local cost="0" session_id="" st
   if [[ ! -f "$status_file" && -f "$adhoc_status" ]]; then
     # Session fell back to the documented adhoc path (could not resolve the
     # run dir). $AP_HOME/runs/adhoc/status.json is a SINGLE shared path, and
@@ -996,6 +1243,34 @@ run_claude() {
   if [[ -z "${st:-}" ]]; then
     st="FAILED"
   fi
+
+  if [[ "$AP_ACT_LAUNCH_MODE" == "oneshot" ]]; then
+    cost="$(json_field "$out" ".total_cost_usd")"
+    session_id="$(json_field "$out" ".session_id")"
+  elif [[ -n "$LAST_ACT_WINDOW" ]] && window_alive "$LAST_ACT_WINDOW"; then
+    # No -p JSON blob in persistent mode, so no total_cost_usd is available
+    # here -- recorded as 0 (a known gap; see autopilot/README.md). Session
+    # id comes from the pane's own pid -> ~/.claude/sessions/<pid>.json,
+    # the same registry ap-runs.py already reads.
+    local pane_pid
+    pane_pid="$(tmux list-panes -t "$AP_TMUX_SESSION:$LAST_ACT_WINDOW" -F '#{pane_pid}' 2>/dev/null | head -1)"
+    if [[ -n "$pane_pid" ]]; then
+      session_id="$(json_field "$(cat "${AP_SESSIONS_DIR:-$HOME/.claude/sessions}/$pane_pid.json" 2>/dev/null)" ".sessionId")"
+    fi
+    LAST_ACT_SESSION_ID="$session_id"
+    if [[ "$st" == "DONE" || "$st" == "FAILED" ]]; then
+      # Short debounce before tearing down: status.json is itself the last
+      # tool call the skill makes, so the transcript is already complete by
+      # the time we see it exist; this only covers a trailing text turn
+      # printed right after that write.
+      sleep 3
+      tmux kill-window -t "$AP_TMUX_SESSION:$LAST_ACT_WINDOW" 2>/dev/null || true
+    fi
+    # NEEDS_HUMAN: window deliberately left alive here. Stage 3 below is
+    # what decides to park it (write the registry entry) -- this function
+    # only ever launches/tears down, never parks.
+  fi
+
   append_ledger "$issue" "$phase" "$st" "${cost:-0}" "${session_id:-unknown}" "$model"
   final_phase="$phase"
   final_status="$st"
@@ -1202,6 +1477,13 @@ $question" \
     fi
     ap-notify.sh "autopilot needs input: ${issue:-$action}" "${question:-see inbox}" "$inbox_url" || true
     echo 0 >"$AP_HOME/fail_count"
+    # Persistent mode: the window is still alive (run_claude() deliberately
+    # didn't kill it for NEEDS_HUMAN) -- park it. Oneshot mode: nothing to
+    # park, the process already exited, exactly as before this feature.
+    if [[ "$AP_ACT_LAUNCH_MODE" != "oneshot" && -n "$LAST_ACT_WINDOW" \
+       && -n "$inbox_issue" && "$inbox_issue" != "null" ]]; then
+      park_registry_write "$inbox_issue" "${question:-}"
+    fi
     ;;
 
   DONE)

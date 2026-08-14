@@ -116,6 +116,27 @@ export AP_SHIP_SLOTS
 # then waits for a human, same as before this feature existed.
 export AP_LIMIT_COOLDOWN_MIN="${AP_LIMIT_COOLDOWN_MIN:-60}"
 
+# How ap-cycle.sh launches and reconciles an act. "persistent" (default): each
+# act runs as a real `claude` session in its own tmux window inside the
+# `autopilot` session, so a NEEDS_HUMAN stop parks alive (releasing its lane
+# slot) instead of exiting -- `tmux attach -t autopilot` and typing into the
+# window, or a GitHub inbox reply, both resume it in place. "oneshot" restores
+# today's exact behavior: `claude -p`, no tmux window, the process exits on
+# any terminal state including NEEDS_HUMAN, and a later reply starts a fresh
+# invocation from the plan file (kata) instead of resuming a live session.
+# This is a launch-mechanism choice only -- it never changes what prompt text
+# or flags an act is invoked with.
+export AP_ACT_LAUNCH_MODE="${AP_ACT_LAUNCH_MODE:-persistent}"
+if [[ "$AP_ACT_LAUNCH_MODE" != "persistent" && "$AP_ACT_LAUNCH_MODE" != "oneshot" ]]; then
+  AP_ACT_LAUNCH_MODE=persistent
+fi
+export AP_ACT_LAUNCH_MODE
+
+# The tmux session persistent-mode acts (and supercronic itself) live in.
+# Overridable so the test suite can point it at a throwaway session name
+# instead of ever touching the real one.
+export AP_TMUX_SESSION="${AP_TMUX_SESSION:-autopilot}"
+
 # Native-extension libraries this workspace does not have on the default loader
 # path. Without them `import numpy` dies with "libz.so.1: cannot open shared
 # object file", which cascades through qdrant_client -> grpc and makes the whole

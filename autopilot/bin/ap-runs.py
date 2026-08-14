@@ -32,6 +32,9 @@ PROJECTS = Path(os.environ.get("AP_PROJECTS_DIR",
                                Path.home() / ".claude" / "projects"))
 SESSIONS = Path(os.environ.get("AP_SESSIONS_DIR",
                                Path.home() / ".claude" / "sessions"))
+# Same override the test harness (and a non-default AP_TMUX_SESSION) needs so
+# this never touches the real "autopilot" session by accident.
+AP_TMUX_SESSION = os.environ.get("AP_TMUX_SESSION", "autopilot")
 
 C = {"dim": "\033[2m", "b": "\033[1m", "r": "\033[31m", "g": "\033[32m",
      "y": "\033[33m", "c": "\033[36m", "0": "\033[0m"}
@@ -51,14 +54,71 @@ def issue_of(s):
 
 # --- discovery ---------------------------------------------------------------
 
+# act_plan_<issue>_<phase> / act_build_<slot>_<issue>_<phase> /
+# act_ship_<slot>_<issue>_<phase> -- the naming scheme ap-cycle.sh's
+# window_name_for() uses (AP_ACT_LAUNCH_MODE=persistent). Underscore-
+# separated, not dot-separated: tmux's own target syntax is
+# session:window.pane, so a dotted window name gets misparsed by tmux
+# itself the moment anything targets it by name.
+_ACT_WINDOW_RE = re.compile(
+    r"^act_(?:plan|build_\d+|ship_\d+)_(?P<issue>[^_]+)_(?P<phase>[^_]+)$"
+)
+
+
+def _tmux_windows(session=None):
+    """[(window_name, pane_pid)] in the given tmux session, or [] if tmux
+    or the session isn't up -- never an error worth surfacing here."""
+    session = session or AP_TMUX_SESSION
+    try:
+        out = subprocess.run(
+            ["tmux", "list-windows", "-t", session, "-F", "#{window_name} #{pane_pid}"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    rows = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        name, _, pid_s = line.rpartition(" ")
+        if name and pid_s.isdigit():
+            rows.append((name, int(pid_s)))
+    return rows
+
+
+def _parked_registry_by_window():
+    """{window_name: registry_dict} for every current $AP_HOME/parked/*.json
+    entry -- see ap-cycle.sh's park_registry_write. Empty (not an error) in
+    AP_ACT_LAUNCH_MODE=oneshot, where nothing ever parks."""
+    parked_dir = AP_HOME / "parked"
+    out = {}
+    if not parked_dir.is_dir():
+        return out
+    for f in parked_dir.glob("*.json"):
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        w = d.get("window")
+        if w:
+            out[w] = d
+    return out
+
+
 def live_acts():
-    """[{pid, run_dir, phase, target, session_id}] for running headless acts."""
+    """[{pid, run_dir, phase, target, session_id, parked}] for running acts,
+    from BOTH launch modes -- a one-shot `claude -p` in the process table
+    (AP_ACT_LAUNCH_MODE=oneshot) and a persistent tmux window
+    (AP_ACT_LAUNCH_MODE=persistent, the default). A given pipeline only ever
+    runs one mode at a time, but both code paths are kept so this still
+    works immediately after flipping the env var either way."""
     out = []
     try:
         ps = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True,
                             text=True, timeout=10).stdout
     except (OSError, subprocess.SubprocessError):
-        return out
+        ps = ""
     reg = {}
     for f in SESSIONS.glob("*.json"):
         try:
@@ -66,6 +126,7 @@ def live_acts():
             reg[d.get("pid")] = d.get("sessionId")
         except (OSError, json.JSONDecodeError):
             pass
+
     for line in ps.splitlines():
         line = line.strip()
         if " -p " not in line or "--run-dir" not in line:
@@ -96,6 +157,22 @@ def live_acts():
             # issue out of the filename so the column reads the same as plan's.
             "target": issue_of(tgt.group(1)) if tgt else "",
             "session_id": reg.get(pid, ""),
+            "parked": False,
+        })
+
+    parked_by_window = _parked_registry_by_window()
+    for window_name, pid in _tmux_windows():
+        m = _ACT_WINDOW_RE.match(window_name)
+        if not m:
+            continue
+        registry = parked_by_window.get(window_name) or {}
+        out.append({
+            "pid": pid,
+            "run_dir": registry.get("run_dir", ""),
+            "phase": m.group("phase"),
+            "target": issue_of(m.group("issue")),
+            "session_id": reg.get(pid, ""),
+            "parked": window_name in parked_by_window,
         })
     return out
 
@@ -279,8 +356,10 @@ def cmd_list(args):
         s = summarize(transcript(sid))
         model = main_model(s)
         dur = (datetime.now(timezone.utc) - s["first"]).total_seconds() / 60 if s["first"] else 0
+        label = "PARKED" if a.get("parked") else "LIVE"
+        clr = "dim" if a.get("parked") else "y"
         print(f"{'now':6} {a['phase']:10} {a['target'][:10]:10} "
-              f"{col('y', 'LIVE'.ljust(8))} {model:9} {'':7} {dur:4.0f} "
+              f"{col(clr, label.ljust(8))} {model:9} {'':7} {dur:4.0f} "
               f"{s['reqs']:4} {sid[:8]:9} {col('dim', 'pid ' + str(a['pid']))}")
     if not rows and not live:
         print(col("dim", "  (no acts recorded)"))
@@ -297,7 +376,13 @@ def cmd_show(args):
     run_dir = rec.get("run_dir") or (s or {}).get("run_dir", "")
 
     print(col("b", "── act ──────────────────────────────────────────────────"))
-    print(f"  state      {col('y','LIVE (pid %s)' % rec['pid']) if kind=='live' else rec.get('status')}")
+    if kind == "live":
+        state_label = ("PARKED (waiting on a reply, pid %s)" if rec.get("parked")
+                        else "LIVE (pid %s)") % rec["pid"]
+        state_color = "dim" if rec.get("parked") else "y"
+        print(f"  state      {col(state_color, state_label)}")
+    else:
+        print(f"  state      {rec.get('status')}")
     print(f"  phase      {rec.get('phase')}")
     print(f"  issue      {rec.get('issue') or rec.get('target') or '-'}")
     print(f"  session    {sid or '-'}")

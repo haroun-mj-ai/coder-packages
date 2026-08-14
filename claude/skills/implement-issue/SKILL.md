@@ -836,6 +836,14 @@ invocation with no explicit plan path writes `status.json` with `status:
 FAILED`, `detail: "headless requires an explicit plan path"`, and ends
 without touching the inbox.
 
+**Before writing `NEEDS_HUMAN` at any of these stop points, stop any dev
+servers this run has already started** (the worktree frontend/backend from
+step 9's QA, if reached) — same discipline step 12 already requires before
+`DONE`, now required before parking too (see `autopilot-protocol.md`'s
+"Parking" section): a lane slot freed at park time can otherwise be handed
+to a fresh act whose assigned ports collide with servers this run left
+bound.
+
 **Step 1/2's stop conditions**, mapped per the ask→fallback rule:
 
 - **BLOCKING unresolved** — `NEEDS_HUMAN`, `question` the exact text.

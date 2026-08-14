@@ -8,7 +8,7 @@ source "$SCRIPT_DIR/ap-env.sh"
 
 CRONTAB_TEMPLATE="$(cd "$SCRIPT_DIR/.." && pwd)/crontab"
 CRONTAB_RENDERED="$AP_HOME/crontab.rendered"
-TMUX_SESSION="autopilot"
+TMUX_SESSION="${AP_TMUX_SESSION:-autopilot}"
 
 usage() {
   echo "Usage: ap {up [--quiet]|down|status|pause|resume|runs|run|tail|watch|sweep|decide|--print-paths}" >&2
@@ -109,6 +109,11 @@ cmd_up() {
   # cd's too, but belt and braces).
   tmux new-session -d -s "$TMUX_SESSION" -c "${AP_WORK_REPO:-/home/coder/root-for-local}" \
     "supercronic -overlapping '$CRONTAB_RENDERED'"
+  # Named so nothing doing `tmux list-windows` pattern-matching on `act_*`
+  # (ap-runs.py's live-act detection, ap-cycle.sh's window_alive() checks)
+  # ever confuses supercronic's own window for one of the act windows
+  # AP_ACT_LAUNCH_MODE=persistent creates alongside it.
+  tmux rename-window -t "$TMUX_SESSION:0" supercronic 2>/dev/null || true
   [[ "$quiet" == true ]] || echo "autopilot started (tmux session '$TMUX_SESSION')"
 }
 
@@ -162,6 +167,20 @@ cmd_down() {
     if [[ -n "$busy" ]]; then
       echo "refusing: lane(s) busy ($busy) -- an act is running and would be killed." >&2
       echo "use 'ap pause' to stop new work, or 'ap down --force' to kill anyway." >&2
+      return 1
+    fi
+
+    # Parked acts hold no lane lock (that's the whole point -- see
+    # ap-cycle.sh's park_registry_write), so the busy-lane check above can't
+    # see them. `tmux kill-session` would silently take every one of them
+    # down too -- refuse separately.
+    local parked_count=0
+    if [[ -d "$AP_HOME/parked" ]]; then
+      parked_count="$(find "$AP_HOME/parked" -maxdepth 1 -name '*.json' | wc -l)"
+    fi
+    if [[ "$parked_count" -gt 0 ]]; then
+      echo "refusing: $parked_count act(s) parked, waiting on a reply -- 'ap down' would kill them too." >&2
+      echo "see 'ap status' for which issues, or 'ap down --force' to kill anyway." >&2
       return 1
     fi
   fi
@@ -232,6 +251,39 @@ cmd_status() {
     echo "plan lane:   free"
   else
     echo "plan lane:   busy"
+  fi
+
+  # Parked acts (AP_ACT_LAUNCH_MODE=persistent only): waiting on a reply,
+  # holding no lane lock -- see ap-cycle.sh's park_registry_write. Cross-
+  # check the window is actually still there; the manual-resume sweep in
+  # ap-cycle.sh's own Stage 0.5 is what reconciles a STALE entry away, this
+  # is read-only reporting, so a lagging one shows here as STALE rather than
+  # silently vanishing from the list.
+  if [[ -d "$AP_HOME/parked" ]] && compgen -G "$AP_HOME/parked/*.json" >/dev/null; then
+    echo "parked acts:"
+    local pf pissue pphase pwindow page_secs now_epoch parked_epoch
+    now_epoch="$(date -u +%s)"
+    for pf in "$AP_HOME"/parked/*.json; do
+      [[ -e "$pf" ]] || continue
+      pissue="$(python3 -c "import json,sys; print(json.load(open('$pf')).get('issue') or '?')" 2>/dev/null)"
+      pphase="$(python3 -c "import json,sys; print(json.load(open('$pf')).get('phase') or '?')" 2>/dev/null)"
+      pwindow="$(python3 -c "import json,sys; print(json.load(open('$pf')).get('window') or '?')" 2>/dev/null)"
+      parked_epoch="$(python3 -c "
+import json, datetime
+try:
+    ts = json.load(open('$pf')).get('parked_at', '')
+    dt = datetime.datetime.strptime(ts, '%Y-%m-%dT%H:%M:%SZ')
+    print(int(dt.replace(tzinfo=datetime.timezone.utc).timestamp()))
+except Exception:
+    print(0)
+" 2>/dev/null)"
+      age_secs=$(( now_epoch - ${parked_epoch:-0} ))
+      if tmux list-windows -t "$TMUX_SESSION" -F '#{window_name}' 2>/dev/null | grep -qx "$pwindow"; then
+        echo "  $pissue ($pphase) in $pwindow, parked $((age_secs / 60))m ago"
+      else
+        echo "  $pissue ($pphase) in $pwindow -- STALE (window missing; the next cycle's manual-resume sweep should clear this)"
+      fi
+    done
   fi
 
   local today ledger_file

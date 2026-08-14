@@ -199,7 +199,98 @@ printf '%s\n' "$@" >"$calls_dir/$n.args"
 exit 0
 STUB_NOTIFY
 
-  chmod +x "$dir/claude" "$dir/gh" "$dir/ap-notify.sh"
+  # Minimal fake tmux for AP_ACT_LAUNCH_MODE=persistent cases, so they never
+  # touch a real tmux server. State lives under $AP_HOME/.test-tmux/ (one
+  # file per window, line 1 = tracked pid), which resets with the rest of
+  # CASE_AP_HOME every setup_case -- real interactive-injection semantics
+  # (does send-keys + a separate Enter actually submit) were verified live
+  # against a real tmux session + real claude, not re-tested here; this
+  # stub only exercises ap-cycle.sh/ap-resume.sh's own bookkeeping.
+  cat >"$dir/tmux" <<'STUB_TMUX'
+#!/usr/bin/env bash
+state_dir="${AP_HOME:-/tmp}/.test-tmux"
+mkdir -p "$state_dir"
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  new-window)
+    name="" args=()
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        -t) shift 2 ;;
+        -n) name="$2"; shift 2 ;;
+        -d) shift ;;
+        --) shift; args=("$@"); break ;;
+        *) shift ;;
+      esac
+    done
+    "${args[@]}" &
+    pid=$!
+    echo "$pid" >"$state_dir/$name.meta"
+    exit 0
+    ;;
+  list-windows)
+    fmt=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        -F) fmt="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    for f in "$state_dir"/*.meta; do
+      [[ -e "$f" ]] || continue
+      name="$(basename "$f" .meta)"
+      pid="$(cat "$f" 2>/dev/null)"
+      if [[ "$fmt" == *pane_pid* ]]; then
+        echo "$name $pid"
+      else
+        echo "$name"
+      fi
+    done
+    exit 0
+    ;;
+  list-panes)
+    target=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        -t) target="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    name="${target#*:}"
+    [[ -f "$state_dir/$name.meta" ]] && cat "$state_dir/$name.meta"
+    exit 0
+    ;;
+  kill-window)
+    target=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        -t) target="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    name="${target#*:}"
+    if [[ -f "$state_dir/$name.meta" ]]; then
+      pid="$(cat "$state_dir/$name.meta" 2>/dev/null)"
+      kill "$pid" 2>/dev/null || true
+      rm -f "$state_dir/$name.meta"
+    fi
+    exit 0
+    ;;
+  send-keys)
+    calls_dir="${AP_TEST_STUB_DIR}/tmux_sendkeys_calls"
+    mkdir -p "$calls_dir"
+    n=$(find "$calls_dir" -maxdepth 1 -name '*.args' 2>/dev/null | wc -l)
+    n=$((n + 1))
+    printf '%s\n' "$@" >"$calls_dir/$n.args"
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+STUB_TMUX
+
+  chmod +x "$dir/claude" "$dir/gh" "$dir/ap-notify.sh" "$dir/tmux"
 }
 
 # --- per-case fixture --------------------------------------------------------
@@ -235,11 +326,20 @@ run_case() {
   # Deliberately launched from a directory that is NOT the work repo (the
   # subshell cd) so the cwd-discipline case can catch a regression of the bug
   # where the poll ran in the inherited cwd and therefore found no skills.
+  #
+  # AP_ACT_LAUNCH_MODE defaults to oneshot HERE (not ap-env.sh's real default,
+  # persistent) so every pre-existing case below keeps exercising exactly the
+  # one-shot `claude -p` code path it was written against, never real tmux.
+  # A persistent-mode case sets AP_ACT_LAUNCH_MODE=persistent (and its own
+  # isolated AP_TMUX_SESSION, backed by the stub dir's fake tmux -- see
+  # make_stub_dir) before calling run_case, overriding this default.
   (
     cd /tmp || exit 1
     AP_HOME="$CASE_AP_HOME" \
     AP_WORK_REPO="$CASE_WORK_REPO" \
     AP_TEST_STUB_DIR="$CASE_STUB_DIR" \
+    AP_ACT_LAUNCH_MODE="${AP_ACT_LAUNCH_MODE:-oneshot}" \
+    AP_TMUX_SESSION="${AP_TMUX_SESSION:-ap-test-should-never-be-real}" \
     PATH="$CASE_STUB_DIR:$PATH" \
       bash "$CYCLE" >"$CASE_AP_HOME/stdout.log" 2>"$CASE_AP_HOME/stderr.log"
   )
@@ -457,6 +557,8 @@ rc="$(
   AP_HOME="$CASE_AP_HOME" \
   AP_WORK_REPO="$CASE_WORK_REPO" \
   AP_TEST_STUB_DIR="$CASE_STUB_DIR" \
+  AP_ACT_LAUNCH_MODE=oneshot \
+  AP_TMUX_SESSION=ap-test-should-never-be-real \
   AP_TEST_POLL_ACTION=plan AP_TEST_POLL_ISSUE=ENG-SYM \
   PATH="$CASE_STUB_DIR:$PATH" \
     bash "$SYMLINK_BIN/ap-cycle.sh" >"$CASE_AP_HOME/stdout.log" 2>"$CASE_AP_HOME/stderr.log"
@@ -864,12 +966,16 @@ assert "case23: adhoc file consumed (moved, not left stale)" bash -c \
   "[ ! -f '$CASE_AP_HOME/runs/adhoc/status.json' ]"
 
 # =============================================================================
-# Case 24: an ACTIONABLE poll must not mark the signals it didn't consume as
-# seen. Two fresh delegations wake the poll; it acts on one (plan). The other
-# must stay live so the next cycle re-wakes and drains it, instead of being
-# stranded until the insurance poll. Regression for the live incident where
-# 6 queued issues were all marked seen by the one poll that implemented an
-# unrelated approval.
+# Case 24: an ACTIONABLE poll marks ONLY the signal it consumed as seen; every
+# OTHER pending signal from the same scan stays live so the next cycle re-wakes
+# and drains it. Two fresh delegations wake the poll; it acts on one (plan for
+# 901). 901 must be marked (or the next cycle replans it AGAIN with the same
+# stale input -- the live bug on ENG-1308, 2026-08-14: a "discard the
+# worktrees" comment was consumed by a replan, never marked seen, and a later
+# cycle saw it as still-new and replanned again, clobbering a genuinely new
+# NEEDS_HUMAN question that had landed in between). 902 must NOT be marked --
+# the prior incident this case also guards, where one poll's actionable
+# response stranded every OTHER queued issue until the 6h insurance poll.
 # =============================================================================
 setup_case
 now_ts="$(date -u +%FT%TZ)"
@@ -878,13 +984,17 @@ export AP_TEST_GH_ISSUES_ALL_OPEN='[{"number":901,"labels":[{"name":"Queued"}]},
 rc="$(AP_TEST_POLL_ACTION=plan AP_TEST_POLL_ISSUE=ENG-901 AP_TEST_POLL_INBOX=901 run_case)"
 assert "case24: first cycle exit 0" [ "$rc" -eq 0 ]
 assert "case24: first cycle woke the poll" [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -ge 1 ]
-assert "case24: unconsumed intake NOT marked seen after actionable poll" bash -c \
-  "python3 -c \"import json; d=json.load(open('$CASE_AP_HOME/scan-state.json')); assert '902' not in d['new_intake_seen'] and '901' not in d['new_intake_seen'], d\""
+assert "case24: the CONSUMED issue (901) IS marked seen" bash -c \
+  "python3 -c \"import json; d=json.load(open('$CASE_AP_HOME/scan-state.json')); assert '901' in d['new_intake_seen'], d\""
+assert "case24: the UNCONSUMED issue (902) is NOT marked seen" bash -c \
+  "python3 -c \"import json; d=json.load(open('$CASE_AP_HOME/scan-state.json')); assert '902' not in d['new_intake_seen'], d\""
 calls_before="$(count_files "$CASE_STUB_DIR/claude_calls")"
 rc2="$(AP_TEST_POLL_ACTION=plan AP_TEST_POLL_ISSUE=ENG-902 AP_TEST_POLL_INBOX=902 run_case)"
 assert "case24: second cycle exit 0" [ "$rc2" -eq 0 ]
 assert "case24: second cycle re-woke the poll for the remaining intake" \
   [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -gt "$calls_before" ]
+assert "case24: both issues are now marked seen after being drained" bash -c \
+  "python3 -c \"import json; d=json.load(open('$CASE_AP_HOME/scan-state.json')); assert '901' in d['new_intake_seen'] and '902' in d['new_intake_seen'], d\""
 
 # =============================================================================
 # Case 23b (adhoc adoption hardening, needed for two-lane concurrency): the
@@ -1734,6 +1844,97 @@ assert "detMode(B): ap-decide.sh itself swapped ship-pending -> shipping" bash -
   "grep -rl '^ship-pending$' '$CASE_STUB_DIR/gh_calls' | xargs -r grep -l '^shipping$' >/dev/null"
 assert "detMode(B): act call targets ship-work for ENG-900" bash -c \
   "grep -q 'ship-work.*ENG-900\|ENG-900.*ship-work' '$CASE_STUB_DIR/claude_calls/1.args' || grep -q 'ship-work' '$CASE_STUB_DIR/claude_calls/1.args'"
+
+# =============================================================================
+# Case: ENG-1308-shaped regression (2026-08-14 live incident). An owner
+# feedback comment on a plan-review issue is consumed by a replan. A SECOND
+# cycle, with the SAME comment still the newest on the issue (nothing new
+# posted), must NOT replan again off it -- the comment was already marked
+# seen by the first cycle's commit. Before the fix, the actionable-poll
+# branch committed /dev/null for everything, so the consumed comment was
+# never recorded and every later cycle treated it as still-new: a real run
+# replanned the identical feedback twice, and the second pass clobbered the
+# label back over a genuinely new NEEDS_HUMAN question that had landed
+# in between.
+# =============================================================================
+setup_case
+export AP_TEST_GH_ISSUES_PLAN_REVIEW='[{"number":1308}]'
+export AP_TEST_GH_COMMENT_1308='[{"id":5280390731,"user":{"login":"haroun"},"body":"discard the worktrees; take the full fix"}]'
+rc1="$(AP_TEST_POLL_ACTION=replan AP_TEST_POLL_ISSUE=ENG-1308 AP_TEST_POLL_INBOX=1308 \
+  AP_TEST_POLL_FEEDBACK="discard the worktrees; take the full fix" run_case)"
+assert "eng1308: first cycle exit 0" [ "$rc1" -eq 0 ]
+assert "eng1308: first cycle actually replanned (one act call)" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 2 ]
+assert "eng1308: the feedback comment IS marked seen after being consumed" bash -c \
+  "python3 -c \"import json; d=json.load(open('$CASE_AP_HOME/scan-state.json')); assert d['inbox'].get('1308') == 5280390731, d\""
+calls_before="$(count_files "$CASE_STUB_DIR/claude_calls")"
+# Second cycle: same fixture, nothing new posted (comment id unchanged).
+rc2="$(AP_TEST_POLL_ACTION=none run_case)"
+unset AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_COMMENT_1308
+assert "eng1308: second cycle exit 0" [ "$rc2" -eq 0 ]
+assert "eng1308: second cycle did NOT wake the poll (comment already consumed)" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq "$calls_before" ]
+
+# =============================================================================
+# Persistent mode (AP_ACT_LAUNCH_MODE=persistent): parking and window
+# lifecycle, against the fake tmux in make_stub_dir. What real tmux/claude
+# interaction actually does (does a resumed session pick up an injected
+# reply) was verified live against a real tmux session, not re-tested here
+# -- these cases only check ap-cycle.sh's own bookkeeping: does a
+# NEEDS_HUMAN act write the parked registry and leave its window up; does a
+# DONE/FAILED act tear its window down; does a parked issue get skipped by
+# the ordinary comment-scan legs.
+# =============================================================================
+
+# --- persist(A): NEEDS_HUMAN parks -- registry written, window left alive --
+setup_case
+export AP_ACT_LAUNCH_MODE=persistent
+export AP_TMUX_SESSION=ap-test-should-never-be-real
+export AP_TEST_ACT_STATUS=NEEDS_HUMAN
+rc="$(AP_TEST_POLL_ACTION=plan AP_TEST_POLL_ISSUE=ENG-PA AP_TEST_POLL_INBOX=601 run_case)"
+assert "persist(A): exit 0" [ "$rc" -eq 0 ]
+assert "persist(A): parked registry written for inbox issue 601" \
+  [ -f "$CASE_AP_HOME/parked/601.json" ]
+assert "persist(A): registry records the right issue/phase/lane" bash -c \
+  "python3 -c \"import json; d=json.load(open('$CASE_AP_HOME/parked/601.json')); assert d['issue']=='ENG-PA' and d['phase']=='plan' and d['lane']=='plan', d\""
+assert "persist(A): registry records the question" bash -c \
+  "python3 -c \"import json; d=json.load(open('$CASE_AP_HOME/parked/601.json')); assert d.get('question'), d\""
+assert "persist(A): window was NOT torn down (still tracked by fake tmux)" bash -c \
+  "ls '$CASE_AP_HOME/.test-tmux/'act_plan_ENG-PA_plan.meta >/dev/null 2>&1"
+unset AP_ACT_LAUNCH_MODE AP_TMUX_SESSION AP_TEST_ACT_STATUS
+
+# --- persist(B): DONE tears the window down ---------------------------------
+setup_case
+export AP_ACT_LAUNCH_MODE=persistent
+export AP_TMUX_SESSION=ap-test-should-never-be-real
+rc="$(AP_TEST_POLL_ACTION=plan AP_TEST_POLL_ISSUE=ENG-PB AP_TEST_POLL_INBOX=602 run_case)"
+assert "persist(B): exit 0" [ "$rc" -eq 0 ]
+assert "persist(B): no parked registry (DONE, not NEEDS_HUMAN)" \
+  bash -c "[ ! -f '$CASE_AP_HOME/parked/602.json' ]"
+assert "persist(B): window WAS torn down" bash -c \
+  "[ ! -f '$CASE_AP_HOME/.test-tmux/act_plan_ENG-PB_plan.meta' ]"
+unset AP_ACT_LAUNCH_MODE AP_TMUX_SESSION
+
+# --- persist(C): a parked issue is skipped by the ordinary comment scan -----
+# A fresh, unmarked plan-review comment on an issue that ALSO has a live
+# parked-registry entry must not be treated as a normal replan signal --
+# is_parked() must exclude it, the same ENG-1308-class guard extended to
+# the parked interval.
+setup_case
+mkdir -p "$CASE_AP_HOME/parked"
+cat >"$CASE_AP_HOME/parked/603.json" <<'EOF'
+{"inbox_issue": 603, "issue": "ENG-PC", "phase": "implement", "lane": "build",
+ "window": "act_build_1_ENG-PC_implement", "run_dir": "/tmp/does-not-matter",
+ "plan_path": "docs/plans/x.md", "ports": {"fe": "5174", "be": "8001"},
+ "parked_at": "2026-08-14T00:00:00Z", "question": "which approach?"}
+EOF
+export AP_TEST_GH_ISSUES_PLAN_REVIEW='[{"number":603}]'
+export AP_TEST_GH_COMMENT_603='[{"id":9001,"user":{"login":"haroun"},"body":"go with option B"}]'
+rc="$(AP_FULL_POLL_INTERVAL_MIN=0 AP_TEST_POLL_ACTION=none run_case)"
+unset AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_COMMENT_603
+assert "persist(C): exit 0" [ "$rc" -eq 0 ]
+assert "persist(C): claude was never invoked at all (parked issue's comment did not even wake the poll)" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 0 ]
 
 if [[ "$FAILURES" -eq 0 ]]; then
   echo "ALL PASS"

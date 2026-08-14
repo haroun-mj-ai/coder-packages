@@ -72,6 +72,12 @@ what you need:
 - `AP_POLL_MODE` (default `model`) — `model` runs the haiku `/autopilot-poll`
   skill every cycle; `deterministic` runs `ap-decide.sh` instead, for $0. See
   "Poll modes" below before flipping this.
+- `AP_ACT_LAUNCH_MODE` (default `persistent`) — `persistent` runs every act
+  as a real interactive `claude` session in its own tmux window, so a
+  mid-run blocking question parks alive (`tmux attach -t autopilot` to
+  answer it directly) instead of ending the run; `oneshot` restores the
+  original `claude -p` behavior. See "Persistent sessions and parking"
+  below.
 
 At least one of `NTFY_TOPIC` / `SLACK_WEBHOOK_URL` must be set for pings to
 actually go anywhere; unconfigured, `ap-notify.sh` just logs to
@@ -151,6 +157,40 @@ deliberately *not* a build slot: a standalone ship is almost pure CI-wait, so
 it must never queue behind a busy build lane. This is distinct from the ship
 half of an implement→ship chain, which stays on the build slot it already
 holds for the whole chain. See "Concurrent builds" below.
+
+## Persistent sessions and parking
+
+`AP_ACT_LAUNCH_MODE` (default `persistent`) controls how `ap-cycle.sh`
+launches every act: a real interactive `claude` session in its own tmux
+window inside the `autopilot` session, instead of a one-shot `claude -p`. The
+practical difference shows up when an act hits a genuine mid-run blocking
+question (not the plan-review `go`/feedback gate above, which stays exactly
+as described — there's no live process to keep for that, the plan phase
+already exited cleanly after committing the plan):
+
+- The window **parks alive** instead of the process exiting. Its lane slot
+  and per-issue lock are released immediately, so a question that takes you
+  hours to answer doesn't tie up one of the pipeline's 2 build slots for that
+  whole time.
+- **Reply from your phone**, same as always — a GitHub inbox comment gets
+  relayed into the parked session automatically (`ap-cycle.sh` detects it and
+  backgrounds `ap-resume.sh`, which re-acquires a slot and injects the reply
+  via `tmux send-keys`).
+- **Or reply at the workspace**: `tmux attach -t autopilot`, find the window
+  (named `act_<lane>[_<slot>]_<issue>_<phase>` — `ap status` lists parked
+  acts, `ap runs`/`ap run <target>` show `PARKED` instead of `LIVE`), and type
+  the answer directly. A background sweep notices the resulting state change
+  and reconciles the locks/registry the same way a relayed reply would.
+- `ap down` refuses while anything is parked (same as it already refuses
+  while a lane is busy) — `ap down --force` to kill parked sessions anyway.
+
+Set `AP_ACT_LAUNCH_MODE=oneshot` to restore the original behavior exactly: a
+`claude -p` process that exits on any terminal state (including a blocking
+question), with a later reply always starting a fresh invocation instead of
+resuming a live one. One real gap in `persistent` mode worth knowing: the
+ledger's `cost` column reads `0` for these acts (no `-p --output-format json`
+blob to read `total_cost_usd` from) — `ap status`'s week-cost tracking will
+undercount actual spend as a result; `oneshot` mode doesn't have this gap.
 
 ## Concurrent builds (and ships)
 

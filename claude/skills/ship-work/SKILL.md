@@ -397,7 +397,11 @@ needs-human --agent` and `work.attention_msg` to the same stop reason —
 signal, at this phase.
 Never continue past a hard stop headlessly — the interactive rule ("stop,
 report, do not proceed to the next repo") holds unchanged; headless mode only
-changes where the stop is reported.
+changes where the stop is reported. What the wrapper does with the process
+after this write (park it alive vs. end the run) is `autopilot-protocol.md`'s
+"Parking" section's call, not this skill's — this skill starts no dev
+servers of its own, so it has nothing to tear down before a `NEEDS_HUMAN`
+write either way.
 
 **Success end state** (all gates clear, PRs open and green or gateless, no
 merge): PR URLs are posted as a comment on the inbox issue and the inbox

@@ -21,6 +21,10 @@ trap 'rm -rf "$FIX"' EXIT
 export AP_HOME="$FIX/ap"
 export AP_PROJECTS_DIR="$FIX/projects"
 export AP_SESSIONS_DIR="$FIX/sessions"
+# ap-runs.py's live_acts() now also queries this tmux session for persistent-
+# mode act windows -- point it at one that can never be the real pipeline's,
+# so a read-only `tmux list-windows` here never touches or depends on it.
+export AP_TMUX_SESSION=ap-test-should-never-be-real
 export NO_COLOR=1
 mkdir -p "$AP_HOME/runs" "$AP_PROJECTS_DIR/proj" "$AP_SESSIONS_DIR"
 

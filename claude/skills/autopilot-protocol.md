@@ -2,12 +2,19 @@
 
 Shared contract for the `--headless` mode of `/implement-issue` (`--phase
 plan` and `--phase implement`) and `/ship-work`, and for the bash
-orchestrator (`ap-cycle.sh`) that invokes them via `claude -p`. Read this
-before reading any skill's own headless section: it defines the vocabulary
-and mechanics once so each skill only states what maps to what.
+orchestrator (`ap-cycle.sh`) that invokes them. Read this before reading any
+skill's own headless section: it defines the vocabulary and mechanics once
+so each skill only states what maps to what.
 (`/plan-issue` and `/implement-plan` are retired, folded into
 `/implement-issue`'s two phases — this document still uses "the plan phase"
 and "the implement phase" as the natural names for what each used to be.)
+
+Launch mechanism is a wrapper-side, not skill-side, concern (see "## Parking"
+below): `ap-cycle.sh` launches a headless act as either a one-shot `claude
+-p` (`AP_ACT_LAUNCH_MODE=oneshot`) or a persistent interactive session in its
+own tmux window (`AP_ACT_LAUNCH_MODE=persistent`, the default). Nothing in
+this document or in a skill's own headless section depends on which — a
+skill never needs to know or care.
 
 ## Trigger
 
@@ -16,9 +23,12 @@ interactive instructions say and this protocol is inert. Present, every "ask
 the human" point in that skill's instructions is replaced by the ask→fallback
 rule below, and the run ends by writing `status.json`.
 
-No autopilot run is ever a human at a terminal. A synchronous question would
-block forever, so headless mode never blocks: it takes a documented default,
-or it ends the run.
+No autopilot run has a human synchronously present at the moment an ask-point
+is hit — headless mode never blocks waiting for one inline: it takes a
+documented default, or it asks and stops (`status: NEEDS_HUMAN`). What
+happens to the *process* after that stop is a wrapper-side launch-mode
+decision — see "## Parking" — not something this rule or a skill's own
+instructions need to distinguish.
 
 ## Command discipline under `dontAsk`
 
@@ -40,9 +50,60 @@ is denied unless every segment is allowed**. So:
 - `DONE` — the phase finished; whatever it was supposed to produce (a
   committed plan, a QA'd branch, an open PR) exists.
 - `NEEDS_HUMAN` — the run cannot proceed without the issue owner; a question
-  has been posted to the inbox issue and the run has ended.
+  has been posted to the inbox issue. What happens to the *process* next is
+  the wrapper's call — see "## Parking" — not something a skill's own
+  instructions decide or need to know.
 - `FAILED` — an error stopped the run. No in-run retry; the wrapper decides
   whether and when to retry.
+
+## Parking
+
+`AP_ACT_LAUNCH_MODE=persistent` (the default) launches every headless act —
+plan, replan, implement, ship, standalone or chained — as a real interactive
+`claude` session in its own tmux window inside the `autopilot` session,
+instead of a one-shot `claude -p`. This changes what happens to the
+*process* after a `NEEDS_HUMAN` write; it changes nothing about how a skill
+decides to reach `NEEDS_HUMAN` in the first place, still governed entirely
+by the ask→fallback rule above.
+
+- **`DONE`/`FAILED`**: the wrapper tears the window down (a short debounce,
+  then `tmux kill-window`) — same as `AP_ACT_LAUNCH_MODE=oneshot`'s process
+  exit, just wrapper-driven instead of automatic.
+- **`NEEDS_HUMAN`**: the window is deliberately left alive — "parks" —
+  instead of ending the run. The wrapper records a parked-registry entry
+  (`$AP_HOME/parked/<inbox-issue>.json`: window name, lane, run dir, plan
+  path, ports, the question) and releases the act's lane slot and per-issue
+  lock immediately, so the pipeline's limited build/ship slots (2 and 3 by
+  default) aren't tied up for however long the owner takes to reply — the
+  exact property `oneshot` mode's "NEEDS_HUMAN frees the slot" already had,
+  preserved here by a different mechanism.
+- **Resuming**: a reply lands one of two ways, both converging on the same
+  `ap-resume.sh <inbox-issue> [<reply-text>]` — re-acquires a slot from the
+  normal pool, re-acquires the per-issue lock, then either injects the reply
+  via `tmux send-keys` or (no reply text) just observes whatever the act has
+  already moved to:
+  1. **A GitHub inbox comment**, exactly as today — `ap-cycle.sh`'s scan
+     detects it (same marker-line discipline, same "is this agent-authored"
+     check) and backgrounds `ap-resume.sh` with the comment text.
+  2. **`tmux attach -t autopilot`**, finding the window (named
+     `act_<lane>[_<slot>]_<issue>_<phase>`; `ap status`/`ap runs` list
+     these), and typing the answer directly. A background sweep in
+     `ap-cycle.sh` notices the resulting state change and reconciles the
+     lane/issue locks and the registry the same way `ap-resume.sh` would —
+     this is what makes attaching and typing alone actually work, not just
+     mechanically possible.
+- **Required of every skill's own headless section**: stop any dev
+  servers/background processes the run started *before* writing
+  `NEEDS_HUMAN`, not only before `DONE` — a slot freed at park time can be
+  handed to a fresh act whose assigned port pair would otherwise collide
+  with the parked act's still-bound servers.
+- **The GitHub inbox comment on `NEEDS_HUMAN` is still mandatory** — a
+  durable audit trail and a channel that works even if the workspace or
+  tmux session is down — it is simply no longer the *only* way back in.
+- **`AP_ACT_LAUNCH_MODE=oneshot`** restores today's exact original
+  behavior: `NEEDS_HUMAN` just ends the run, a later reply starts a brand
+  new invocation that re-derives context from the plan file (and kata).
+  Nothing above applies in this mode.
 
 ## `status.json`
 

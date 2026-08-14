@@ -107,12 +107,13 @@ def _parked_registry_by_window():
 
 
 def live_acts():
-    """[{pid, run_dir, phase, target, session_id, parked}] for running acts,
-    from BOTH launch modes -- a one-shot `claude -p` in the process table
-    (AP_ACT_LAUNCH_MODE=oneshot) and a persistent tmux window
-    (AP_ACT_LAUNCH_MODE=persistent, the default). A given pipeline only ever
-    runs one mode at a time, but both code paths are kept so this still
-    works immediately after flipping the env var either way."""
+    """[{pid, run_dir, phase, target, session_id, parked, window}] for running
+    acts, from BOTH launch modes -- a one-shot `claude -p` in the process
+    table (AP_ACT_LAUNCH_MODE=oneshot, `window` is None: no pane exists) and
+    a persistent tmux window (AP_ACT_LAUNCH_MODE=persistent, the default,
+    `window` is its tmux window name). A given pipeline only ever runs one
+    mode at a time, but both code paths are kept so this still works
+    immediately after flipping the env var either way."""
     out = []
     try:
         ps = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True,
@@ -158,6 +159,7 @@ def live_acts():
             "target": issue_of(tgt.group(1)) if tgt else "",
             "session_id": reg.get(pid, ""),
             "parked": False,
+            "window": None,
         })
 
     parked_by_window = _parked_registry_by_window()
@@ -173,6 +175,7 @@ def live_acts():
             "target": issue_of(m.group("issue")),
             "session_id": reg.get(pid, ""),
             "parked": window_name in parked_by_window,
+            "window": window_name,
         })
     return out
 
@@ -434,6 +437,52 @@ def cmd_model(args):
     return 0
 
 
+def cmd_interrupt(args):
+    """`ap pause-act <target>` -- send Claude Code's own interrupt (Escape)
+    into a live persistent act's tmux window. Stops it mid-turn without
+    losing the session/context (unlike a NEEDS_HUMAN park, nothing is
+    written to status.json and no reply is expected) -- `ap resume-act`
+    later picks the same session back up exactly where it left off.
+    Only meaningful for AP_ACT_LAUNCH_MODE=persistent acts: a oneshot
+    `claude -p` act has no interactive pane to interrupt."""
+    kind, rec = resolve(args.target)
+    if kind != "live" or not rec or not rec.get("window"):
+        print(f"no live, interactive (persistent-mode) act matches '{args.target}' -- "
+              "a oneshot act has no session to interrupt", file=sys.stderr)
+        return 1
+    window = rec["window"]
+    subprocess.run(["tmux", "send-keys", "-t", f"{AP_TMUX_SESSION}:{window}", "Escape"],
+                   check=False)
+    print(f"interrupted {window} (issue {rec.get('target') or '?'}, phase {rec.get('phase')})")
+    print(f"resume: ap resume-act {args.target} [\"<message>\"]  "
+          f"(or attach: tmux attach -t {AP_TMUX_SESSION})")
+    print("note: this does NOT release the act's build/ship/plan lane lock -- unlike "
+          "a NEEDS_HUMAN park, the ap-cycle.sh process that dispatched it is still "
+          "polling for status.json, so its slot stays occupied the whole time it's paused")
+    return 0
+
+
+def cmd_continue(args):
+    """`ap resume-act <target> [message]` -- inject a message into a live,
+    interrupted (or otherwise idle) act's tmux window. Two SEPARATE
+    send-keys calls, not text+Enter in one -- Claude Code's TUI does not
+    reliably submit otherwise (same fix ap-resume.sh's reply injection
+    needed, caught only by live testing; see autopilot README)."""
+    kind, rec = resolve(args.target)
+    if kind != "live" or not rec or not rec.get("window"):
+        print(f"no live, interactive (persistent-mode) act matches '{args.target}'",
+              file=sys.stderr)
+        return 1
+    window = rec["window"]
+    text = args.message or "continue"
+    target = f"{AP_TMUX_SESSION}:{window}"
+    subprocess.run(["tmux", "send-keys", "-t", target, "--", text], check=False)
+    time.sleep(1)
+    subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], check=False)
+    print(f"resumed {window} with: {text}")
+    return 0
+
+
 def cmd_cost(args):
     """Estimated USD cost for one session's transcript, printed to stdout as
     a bare number (for a bash caller to capture directly). This exists for
@@ -655,6 +704,15 @@ def main():
     p = sub.add_parser("model", help="the act's own model for one session's transcript")
     p.add_argument("session_id")
     p.set_defaults(fn=cmd_model)
+
+    p = sub.add_parser("interrupt", help="pause a live persistent act mid-turn (resumable)")
+    p.add_argument("target", nargs="?", default="latest")
+    p.set_defaults(fn=cmd_interrupt)
+
+    p = sub.add_parser("continue", help="resume an interrupted/idle live act")
+    p.add_argument("target", nargs="?", default="latest")
+    p.add_argument("message", nargs="?", default="continue")
+    p.set_defaults(fn=cmd_continue)
 
     a = ap.parse_args()
     sys.exit(a.fn(a) or 0)

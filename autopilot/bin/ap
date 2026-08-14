@@ -11,7 +11,7 @@ CRONTAB_RENDERED="$AP_HOME/crontab.rendered"
 TMUX_SESSION="${AP_TMUX_SESSION:-autopilot}"
 
 usage() {
-  echo "Usage: ap {up [--quiet]|down|status|pause|resume|runs|run|tail|watch|sweep|decide|--print-paths}" >&2
+  echo "Usage: ap {up [--quiet]|down|status|pause|resume|runs|run|tail|watch|sweep|pause-act|resume-act|decide|--print-paths}" >&2
   echo "  runs [-n N]    List recent acts; live ones are marked LIVE." >&2
   echo "  run  [TARGET]  One act in detail: main-loop model, tokens, tool mix," >&2
   echo "                 status.json, stderr, final message. --timeline for" >&2
@@ -22,6 +22,12 @@ usage() {
   echo "                 branches. Defaults to --dry-run (report only); pass" >&2
   echo "                 --yes to actually remove. Never --force, never" >&2
   echo "                 'branch -D'." >&2
+  echo "  pause-act [TARGET]        Interrupt one live persistent act mid-turn" >&2
+  echo "                 (Escape) -- resumable, unlike 'ap pause' which only" >&2
+  echo "                 stops NEW dispatches. Note: does NOT free its lane" >&2
+  echo "                 slot -- ap-cycle.sh is still waiting on it." >&2
+  echo "  resume-act [TARGET] [MESSAGE]   Resume an interrupted/idle live act" >&2
+  echo "                 by injecting MESSAGE (default: \"continue\")." >&2
   echo "  decide         Run the deterministic decider (ap-decide.sh --dry-run)" >&2
   echo "                 against the REAL inbox, no writes, and pretty-print the" >&2
   echo "                 decision plus a one-line reason per tier it evaluated --" >&2
@@ -42,6 +48,8 @@ cmd_run() { python3 "$RUNS_PY" show "$@"; }
 cmd_tail() { python3 -u "$RUNS_PY" tail "$@"; }
 cmd_watch() { python3 "$RUNS_PY" watch "$@"; }
 cmd_sweep() { "$SCRIPT_DIR/ap-sweep.sh" "$@"; }
+cmd_pause_act() { python3 "$RUNS_PY" interrupt "${1:-latest}"; }
+cmd_resume_act() { python3 "$RUNS_PY" continue "${1:-latest}" "${2:-continue}"; }
 
 # `ap decide` runs the deterministic decider in --dry-run (no gh writes,
 # ever) against the REAL inbox, and pretty-prints the decision plus its
@@ -383,6 +391,8 @@ case "$sub" in
   tail) cmd_tail "$@" ;;
   watch) cmd_watch "$@" ;;
   sweep) cmd_sweep "$@" ;;
+  pause-act) cmd_pause_act "${1:-}" ;;
+  resume-act) cmd_resume_act "${1:-}" "${2:-}" ;;
   decide) cmd_decide "$@" ;;
   --print-paths) cmd_print_paths ;;
   *) usage ;;

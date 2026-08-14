@@ -1433,7 +1433,7 @@ assert "limit(e): pause reason is usage-limit" bash -c \
 
 # =============================================================================
 # Feature: visible ship stage (`shipping` label). Held only while
-# `/ship-work --headless --no-merge` runs, swapped in by the WRAPPER (not the
+# `/ship-work --headless` runs, swapped in by the WRAPPER (not the
 # skill) right before invoking that phase, with its own ping.
 # =============================================================================
 
@@ -1538,12 +1538,14 @@ assert "external(d): notify title does NOT say requeued" bash -c \
 # =============================================================================
 # Ship-only action, ship lane (Change: ship gets its OWN lane, not build).
 # poll can emit action=ship for a ship-pending issue; dispatched as
-# /ship-work --headless --no-merge --ports, on its own slot pool
+# /ship-work --headless --ports, on its own slot pool
 # (lock.ship.1 .. lock.ship.N) and its own port base (5180+n/8010+n) --
-# never the build lane's ports, never the human's baseline.
+# never the build lane's ports, never the human's baseline. `ship-work` never
+# merges regardless of flags (there is no `--no-merge` flag anymore), so
+# nothing needs disabling here.
 # =============================================================================
 
-# --- (e) action=ship dispatches /ship-work with --no-merge and --ports from
+# --- (e) action=ship dispatches /ship-work with --ports from
 # the ship base, slot 1 (fe=5181,be=8011).
 setup_case
 rc="$(AP_TEST_POLL_ACTION=ship AP_TEST_POLL_ISSUE=ENG-SHIP-ONLY \
@@ -1553,8 +1555,8 @@ act_args="$CASE_STUB_DIR/claude_calls/2.args"
 assert "shipOnly(e): act call recorded" [ -f "$act_args" ]
 assert "shipOnly(e): dispatches /ship-work" bash -c \
   "[ -f '$act_args' ] && grep -q 'ship-work' '$act_args'"
-assert "shipOnly(e): includes --no-merge" bash -c \
-  "[ -f '$act_args' ] && grep -q -- '--no-merge' '$act_args'"
+assert "shipOnly(e): never passes a stale --no-merge flag" bash -c \
+  "[ -f '$act_args' ] && ! grep -q -- '--no-merge' '$act_args'"
 assert "shipOnly(e): --ports from the ship base, slot 1 (fe=5181,be=8011)" bash -c \
   "[ -f '$act_args' ] && grep -q -- '--ports fe=5181,be=8011' '$act_args'"
 assert "shipOnly(e): never assigns fe=5173 nor be=8000 (human baseline)" bash -c \

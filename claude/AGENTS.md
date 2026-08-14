@@ -13,8 +13,8 @@ The supported path from ticket to staging is two skills in `.claude/skills/`. Us
 | Skill | Ends at |
 |---|---|
 | `/implement-issue <id or description>` (Phase A / no `--phase`, or `--phase plan` headlessly) | every repo fetched, a worktree per involved repo cut from fresh `dev`, and a reviewed plan committed on the feature branch. Ticket filed and claimed. Stops for approval |
-| `/implement-issue <plan>` (Phase B, or `--phase implement` headlessly) | a committed, roborev-reviewed branch in those same worktrees, with a durable QA artifact under `docs/plans/qa/`. Never pushes |
-| `/ship-work <plan>` | merged to `dev`. Never touches `main` |
+| `/implement-issue <plan>` (Phase B, or `--phase implement` headlessly) | a committed, roborev-reviewed branch in those same worktrees, with a durable QA artifact under `docs/plans/qa/`, pushed, with the PR(s) open on `dev`. Never merges |
+| `/ship-work <plan>` | pushed, rebased onto latest `dev`, locally gate-clean, PR(s) confirmed open. Never waits on CI and never merges — a human does both, whenever ready |
 
 `implement-issue` supersedes the now-retired `plan-issue`/`implement-plan` — one skill, two phases separated by a hard approval gate, rather than two separate invocations.
 
@@ -189,7 +189,7 @@ The gate is **whether the action leaves the machine**, not whether it writes any
 
 - **Free, no approval needed:** local commits, `--amend`, creating branches and worktrees, `roborev` runs. All local, all reversible, so asking each time is friction with no safety value.
 - **Needs explicit approval, every time:** `git push`, force-push, opening or updating a PR, merging, and Linear writes. One approval covers one batch, not a standing licence.
-- **Exception:** invoking a skill is approval for what that skill declares it does. `/ship-work` is defined to push, open PRs, and merge to `dev`, so running it authorises those without a prompt per step.
+- **Exception:** invoking a skill is approval for what that skill declares it does. `/implement-issue`'s Phase B (`--phase implement`) is defined to push and open PRs as its own last step; `/ship-work` is defined to rebase and (as a fallback for a plan predating this convention) push/open PRs itself — never to merge. Merging always needs its own explicit, separate approval, regardless of skill. Running either authorises what it declares, without a prompt per step.
 
 Never stage with `git add -A`. Always name explicit paths. `-A` leaked live Stripe, OpenAI, and JWT secrets from this tree once already.
 
@@ -214,17 +214,18 @@ Run `./scripts/install-hooks.sh` once per fresh clone, or `--check` to verify. `
 
 ### Session Completion
 
-Work is **not complete** until `git push` succeeds. Prefer `/ship-work`, which does steps 2 through 7.
+Work is **not complete** until `git push` succeeds. Prefer `/implement-issue --phase implement`, which does steps 1 through 3, then `/ship-work`, which does steps 4 through 8.
 
 1. Run quality gates (all must pass) and QA the interaction surface
 2. Commit, organized by task, with `ENG-xxx` in the subject
-3. Get push approval, then push and open one PR per repo touched
-4. Land cross-repo work **in dependency order**: the repo whose API the other consumes merges first, and the dependent PR is rebased onto the new `dev` before its CI is trusted
-5. Verify every push and merge **by content**, not by the command's output: `git -C <repo> show origin/dev:<file>`. An amend racing a merge has silently dropped a fix here before
-6. Update Linear statuses (In Review, then Staging). Never `Done`
-7. Archive completed plans: `mkdir -p docs/plans/completed` (it does not exist yet), `git mv` the plan there, set `Status: Completed`
-8. Create Linear issues for remaining work
-9. Update docs (`CATALOG.md`, support docs) and hand off context for the next session
+3. Rebase onto fresh `dev`, then push and open one PR per repo touched
+4. Wait for CI, fixing a red check within budget
+5. Land cross-repo work **in dependency order**: the repo whose API the other consumes merges first, and the dependent PR is rebased onto the new `dev` before its CI is trusted
+6. Verify every push and merge **by content**, not by the command's output: `git -C <repo> show origin/dev:<file>`. An amend racing a merge has silently dropped a fix here before
+7. Update Linear statuses (In Review, then Staging). Never `Done`
+8. Archive completed plans: `mkdir -p docs/plans/completed` (it does not exist yet), `git mv` the plan there, set `Status: Completed`
+9. Create Linear issues for remaining work
+10. Update docs (`CATALOG.md`, support docs) and hand off context for the next session
 
 Every git command in a multi-repo session takes `git -C <abs-path>`. Root, `backend/`, `frontend/`, `assistants/`, and `observability/` are five separate repositories, and a bare `git` in the wrong cwd has caused a misdirected amend.
 

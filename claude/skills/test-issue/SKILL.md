@@ -1,6 +1,6 @@
 ---
 name: test-issue
-description: Walk the human through testing one ready-to-test issue end to end — assemble its PRs across repos, stand up the changed-vs-baseline comparison, run the e2e spec and browser QA, then hand over the merge command. Interactive only, a human's own QA session, not headless. Use when an issue's PRs are open and need verification before merge. Do NOT use to write feature code, and do NOT use to merge — that is /ship-work.
+description: Walk the human through testing one ready-to-test issue end to end — assemble its PRs across repos, stand up the changed-vs-baseline comparison, run the e2e spec and browser QA, then hand over the merge command for the human to run themselves. Interactive only, a human's own QA session, not headless. Use when an issue's PRs are open and need verification before merge. Do NOT use to write feature code, and do NOT use to merge — nothing in this pipeline merges autonomously, that's always the human's own action.
 ---
 
 # test-issue
@@ -10,8 +10,10 @@ and the mechanical checking; the human still does the judging that only a human
 can do — whether a screenshot actually looks right, whether a UX gap matters.
 
 **Not this skill's job:** writing or fixing feature code (that is `/implement-issue`,
-or a direct fix if something is broken), and merging (that is `/ship-work`). If
-testing turns up a real bug, report it and stop — do not silently patch it here.
+or a direct fix if something is broken), and merging — nothing in this pipeline
+merges autonomously; the human runs the merge command themselves once they're
+satisfied. If testing turns up a real bug, report it and stop — do not silently
+patch it here.
 
 ## Usage
 
@@ -221,6 +223,15 @@ features `/implement-issue`'s Phase B `scout` dispatch already flagged as worth
 checking, not a smoke test of the whole app, and not a list to re-derive from
 the diff yourself.
 
+**If a scenario needs CRM data that isn't in the sandbox** (an Opportunity in
+a particular stage, an Account with a particular field), don't skip the
+scenario — seed it with the `sf` CLI per
+`docs/runbooks/salesforce-sandbox-local.md`'s "Seeding QA/test data via the
+Salesforce CLI" section. Query-then-create (reuse a fixture that's already
+there), name it `ZZ-TEST ENG-<id> - <slug>`, and force a sync so it actually
+reaches the app before you go looking for it in the UI. Note what you created
+in your report (step 6) — step 7's hand-off reminds you to delete it.
+
 ### 5. Run the issue's e2e spec, if one exists
 
 Check whether the root PR touched `tests/e2e/tests/**`. If it did:
@@ -267,10 +278,20 @@ Print the exact command for the human to run next:
 /ship-work <plan path>
 ```
 
+That confirms the PR(s) are rebased onto the latest `dev` and locally
+gate-clean — it does not wait on CI or merge. Once CI is green on GitHub, the
+human merges it themselves (GitHub UI or `gh pr merge`).
+
 If step 1 found drift against `dev`/`main` or a conflict in the merge-tree probe,
-say so again here and point at `/ship-work` to resolve it (it rebases properly and
-waits on CI) — never propose a manual rebase from this skill.
+say so again here and point at `/ship-work` to resolve it (it rebases properly)
+— never propose a manual rebase from this skill.
 
 And remind them explicitly: **after the merge, close the inbox issue.** The
 pipeline does not close it, and it keeps showing up in the daily brief until
 someone does.
+
+**If step 4 seeded anything in the Salesforce sandbox, delete it now** — the
+same query-then-delete from the runbook's seeding section, scoped to that
+`ZZ-TEST ENG-<id>` prefix, children before parents. A record left behind is
+pollution in a sandbox other engineers also use; don't leave that for a
+later run to notice.

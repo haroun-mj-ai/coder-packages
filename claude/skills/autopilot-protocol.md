@@ -132,7 +132,11 @@ Exact shape, every key present on every write:
 - `phase`: which of the three skills wrote this file.
 - `plan_path`: absolute path to the committed plan file, or `null` if none
   exists yet (e.g. a `FAILED` run that never reached the write).
-- `pr_urls`: `[]` unless `phase: ship` succeeded; then the opened PR URL(s).
+- `pr_urls`: `[]` until the PR(s) exist. Normally populated on `phase:
+  implement`'s `DONE` — `/implement-issue`'s Phase B step 13 pushes and opens
+  them as its own last step. `phase: ship`'s `DONE` also fills this (whether
+  confirming what implement already opened, or — the fallback path, a plan
+  predating this convention — having opened them itself).
 - `question`: the exact question posted to the inbox on `NEEDS_HUMAN`, or
   `null` otherwise.
 - `detail`: short free text — documented-default assumptions taken, the
@@ -188,10 +192,15 @@ team-visible.
   `planning`, `plan-review`, `building`, `shipping`, `ready-to-test`,
   `needs-input`, `failed`, `ship-pending`. State machine:
   `planning → plan-review → building → shipping → ready-to-test`, with
-  `needs-input`/`failed` reachable from any state. `shipping` is the odd one
-  out: it is set by the **orchestrator** (`ap-cycle.sh`), not by a skill,
-  right before it invokes the ship phase (`building` → `shipping`) — this
-  makes it reliable even if the ship session dies before writing anything.
+  `needs-input`/`failed` reachable from any state. `building` now covers the
+  push and PR-open too — `/implement-issue`'s Phase B step 13 does both as
+  its own last step before writing `DONE` — so by the time `shipping` starts
+  the PR(s) already exist; `shipping` now covers only `/ship-work`'s own
+  rebase-and-local-gate pass, since it never waits on remote CI and never
+  merges. `shipping` is the odd one out: it is set by the
+  **orchestrator** (`ap-cycle.sh`), not by a skill, right before it invokes
+  the ship phase (`building` → `shipping`) — this makes it reliable even if
+  the ship session dies before writing anything.
   `/ship-work --headless` owns the swap out of it (`shipping` →
   `ready-to-test` on success, `shipping` → `needs-input` on a hard stop).
   Every other swap is skill-side. Swap with:
@@ -203,8 +212,9 @@ team-visible.
   fails for an external cause, see "External failures are re-queued, not
   dead-ended" below) or by a human relabelling by hand. `autopilot-poll`'s
   tier 4 claims it (`ship-pending` → `shipping`) and emits `action:ship`,
-  which the orchestrator dispatches as `/ship-work --headless --no-merge`
-  with no `/implement-issue` step first — the plan is
+  which the orchestrator dispatches as `/ship-work --headless`
+  (`ship-work` never merges regardless of flags, so there is no `--no-merge`
+  to pass anymore) with no `/implement-issue` step first — the plan is
   already committed. This `action:ship` claims the orchestrator's SHIP lane
   (its own slot pool, `AP_SHIP_SLOTS`), not the BUILD lane `implement` uses —
   see "Orchestrator guarantees" below for the port-pair mechanics, and

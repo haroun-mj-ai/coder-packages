@@ -1,14 +1,25 @@
 ---
 name: ship-work
-description: Take the code an approved plan produced and land it on dev: commit, push, open the PRs, rebase, wait for CI, fix a red check within a strict budget, then merge in dependency order and update Linear. Stops hard on human review comments, semantic conflicts, security findings, or scope creep. Use after /implement-issue's --phase implement when asked to ship, land, or open PRs for finished work. Never touches main or production.
+description: Take the branch and open PR(s) /implement-issue's --phase implement already produced, get them pushed, rebased onto the latest dev, and locally gate-clean: confirm what's already open (or, for a plan predating this convention, still commit/push/open it), rebase, run the CI-mirroring local gates, then stop and report. Never waits on remote CI and never merges — both are a separate, later human action. Stops hard on human review comments, semantic conflicts, security findings, or scope creep. Use after /implement-issue's --phase implement when asked to ship or land finished work up to the PR. Never touches main or production, and never merges to dev either.
 ---
 
 # ship-work
 
-Third and last skill in the chain: `/implement-issue` designs (`--phase plan`)
-and builds (`--phase implement`), this lands it on `dev`. It stops at `dev`.
-Anything involving `main` is a production deploy via Railway and stays a
-human decision.
+Third skill in the chain: `/implement-issue` designs (`--phase plan`), builds,
+and — as the last thing its `--phase implement` does — pushes and opens the
+PR(s); this skill confirms that landing is solid (scope, secrets, local
+gates, rebased onto the latest `dev`) and then **stops**. It does not poll
+remote CI and it does not merge. Both of those are a human's call, made
+whenever they're ready to look at the PR themselves — this skill's job ends
+at "pushed, rebased, locally green, reported."
+
+**The common starting point is already-open PRs, not uncommitted code.**
+Step 1's "detect and skip work that is already done" is not an edge case
+here — it's the normal path, since `/implement-issue`'s Phase B step 13
+already committed, rebased, pushed, and opened the PR(s) before handing off.
+Steps 4-5 (commit and push, open the PRs) stay in this skill only as a
+fallback: a plan predating this convention, or a manual/legacy invocation
+where implement never got that far.
 
 ## Usage
 
@@ -16,17 +27,19 @@ human decision.
 /ship-work                                # infer from current branch + newest plan
 /ship-work docs/plans/2026-07-31-eng-123-foo.md
 /ship-work --dry-run                      # read-only: report exactly what it would do
-/ship-work --no-merge                     # stop at green and mergeable
 ```
 
 Use `--dry-run` the first few times. It performs every read and prints the action
-plan (PRs it would open, bases, merge order) without mutating anything.
+plan (what it would push, rebase, and open) without mutating anything.
+
+There is no merge mode and no CI-wait mode — this skill never does either, so
+there is nothing to opt out of.
 
 ## Hard stops
 
-These end the run immediately. Report what landed, what did not, and the one next
+These end the run immediately. Report what's done, what isn't, and the one next
 action, then stop. **Do not proceed to the next repo**, because a partial
-cross-repo landing is the worst state to leave staging in.
+cross-repo push is still confusing to leave half-reported.
 
 1. **A human left a review comment or requested changes** on any PR. Never resolve
    another person's feedback autonomously, even if the fix looks obvious.
@@ -37,13 +50,12 @@ cross-repo landing is the worst state to leave staging in.
    rewrite history to hide it.
 4. **The diff touches files the plan never named.** Catches an implementer that
    widened scope and a stray unrelated edit in one check.
-5. Two failed fix attempts on the same red check.
-6. Anything that would touch `main`, force-push a shared branch, or merge a PR
-   whose base is not `dev` (or `main` for `assistants`/`observability`, which have
-   no `dev`).
+5. Anything that would touch `main`, force-push a shared branch other than this
+   ticket's own feature branch, or attempt to merge anything at all — merging is
+   never this skill's action, on any base, under any flag.
 
 Being stopped is a success condition for this skill. A clear halt beats a confident
-merge of something half-understood.
+push of something half-understood.
 
 ## Repo map
 
@@ -63,21 +75,21 @@ tools, never the `gh` CLI.** Pushes go over git SSH.
 
 ## What CI actually checks, per repo
 
-Knowing this is the difference between waiting for a signal and waiting forever.
+This is reference material for whoever reviews and merges the PR later — this
+skill itself never polls these checks, but reporting them accurately in the
+final summary saves the human a lookup.
 
 - **`backend/`**: `Backend CI` on `pull_request` to `dev`/`main`. Job `lint` runs
-  `ruff check` and `ruff format --check`, both `continue-on-error: true`, so **ruff
-  never gates a merge**. Job `test` runs `pytest tests/ --cov` and **does** gate.
+  `ruff check` and `ruff format --check`, both `continue-on-error: true`, so
+  ruff never gates a merge. Job `test` runs `pytest tests/ --cov` and does gate.
 - **`frontend/`**: `Frontend CI` on `pull_request`. Jobs `lint`
   (`npm run lint` plus `npx tsc --noEmit`), `test` (`npm run test:coverage`),
-  `build` (`npm run build`), `dependency-review`. **All blocking.** Note the
+  `build` (`npm run build`), `dependency-review`. All blocking. Note the
   asymmetry: a single eslint error or type error fails the frontend PR while the
   backend shrugs at hundreds of ruff errors.
-- **root**: **no PR-triggered workflows at all.** `e2e.yml` is
-  `workflow_dispatch` plus a nightly cron; `release-notify.yml` is manual. A root
-  PR will show zero checks. Do not wait for CI on it and do not report "green":
-  say plainly that root has no PR gate and that the local quality gates were the
-  only signal.
+- **root**: no PR-triggered workflows at all. `e2e.yml` is `workflow_dispatch`
+  plus a nightly cron; `release-notify.yml` is manual. A root PR will show zero
+  checks — say so plainly in the report rather than implying "green."
 - **`assistants/`, `observability/`**: no workflows at all. Same treatment.
 
 No repo has a CODEOWNERS file or a PR template, so nobody is auto-requested as a
@@ -104,11 +116,23 @@ git -C <abs-path> status -sb
 git -C <abs-path> log --oneline origin/dev..HEAD
 ```
 
-Detect and skip work that is already done. An already-merged branch, an open PR
-that exists, a commit already on `dev` (`git -C <path> branch -r --contains HEAD`)
-means resume from the next unfinished step rather than redoing it.
+Detect and skip work that is already done. **Check `docs/plans/qa/<eng-id>-qa.md`'s
+`PRs:` header first** — the normal case is that `/implement-issue`'s Phase B step 13
+already committed, rebased, pushed, and opened every PR, so that line already has
+the URLs and there is nothing to redo; jump straight to step 6 (rebase) once
+confirmed against `git -C <path> log --oneline origin/dev..HEAD` and
+`mcp__github__pull_request_read`. Fall back to discovering it yourself — an
+already-merged branch, an open PR search by branch name, a commit already on `dev`
+(`git -C <path> branch -r --contains HEAD`) — only when that line is missing or
+stale, meaning a plan predating this convention or a manual invocation.
 
 ### 2. Gate on scope, then on secrets
+
+Usually a **re-confirmation**, not a first discovery — `/implement-issue`'s Phase B
+step 13 already ran both of these right before its own push. Run them anyway; they
+are cheap, and this is the actual last checkpoint before anything leaves the
+machine. Skip only the literal re-scan when step 13's report already covers the
+exact commit still at `HEAD` (nothing has changed since).
 
 **Scope (hard stop 4).** For each repo, list the changed files and compare against
 the union of the plan's per-unit file lists:
@@ -141,7 +165,7 @@ pattern is literally written here. A hit whose only match is the regex source in
 pattern definition or a test fixture, before treating it as hard stop 3. Never
 loosen the pattern to make a hit go away.
 
-### 3. Local gates before remote gates — reuse `/implement-issue`'s (Phase B) result when it is still valid
+### 3. Local gates before pushing — reuse `/implement-issue`'s (Phase B) result when it is still valid
 
 Do not blindly re-run what the previous phase already ran. `/implement-issue`'s
 Phase B (formerly `/implement-plan`) writes a QA artifact at
@@ -193,12 +217,24 @@ unless the artifact's `Gates:` line explicitly names those as having passed
 too. If the artifact only ever records the narrower Phase B gate set,
 treat this repo's gates as unrecorded and run the full CI-mirroring set here.
 
+A real, in-diff local gate failure (not the known noise below) gets fixed here,
+in this same run, same as any other implementation defect — this step existing
+at all is what lets the rest of the skill stay CI-blind: if the local mirror is
+clean, remote CI failing on the same commit is either a real miss in the mirror
+(worth noting) or one of the non-blocking/pre-existing/flake categories below,
+not something to chase with a fix loop after the push.
+
 Known noise, which is not a reason to stop: backend endpoint tests failing in
 isolation on uninitialized Beanie, and the `test_specs_phase3`/`phase4` failures
 from `assistants/` template drift, which CI skips. Baseline against untouched
 `dev` before attributing any failure to this change.
 
-### 4. Commit and push
+### 4. Commit and push — fallback only
+
+**Skip this step entirely when step 1 already found a commit and an open PR**
+for this branch, which is the normal case now that `/implement-issue`'s Phase
+B does this itself. Run it only for a plan predating that convention, or a
+manual/legacy invocation that never reached implement's step 13.
 
 One coherent commit per work unit, or one per repo when the units are small.
 
@@ -221,10 +257,15 @@ git -C <path> diff --stat HEAD origin/<branch>    # must be empty
 An amend plus force-push around merge time has silently dropped a fix here before.
 The push command's own output is not evidence.
 
-### 5. Open the PRs
+### 5. Open the PRs — fallback only
+
+**Skip this step entirely when step 1 already found the PR(s) open** — again
+the normal case, since `/implement-issue`'s Phase B step 13 opens them as
+part of finishing implementation. Run it only in the same fallback cases as
+step 4.
 
 `mcp__github__create_pull_request`, one per repo, base per the repo map. Open all
-of them before merging any, so a reviewer can see the change as one thing.
+of them before reporting, so a reviewer can see the change as one thing.
 
 - **title** `ENG-<id>: <what changed>`
 - **body**, in this order: what changed and why (two or three lines), the work
@@ -236,18 +277,23 @@ of them before merging any, so a reviewer can see the change as one thing.
 - cross-link the sibling PRs by URL when a ticket spans repos, and state the
   required landing order in each body.
 
-**Once every PR is open, fill the QA artifact's `PRs:` line.** Edit
-`docs/plans/qa/<eng-id>-qa.md`'s header — replace `PRs: (filled in by
-ship-work)` with the opened URLs, one line, e.g. `PRs: backend
+**Only in this fallback path, once every PR is open, fill the QA artifact's
+`PRs:` line yourself.** Edit `docs/plans/qa/<eng-id>-qa.md`'s header — replace
+the placeholder with the opened URLs, one line, e.g. `PRs: backend
 <url>, frontend <url>, root <url>` — and commit that single-line change on its
 own, `ENG-<id>: record PR URLs in QA artifact`, staged with the explicit path.
-This is the **only** edit `/ship-work` makes to the artifact: everything else
-in the file (the four QA sections, the `Commit:`/`Gates:`/`Relaunch:` lines) is
-`/implement-issue`'s Phase B to write, and this skill does not second-guess or
-re-derive them. `/test-issue` later reads this same line instead of
-re-discovering PR numbers through `gh pr list`.
+In the normal path this line is already filled by `/implement-issue`'s Phase B
+step 13, and this skill never second-guesses or re-derives it — everything in
+the file (the four QA sections, the `Commit:`/`Gates:`/`Relaunch:` lines, and
+now usually `PRs:` too) is Phase B's to write. `/test-issue` reads this same
+line instead of re-discovering PR numbers through `gh pr list`.
 
 ### 6. Rebase, and keep rebasing
+
+`/implement-issue`'s Phase B step 13 already rebased once, right before its own
+push — this step is about staying current on THIS run: if you're invoked again
+later (a fixup, a sibling repo's PR having merged in the meantime, a stale
+branch), rebase again before reporting.
 
 The convention here is rebase, not merge commits into the feature branch, so do it
 locally rather than with `update_pull_request_branch` (which creates a merge
@@ -273,65 +319,37 @@ Everything else is a semantic conflict and a hard stop. When both sides changed
 the same logic, an agent guessing which intent wins is how a fix disappears
 without anyone noticing.
 
-**Re-rebase after each sibling merge.** Once the backend PR lands, the frontend PR
-is green against a `dev` that predates the new API. Rebase it onto the new `dev`
-and let CI run again before merging it.
+If a sibling repo's PR merged since the last time this ran (the human merged it
+manually), rebasing onto the fresh `dev` here is still this skill's job — it's
+the same operation regardless of who or what triggered the need for it.
 
-### 7. Wait for CI, then classify what comes back
+### 7. Report, then stop
 
-Read checks with `mcp__github__pull_request_read`, `method: "get_check_runs"` for
-the individual jobs and `method: "get_status"` for the combined state.
+This is the end of the run. Do not open a check-run poll, do not call
+`mcp__github__pull_request_read` in a loop, do not call
+`mcp__github__merge_pull_request` — none of that is this skill's job. CI runs on
+its own schedule once a PR is pushed; a human reviews it and merges (or asks for
+another `/ship-work` pass) whenever they're ready. Report:
 
-Poll at an interval matched to the job, not tightly: backend `test` takes minutes.
-Between polls, wait with `Monitor` rather than a foreground sleep. For repos with
-no PR workflows, skip this step entirely and say so.
+- every PR's URL, current base, and whether it's freshly opened or already existed
+- the local gate results from step 3 (pass/fail per repo, and which command mirrored
+  which CI job), since that's the only quality signal this run actually produced
+- any rebase performed in step 6 and how conflicts (if any) were resolved
+- for each repo, one line from **What CI actually checks** above, so the human
+  reading the report knows what to expect without a separate lookup — e.g. "root
+  has no PR-triggered CI, so there is nothing to wait for there"
+- anything a hard stop caught, if the run ended early
 
-Classify before reacting. Fixing the wrong category is how the loop burns budget:
+Once a human has actually merged the PR(s), the closeout work below — Linear,
+kata, the plan archive, worktree cleanup — still needs doing by someone, but not
+autonomously by this run of the skill. See **After a human merges** below for what
+that looks like; it's documented for reference, not executed here.
 
-- **Non-blocking.** Backend `lint` red is expected: both ruff steps are
-  `continue-on-error`, and `dev` already carries substantial ruff debt. Do not fix
-  it, do not mass-reformat, and do not report it as a failure.
-- **Pre-existing on `dev`.** Before blaming the diff, check the same job on `dev`'s
-  most recent run. If `dev` is red too, this is not yours: report it, stop, and do
-  not fix someone else's break inside this ticket.
-- **Infrastructure or known flake.** One retry, then stop. Known instance:
-  `deploy-production.yml` installs the Railway CLI by piping `install.sh` to bash,
-  which is fragile in Actions. It is also a production workflow and outside this
-  skill's scope, so it never gates a `dev` merge.
-- **A real failure inside the diff.** Hand the job log and the failing test to an
-  `implementer` (`subagent_type: "implementer"`, pinned sonnet and medium effort)
-  with the plan's spec for the affected unit. **Two attempts total, then stop.** An
-  agent grinding on a failure it does not understand is the exact token-burn
-  pattern this whole chain exists to avoid.
+## After a human merges (reference — not run by this skill)
 
-Check for human activity on every poll: `method: "get_reviews"` and
-`method: "get_review_comments"`. Any review comment or requested change is hard
-stop 1, immediately, even mid-fix.
-
-### 8. Merge, in dependency order
-
-Only when a PR is green (or has no gate), has no unresolved human comment, and is
-mergeable. Skip this step under `--no-merge`.
-
-Order comes from the plan's dependency edges, not from convenience: the repo whose
-API or schema the other consumes lands first, which in practice means backend
-before frontend. Merge one, verify, rebase the next, wait for its CI, then merge
-it.
-
-`mcp__github__merge_pull_request` with `merge_method: "merge"`, matching the
-existing history on `dev`. Never `main` as a base.
-
-**Verify each merge by content, not by the API's word:**
-
-```bash
-git -C <path> fetch origin dev --quiet
-git -C <path> show origin/dev:<a-file-the-change-touched> | grep <a-signature-line>
-```
-
-Linear status and a 200 from the merge call are both consistent with the fix
-having been dropped by a force-push that raced the merge.
-
-### 9. Close out
+This section is retained so the closeout steps aren't lost, not because this
+skill performs them. Once a PR from this ticket has actually landed on `dev`
+(verified by a human, or by a later explicit request to close the ticket out):
 
 - Linear → `Staging` for each merged repo, per `AGENTS.md` §2. Comment the PR URLs
   on the issue. **Never** set `Done`; a reviewer does that after verification.
@@ -340,26 +358,25 @@ having been dropped by a force-push that raced the merge.
   fold this into the root PR when the ticket already has one. When it does not,
   open a small root PR carrying just the archive rather than pushing straight to
   `dev`.
-- Final report: what merged and where, PR URLs, what CI actually verified per repo
-  (and where there was no gate at all), every conflict resolved automatically,
-  every fix attempt spent, and what remains for a human. If anything stopped the
-  run, lead with that.
 - Close the kata issue (`kata search "ENG-<id>" --agent` to find the ref
   `/implement-issue` created in Phase A and kept open through Phase B): `kata close <ref>
   --done --message "<what shipped>" --commit <merge-sha> --agent`, one call
   per merged repo's commit if they differ, or the root's if only one applies.
-  This is the one skill in the chain that actually closes it, since "done"
-  for a local step-ledger means merged, matching why Linear's `Staging` only
-  happens here too. If kata is unavailable or the ref can't be found, note it
-  in the final report and continue — never let it block the merge itself.
-- After a successful merge, remove the worktree and local branch for the issue in
-  every repo that merged — the same never-force rules as everywhere else in this
-  skill: `git -C <repo> worktree remove <path>` (never `--force`) then
-  `git -C <repo> branch -d <branch>` (never `-D`), and only once the branch is
-  actually merged into its base and the worktree is clean. `autopilot/bin/ap-sweep.sh`
-  (`ap sweep`) does exactly this check on a schedule for anything left behind — use
-  it (`ap sweep --yes`) instead of hand-rolling the same check for the periodic
-  cleanup case, or when cleaning up several issues' worktrees at once.
+  If kata is unavailable or the ref can't be found, note it and continue.
+- Remove the worktree and local branch for the issue in every repo that merged —
+  the same never-force rules as everywhere else: `git -C <repo> worktree remove
+  <path>` (never `--force`) then `git -C <repo> branch -d <branch>` (never `-D`),
+  and only once the branch is actually merged into its base and the worktree is
+  clean. `autopilot/bin/ap-sweep.sh` (`ap sweep`) does exactly this check on a
+  schedule for anything left behind — use it (`ap sweep --yes`) instead of
+  hand-rolling the same check for the periodic cleanup case, or when cleaning up
+  several issues' worktrees at once.
+
+If asked to perform this closeout, verify the merge by content first (`git -C
+<path> fetch origin dev --quiet && git -C <path> show origin/dev:<a-touched-file>
+| grep <a-signature-line>`) — a 200 from a merge call or a green Linear status
+are both consistent with a fix having been dropped by a race, same caution as
+ever.
 
 ## Headless mode (--headless)
 
@@ -367,80 +384,60 @@ Shared vocabulary, `status.json` shape, inbox contract, and the ask→fallback
 rule live in `.claude/skills/autopilot-protocol.md` — read it first; this
 section only states what maps to what for this skill.
 
-`--headless` **implies `--no-merge`, non-negotiable.** Step 8 (merge) is
-unreachable under `--headless` regardless of what the invocation otherwise
-says — there is no headless path into that step, even if a caller passes
-`--headless` without also passing `--no-merge`. Merging is always the human's
-interactive `/ship-work` run. (Defense in depth: the autopilot permission
-profile also denies the merge tool; this is a second, independent guarantee
-inside the skill's own text.)
+Headless and interactive are now the same shape for this skill, because
+neither one ever waits on CI or merges — there is no `--no-merge` to imply
+anymore, since merging was never in scope to begin with. The only thing
+headless mode changes is *how a stop or a success gets reported* (an inbox
+comment and `status.json` instead of a chat message).
 
 Pushing feature branches and opening PRs against `dev` **is** pre-approved
-under `--headless` — that standing authorization is precisely why this skill
-is part of the autopilot chain. Nothing else about the existing rules
-loosens: never `main`, never a direct push to `dev` itself, and the only
-force-push is the lease-guarded `git push --force-with-lease` in step 6's
-rebase, exactly as interactive.
+under `--headless`, same as interactive — but the normal headless case is
+that `/implement-issue --phase implement --headless` already did both as its
+own step 13, so steps 4-5 here are the same fallback they are interactively.
+Nothing else about the existing rules loosens: never `main`, never a direct
+push to `dev` itself, never a merge call, and the only force-push is the
+lease-guarded `git push --force-with-lease` in step 6's rebase, exactly as
+interactive.
 
-Each of the six **Hard stops** above, hit under `--headless`, ends the run as
+Each of the five **Hard stops** above, hit under `--headless`, ends the run as
 `NEEDS_HUMAN` per the protocol's ask→fallback rule: post the stop reason
 (which numbered hard stop, and the evidence — the review comment, the
-conflicting diff, the finding string, the out-of-plan file list, the second
-failed check, or the main/force-push/wrong-base attempt) as a comment on the
-inbox issue, prefixed with the line `Phase: ship` per the protocol's
-ask→fallback rule, swap its label `shipping` → `needs-input` (the wrapper
-already swapped `building` → `shipping` before invoking this phase), and
-write `status.json` with `status: NEEDS_HUMAN`, `phase: "ship"`, and
-`question` set to that same text. Also `kata meta set <ref> work.attention
-needs-human --agent` and `work.attention_msg` to the same stop reason —
-`/implement-issue`'s Phase B step 1 rule covers the mechanics; this is that same
-signal, at this phase.
+conflicting diff, the finding string, the out-of-plan file list, or the
+main/force-push/merge attempt) as a comment on the inbox issue, prefixed with
+the line `Phase: ship` per the protocol's ask→fallback rule, swap its label
+`shipping` → `needs-input` (the wrapper already swapped `building` →
+`shipping` before invoking this phase), and write `status.json` with `status:
+NEEDS_HUMAN`, `phase: "ship"`, and `question` set to that same text. Also
+`kata meta set <ref> work.attention needs-human --agent` and
+`work.attention_msg` to the same stop reason — `/implement-issue`'s Phase B
+step 1 rule covers the mechanics; this is that same signal, at this phase.
 Never continue past a hard stop headlessly — the interactive rule ("stop,
 report, do not proceed to the next repo") holds unchanged; headless mode only
-changes where the stop is reported. What the wrapper does with the process
-after this write (park it alive vs. end the run) is `autopilot-protocol.md`'s
-"Parking" section's call, not this skill's — this skill starts no dev
-servers of its own, so it has nothing to tear down before a `NEEDS_HUMAN`
-write either way.
+changes where the stop is reported.
 
-**Success end state** (all gates clear, PRs open and green or gateless, no
-merge): PR URLs are posted as a comment on the inbox issue and the inbox
-label is swapped `shipping` → `ready-to-test`. On Linear — the one write beyond the
-claim, and it is a label, not a comment — add label `agent:ready-to-test`;
-Linear status stays `In Progress`. Headless ship-work never posts a Linear
-comment, success or failure; the PR link(s) live on the inbox issue only.
-Never `Staging` headlessly (`Staging` means merged, and headless ship-work
-never merges) and never `Done` (a reviewer sets that, same as interactive).
-Write `status.json` with `status: "DONE"`, `phase: "ship"`, and `pr_urls`
-filled with every opened PR URL. Leave the kata issue **open**, `work.attention
-ok` — headless ship-work never merges, so it never reaches step 9's close
-either; that stays for whichever later interactive `/ship-work` run actually
-merges.
+**Success end state** (all local gates clear, PRs open and pushed, rebased
+current): PR URLs — normally already posted by `/implement-issue`'s own
+`Phase: implement` comment, restate them here alongside the local gate result —
+are posted as a comment on the inbox issue and the inbox label is swapped
+`shipping` → `ready-to-test`. On Linear — the one write beyond the claim, and
+it is a label, not a comment — add label `agent:ready-to-test`; Linear status
+stays `In Progress`. Headless ship-work never posts a Linear comment, success
+or failure; the PR link(s) live on the inbox issue only. Never `Staging`
+(that's the human's job once they've actually merged, per **After a human
+merges** above) and never `Done`. Write `status.json` with `status: "DONE"`,
+`phase: "ship"`, and `pr_urls` filled with every opened PR URL. Leave the kata
+issue **open**, `work.attention ok` — this phase never merges, so it never
+performs the post-merge closeout either; that stays for whichever later
+request actually merges and asks for closeout.
 
 Plan archiving (`docs/plans/` → `docs/plans/completed/`) does **not** happen
-under `--headless` — it stays exactly where step 9 leaves it today, performed
-only by the human's later interactive `/ship-work` run that actually merges.
+here — it's part of the post-merge closeout above, performed only once
+someone has actually merged and asks for it.
 
-**Never end the turn with work still in the background — this is how headless
-ship-work dies most often.** The `-p` harness ends the process when your turn
-ends: there is no later turn in which a background task's result comes back to
-you. Waiting on CI is exactly where this bites. A real run (ENG-1199,
-2026-08-12) finished its turn saying *"that worked and is running in the
-background, I'll wait for it to finish"* — the process exited, `status.json` was
-never written, and the wrapper correctly reconciled a successful push as a
-crash.
-
-So, in headless mode:
-
-- Poll CI with **blocking foreground** commands (`gh pr checks <n> --watch`, or
-  a bounded loop of `gh pr checks <n>` calls you actually wait on inside the
-  turn). Never park the wait in a background task and end your message.
-- Treat writing `status.json` as the last thing that must complete before
-  anything else is allowed to still be running. If you genuinely cannot finish
-  the wait inside the turn, write `status.json` FIRST with what you know —
-  `NEEDS_HUMAN` naming the PR and the pending check, or `FAILED` with
-  `detail: "CI wait exceeded the turn"` — so the run is reconcilable and the
-  next cycle (or the owner) can pick it up from a known state.
-- The same rule covers `roborev --wait`, long test suites, and anything else
-  you would be tempted to background: if it must run, run it in the foreground;
-  if it cannot, record state before yielding.
+**Never end the turn with required local work still in the background.** The
+`-p` harness ends the process when your turn ends: there is no later turn in
+which a background task's result comes back to you. This no longer applies to
+CI (this skill never waits on it), but it still applies to step 3's local
+gates and to anything else you'd be tempted to background inside this run:
+run it in the foreground, or record state in `status.json` before yielding if
+it genuinely cannot finish inside the turn.

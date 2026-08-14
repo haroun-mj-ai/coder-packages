@@ -1,21 +1,25 @@
 ---
 name: implement-issue
-description: Take a Linear task ID (or a free-text description, filing the ticket first) from ticket to a reviewed, tested branch in two phases separated by a hard approval gate. Phase plan: fetches every repo into fresh worktrees, classifies risk (Light/Standard/Heavy), drafts acceptance scenarios from the raw ticket in a fresh sub-agent context, drafts the plan via an Opus sub-agent, adversarially audits it with an independent fable-model sub-agent, commits the plan, and stops for approval. Phase implement: reuses that worktree (with a staleness check before touching anything), dispatches model-matched implementer sub-agents per work unit, runs a spec-vs-test audit plus a fresh-context code review with zero plan visibility, runs the real quality gates, derives the change's blast radius, QAs it in the browser, writes the durable QA artifact under docs/plans/qa/, commits, and runs roborev. Ends by recommending /ship-work; never merges, pushes, or opens a PR. Headlessly takes --phase plan or --phase implement so autopilot can run the two phases hours apart with a human's approval in between. Supersedes /plan-issue and /implement-plan as the single main path. Use when the user says "implement ENG-123", hands you a Linear id or free-text description to take from ticket to a shippable branch, or on /implement-issue. Do NOT use to ship, merge, or open a PR — that's /ship-work.
+description: Take a Linear task ID (or a free-text description, filing the ticket first) from ticket to an open PR in two phases separated by a hard approval gate. Phase plan: fetches every repo into fresh worktrees, classifies risk (Light/Standard/Heavy), drafts acceptance scenarios from the raw ticket in a fresh sub-agent context, drafts the plan via an Opus sub-agent, adversarially audits it with an independent fable-model sub-agent, commits the plan, and stops for approval. Phase implement: reuses that worktree (with a staleness check before touching anything), dispatches model-matched implementer sub-agents per work unit, runs a spec-vs-test audit plus a fresh-context code review with zero plan visibility, runs the real quality gates, derives the change's blast radius, QAs it in the browser, writes the durable QA artifact under docs/plans/qa/, commits, runs roborev, then gates on scope/secrets, rebases onto fresh dev, pushes, and opens the PR(s) — no server or Docker required, this is pure git/GitHub-API reusing gates already run. Ends by recommending /ship-work to confirm the push is rebased and locally gate-clean; never merges, and never waits on CI itself (neither skill does — CI-watching and merging are a human's later, separate call). Headlessly takes --phase plan or --phase implement so autopilot can run the two phases hours apart with a human's approval in between; --phase implement now pushes and opens PRs headlessly too. Supersedes /plan-issue and /implement-plan as the single main path. Use when the user says "implement ENG-123", hands you a Linear id or free-text description to take from ticket to an open PR, or on /implement-issue. Do NOT use to merge — nothing in this chain merges autonomously.
 ---
 
 # implement-issue
 
 Two phases, one hard approval gate between them: **plan** produces a
-reviewed, committed plan and stops; **implement** builds it, tests it, and
-hands off to `/ship-work`. Interactively these flow in one session
-(`ExitPlanMode`'s approval leads straight into implementation). Headlessly
-they are two separate invocations, `--phase plan` and `--phase implement`,
-because a `claude -p` process cannot synchronously block for hours waiting on
-a human's `go` comment — see Headless mode below.
+reviewed, committed plan and stops; **implement** builds it, tests it,
+pushes it, and opens the PR(s), then hands off to `/ship-work` to confirm
+the push is rebased onto the latest `dev` and locally gate-clean.
+Interactively these flow in one session (`ExitPlanMode`'s approval leads
+straight into implementation). Headlessly they are two separate invocations,
+`--phase plan` and `--phase implement`, because a `claude -p` process cannot
+synchronously block for hours waiting on a human's `go` comment — see
+Headless mode below.
 
 This skill supersedes `/plan-issue` and `/implement-plan`, which are now
-retired stubs pointing here. It never pushes, opens a PR, or merges — that
-is entirely `/ship-work`'s job, unchanged.
+retired stubs pointing here. It pushes and opens the PR(s) once the change is
+built, tested, and reviewed — but it never merges, and neither does
+`/ship-work`. Watching remote CI and merging are always a human's own,
+separate action, on their own timeline.
 
 ## Usage
 
@@ -140,6 +144,17 @@ behavior rather than silently planning against a ticket that doesn't exist.
 
 Then check what already exists: `ls docs/plans/ docs/plans/completed/ 2>/dev/null | grep -i <keyword>`,
 and skim `docs/guides/architecture/features/CATALOG.md` for the feature area.
+
+**Suggest a session rename, interactive only** — once the ticket's title is
+known, print a `/rename <three words max>` line the human can copy-paste
+(e.g. `/rename crm-sync-fix`, `/rename mfa-login-retry`). Pick the three
+words from the ticket's title/id, whatever gives the most context in the
+least space. **This cannot be done automatically**: `/rename` is a
+client-side REPL command Claude Code intercepts from the human's own typed
+input before it ever reaches the model — nothing a skill's instructions
+cause the agent to output can invoke it, and there is no other API, hook, or
+settings key that renames a running session or its terminal tab. Skip this
+in headless mode entirely (`claude -p` has no session picker or tab to name).
 
 ### 2. Classify the risk tier
 
@@ -322,8 +337,10 @@ Interactive path (headless equivalent in Headless mode below):
 - A **BLOCKING** question only the requester can answer goes in that same
   comment, addressed `@displayName`, not just surfaced in chat.
 - **Mirror into kata**, a **local** step-ledger `--phase implement` resumes
-  and `/ship-work` eventually closes with evidence — Linear stays the source
-  of truth for the ticket, kata just survives a session dying mid-build.
+  and a human eventually closes with evidence once the PR(s) are actually
+  merged (see `/ship-work`'s "After a human merges" reference) — Linear
+  stays the source of truth for the ticket, kata just survives a session
+  dying mid-build.
   Skip under `--no-issue` unless asked to track anyway.
   - `kata search "ENG-<id>" --agent` first — a `--feedback` re-plan may
     already have one. Reuse it.
@@ -516,17 +533,25 @@ two-phase split exists to prevent.
 ### 5. Quality gates, run from this session
 
 ```bash
-cd frontend && npm run build && npm run test:run    # TS check + build, unit tests
-cd backend  && poetry run pytest
-cd tests/e2e && npx playwright test                 # only if e2e specs changed
+cd frontend && npm run build && npm run test:run                     # TS check + build, unit tests
+cd backend  && poetry run pytest <paths touched or exercising them>   # scoped, not the whole repo
+cd tests/e2e && npx playwright test                                  # only if e2e specs changed
 ```
 
-Report **verbatim output**, never predict a result. **Light tier**: skip the
-full Playwright suite unless the ticket specifically needs running services;
-scoped unit tests + `npm run build`/`poetry run pytest` on affected modules
-is enough. Known noise, baseline against untouched `dev` before attributing
-either to this change: some backend endpoint tests fail in isolation with a
-pydantic `AttributeError: id` (Beanie never initialized); ~2 dozen
+Report **verbatim output**, never predict a result. Running the entire
+`poetry run pytest` with no path argument is not required — scope it to the
+directories/files each work unit actually touched or that exercise the
+changed behavior (mirroring what each unit's own `Done when` already ran),
+same as the Light-tier carve-out already did. A full-repo run is slow and
+was never the thing that caught real regressions in practice — the
+per-unit scoped runs plus the spec-auditor/code-review/blast-radius passes
+below are what carry that weight. If a broader sweep is genuinely wanted
+(e.g. suspicion that unrelated tests regressed), scope it to the touched
+top-level package(s), not the unscoped whole-repo invocation. Skip the full
+Playwright suite unless the ticket specifically needs running services.
+Known noise, baseline against untouched `dev` before attributing either to
+this change: some backend endpoint tests fail in isolation with a pydantic
+`AttributeError: id` (Beanie never initialized); ~2 dozen
 `test_specs_phase3`/`phase4` failures are `assistants/` template drift,
 skipped in CI. `ruff` is not blocking; match neighbours, add no new errors,
 don't mass-reformat.
@@ -623,6 +648,18 @@ For backend-only changes there's no browser, but the surface is the same:
 exercise the other call sites scout found, tenancy/permission cases
 included, against the local API.
 
+**If a scenario needs CRM data that doesn't exist in the sandbox**, seed it
+with the Salesforce CLI (`sf`) rather than skipping the scenario or writing
+around it — see `docs/runbooks/salesforce-sandbox-local.md`'s "Seeding
+QA/test data via the Salesforce CLI" section for the exact commands. Every
+seeded record's `Name` starts with `ZZ-TEST ENG-<id>` and is owned by the
+already-connected sandbox user; record each created Id in this step's notes
+(step 12 deletes them again). Query-then-create — never create a record this
+step already confirmed exists. This is safe unsupervised because create and
+delete are both scoped to that one prefix; it is still real state in a
+sandbox other engineers use, so seed only what the scenario actually needs,
+nothing extra "while you're in there."
+
 ### 9. Write the QA plan as a durable artifact
 
 Write to `<root-worktree>/docs/plans/qa/<eng-id>-qa.md` (create the `qa/`
@@ -633,9 +670,39 @@ order and keys:
 Issue: ENG-<id>
 Commit: <the SHA step 5's gates were run against, one per touched repo, e.g. "backend abc1234, frontend def5678">
 Gates: <verbatim pass/fail summary per gate command, e.g. "frontend build+test:run PASS, backend pytest PASS">
+UI: <the URL to open in a browser to see this change, with its port — e.g. "changed http://localhost:5175 (api :8001) | baseline http://localhost:5173 (api :8000)". "none — <reason>" if there is genuinely no UI surface.>
 Relaunch: <exact commands to bring the changed pair up on demand — worktree paths, ports, the .env.local copy, the node_modules symlink, and the 5173-5176 CORS window caveat>
-PRs: (filled in by ship-work)
+E2E: <exact command to run this issue's e2e spec against the changed pair's ports, e.g. "cd tests/e2e && E2E_BASE_URL=http://localhost:5175 E2E_API_URL=http://localhost:8001/api/v1 npx playwright test tests/cockpit/cockpit-eng1234-foo.spec.ts --project=chromium". "none — <reason>" if no e2e spec covers this change.>
+PRs: (filled in once opened, by step 13)
 ```
+
+**`UI:` is mandatory on every artifact, at every tier, with no exceptions.**
+It exists so the human can open the change in a browser without reading the
+rest of the file or reconstructing a command — a bare URL they can click,
+plus the port, plus which API port that frontend is pointed at (the frontend's
+own `.env` decides this, and it is routinely NOT 8000 — check it rather than
+assuming). State the **baseline** URL alongside the changed one whenever both
+are meaningful, since the entire point is comparing them.
+
+Write `UI:` even when this run left no server running — it names where the
+change *will* be once `Relaunch:` is run, and the two are read together. For a
+change with no UI surface at all (backend-only, a migration, tooling), write
+`none — <one-line reason>` rather than omitting the key: an absent key reads as
+an oversight, and a reader cannot tell "no UI" from "forgot to say."
+Never write a port here that this run did not actually verify serves the
+changed code — confirm with `ss -ltnp` and by loading the page, because a URL
+that silently serves the *baseline* checkout produces a QA pass that proves
+nothing (the worktree/`5173` trap in step 2).
+
+**`E2E:` is mandatory too, same rule as `UI:`.** Check whether the root PR's
+diff touches `tests/e2e/tests/**` (a new or updated spec for this issue) —
+if it does, write the exact runnable command, `E2E_BASE_URL`/`E2E_API_URL`
+pointed at the changed pair's actual ports (from `Relaunch:`), not the
+baseline's. This is what turns the human's own pass into a copy-paste
+instead of a rediscovery of `tests/e2e/.env.e2e.example`'s two variables.
+If this change has no e2e spec — most Light tickets, and any change that
+isn't `frontend/`-facing — write `none — <reason>` (e.g. "none — no e2e
+spec covers this surface" or "none — backend-only change").
 
 Below the header, the same four sections, **by exact heading** (`ship-work`
 and `test-issue` both parse these verbatim):
@@ -671,8 +738,11 @@ verbatim test/build output; screenshots if any; the QA plan; anything not
 implemented and precisely why (scaling down is the human's call).
 
 Do **not** ask approval to commit or run roborev — both stay on this
-machine and are trivially reversible. What still needs explicit approval:
-pushing, opening a PR, merging, Linear writes — all `/ship-work`'s.
+machine and are trivially reversible. Do **not** ask approval to push or open
+the PR(s) either (step 13, coming next) — invoking this skill already
+authorizes what it declares, per `AGENTS.md`'s Permission section. What still
+needs explicit approval: merging (never done by anything in this chain — a
+human's own separate action) and Linear writes.
 
 ### 11. Commit, then review
 
@@ -710,31 +780,138 @@ relaunch recipe** (worktree paths, ports, the `.env.local` copy, the
 chat. `/test-issue` starts the changed pair later, on demand, from that same
 header.
 
-### 13. Hand off to `/ship-work`, and do not push
+**Also delete anything step 8 seeded in the Salesforce sandbox** — the
+`ZZ-TEST ENG-<id>` query-then-delete from the runbook's seeding section,
+same prefix, one pass per object type seeded (children before parents). A
+sandbox record left behind is not this run's process to clean up later; if
+the query matches zero rows, that's fine and expected — nothing was seeded,
+or a fixture the human seeded by hand outside the prefix was correctly left
+alone.
 
-This phase ends at a committed, roborev-reviewed branch and **stops there**.
+### 13. Push and open the PR(s) — no server, no Docker
 
-**Never push, never open/update a PR, never merge, never archive the plan,
-never move the Linear status** — not even when the branch looks obviously
-ready. Everything past the commit belongs to `/ship-work`, which owns
-rebasing onto fresh `dev`, waiting on real CI, the fix budget, landing PRs in
-dependency order. **This explicitly replaces Bechir's original
-`implement-linear-task.md` steps that locally merged into `dev` and then
-dockerized/e2e'd against that merge — those are dropped entirely, not
-adapted.** `ship-work` remains the only thing that pushes, opens PRs, or
-merges, exactly as it does today.
+Pure git and GitHub-API from here: rebase, push, open a PR. Nothing needs to
+be running locally to do this — no dev server, no database, no
+`dockerize-local`. Whatever step 5's gates and step 8's QA already proved
+stands; this step re-runs none of it, it only ships what already passed.
+
+**Gate on scope, then on secrets first** — the same two checks `/ship-work`
+used to run right before its own push, moved here since this is now the step
+that pushes. Either one failing is a stop-and-report (interactive) /
+`NEEDS_HUMAN` (headless) — never push past it:
+
+- **Scope.** Per repo, `git -C <path> diff --name-only origin/dev...HEAD` and
+  `git -C <path> status --porcelain`, compared against the union of the
+  plan's per-unit file lists. A file outside the plan — an implementer that
+  widened scope, or a stray unrelated edit — stops here and gets reported
+  individually. Test files the plan implied but didn't name by exact path are
+  fine; new source files it never mentioned are not.
+- **Secrets.** Before anything leaves the machine:
+  ```bash
+  git -C <path> diff --cached -U0 | grep -nE \
+    'sk-[A-Za-z0-9]{16,}|sk_live_|rk_live_|AKIA[0-9A-Z]{16}|xox[baprs]-|ghp_[A-Za-z0-9]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+  ```
+  Any hit stops the run — except a hit whose only match is this regex's own
+  source text in a `.claude/` doc; never loosen the pattern to make that go
+  away.
+
+**Rebase onto fresh `dev` once, per repo, before pushing** — a plan approved
+earlier sits on an earlier `dev`:
+
+```bash
+git -C <path> fetch origin dev --quiet   # main for assistants/observability
+git -C <path> rebase origin/dev
+```
+
+Resolve deterministically or stop, the same three classes `/ship-work`
+allows and nothing else: lockfiles (`package-lock.json`, `poetry.lock` — take
+theirs, regenerate with the real tool), import-ordering/formatter-only
+churn, append-only list files where both sides added a distinct line.
+Anything else is a semantic conflict — stop, name the files, do not guess
+which intent wins. This is the only rebase this phase does; re-rebasing
+after a sibling PR merges is `/ship-work`'s job (its own step 6), tied to the
+merge-ordering it alone performs.
+
+**Push, and verify by content, not by the command's output:**
+
+```bash
+git -C <path> push -u origin <branch>
+git -C <path> fetch origin <branch> --quiet
+git -C <path> diff --stat HEAD origin/<branch>    # must be empty
+```
+
+**Open one PR per repo**, `mcp__github__create_pull_request`, base per repo
+(`dev`; `main` for `assistants/`/`observability/`):
+
+- title `ENG-<id>: <what changed>`
+- body, in this order: what changed and why (two or three lines), the work
+  units it covers, verbatim test evidence, the QA plan, a link/path to the
+  plan doc, screenshots from browser QA
+- **`Part of ENG-<id>`** in the body — never `Fixes`/`Closes`/`Resolves`
+  (those auto-close the Linear-linked issue; only a reviewer marks it `Done`)
+- cross-link sibling PRs by URL when the ticket spans repos, and state the
+  required landing order in each body — the human merging reads this to
+  decide the order, since neither this skill nor `/ship-work` merges
+
+**Fill the QA artifact's `PRs:` line** once every PR is open — edit
+`docs/plans/qa/<eng-id>-qa.md`'s header, replace the placeholder with the
+opened URLs (`PRs: backend <url>, frontend <url>, root <url>`), commit that
+one-line edit on its own: `ENG-<id>: record PR URLs in QA artifact`.
+
+**Never wait for CI, never merge here** — neither this step nor `/ship-work`'s
+own next pass ever does either; both stop at a pushed, rebased, locally
+gate-clean PR and leave CI-watching and merging to the human.
+
+### 14. Hand off to `/ship-work` to confirm the push is solid
+
+This phase ends at a pushed branch with an open, roborev-reviewed PR (or
+PRs), and **stops there**.
+
+**Never merge, never archive the plan, never move the Linear status** — not
+even when every check is obviously green. None of that happens in this
+chain at all: merging, and everything that follows a merge (Linear
+`Staging`, the plan archive, kata close, worktree cleanup), is a human's own
+separate action once they've reviewed and merged the PR(s) themselves,
+documented as reference in `/ship-work`'s "After a human merges" section.
+**This explicitly replaces Bechir's original `implement-linear-task.md` steps
+that locally merged into `dev` and then dockerized/e2e'd against that merge —
+those are dropped entirely, not adapted.** `/ship-work` keeps the ability to
+push/open a PR itself as a fallback for a plan predating this convention or a
+manual invocation, but the normal path is that step 13 already did it — and
+in neither path does it merge.
 
 **Leave the kata issue open, `work.attention ok`** — do not close it.
-Closing with evidence is `/ship-work`'s call (its own step 9), once the code
-is actually merged.
+Closing with evidence happens once a human has actually merged the code and
+asks for the closeout, per `/ship-work`'s reference section for that.
 
-End every run by recommending the next command, plan path filled in:
+End every run by handing the human their own pre-ship QA pass, not just a
+merge command — the goal is that running through it themselves is what
+earns the confidence to push into staging, not the agent's say-so alone:
 
-> Implementation is committed on `<branch>` in `<repos>` and roborev is
-> clean. QA artifact: `docs/plans/qa/<eng-id>-qa.md` (commit `<sha>`, gates
-> `<pass/fail>`). No servers were left running — the relaunch commands are
-> in the artifact's `Relaunch:` header. Nothing has been pushed. Run
-> `/ship-work docs/plans/<plan>.md` to open the PRs and land it on `dev`.
+> Implementation is committed on `<branch>` in `<repos>`, roborev is clean,
+> and the PR(s) are open: `<urls>`.
+>
+> **To verify it yourself before shipping:**
+> 1. Frontend (linked to its own backend): `<changed URL with port>` (baseline
+>    `<baseline URL with port>` for comparison) — servers are
+>    `<running | stopped; relaunch with the artifact's Relaunch: header>`.
+> 2. QA doc, walk it scenario by scenario: `docs/plans/qa/<eng-id>-qa.md`
+>    (commit `<sha>`, gates `<pass/fail>`) — check off **Verified here**,
+>    **Needs a human**, **Interaction cases**, and **Edge cases** as you go.
+> 3. E2E, if this issue has a spec: `<E2E: command from the artifact>`
+>    (`none — <reason>` otherwise).
+>
+> Once you've run the scenarios and they hold up, run
+> `/ship-work docs/plans/<plan>.md` to confirm it's rebased onto the latest
+> `dev` and locally gate-clean, then merge it yourself once CI is green.
+
+**Always include all three lines verbatim from the artifact's `UI:`,
+`Relaunch:`, and `E2E:` headers** (`none — <reason>` for either of the
+latter two when there's genuinely nothing to run). The human reads this
+message far more often than the artifact, and "where do I click, what do I
+click through, and how do I run the e2e spec" are the three follow-up
+questions that otherwise get asked every time — answering all three
+unprompted, with ports already filled in, is worth the extra lines.
 
 Say it even when the run stopped early, adjusted for what's left.
 
@@ -859,6 +1036,16 @@ bound.
 `NEEDS_HUMAN`, the finding posted verbatim as `question`. The plan is never
 amended headlessly.
 
+**Step 13's stop conditions** — no documented default for either, so both
+resolve via the ask→fallback rule's `NEEDS_HUMAN` branch, never a silent
+skip:
+
+- **Out-of-plan file** (the scope gate) — `NEEDS_HUMAN`, the file list quoted
+  in `question`.
+- **Secret-shaped string hit, or a semantic rebase conflict** — `NEEDS_HUMAN`,
+  the finding (or the conflicting file list) quoted in `question`. Never push
+  past either.
+
 **Server policy** (step 12): run the full QA including the baseline
 comparison, exactly as interactive — headless QA is not lighter QA. Stop the
 changed-pair servers this run started; the baseline pair is never something
@@ -876,15 +1063,20 @@ allowlist — omitting it reproduces the same broken-page failure for a
 different port range).
 
 **End state:** commit exactly as interactive (step 11), run `roborev`
-exactly as interactive. Write `status.json` with `status: DONE`, `phase:
-"implement"`, `plan_path` set, `detail` = the QA artifact's absolute path.
-Do **not** change the inbox label — it stays `building`; the ship phase in
-the same cycle owns the next transition. Roborev findings never block a
-`DONE` write — record in `detail`.
+exactly as interactive, then run step 13 exactly as interactive — gate on
+scope/secrets, rebase, push, open the PR(s), fill and commit the QA
+artifact's `PRs:` line. Write `status.json` with `status: DONE`, `phase:
+"implement"`, `plan_path` set, `pr_urls` filled with every opened PR URL,
+`detail` = the QA artifact's absolute path. Post the PR URL(s) as part of
+the same `Phase: implement` inbox comment step 9 already writes. Do **not**
+change the inbox label — it stays `building`; the wrapper swaps it to
+`shipping` right after seeing this `DONE`, before invoking the ship phase.
+Roborev findings never block a `DONE` write — record in `detail`.
 
-**The push rule is unchanged** — "never push, never open/update a PR, never
-merge, never move Linear status" applies identically headlessly. Pushing and
-PRs belong to `/ship-work`, headless or not.
+**Pushing and opening PRs is pre-approved headlessly** — step 13 runs
+exactly as interactive, no different gate. Merging is never autonomous:
+"never merge, never move Linear status beyond the claim" applies identically
+headlessly, and stays entirely `/ship-work`'s job.
 
 **Never end the turn with work still in the background.** The headless `-p`
 harness kills the session outright once its background-wait ceiling passes —

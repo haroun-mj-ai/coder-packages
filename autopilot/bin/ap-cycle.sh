@@ -1314,28 +1314,31 @@ case "$action" in
     run_claude "implement" "/implement-issue --phase implement $plan_path --headless --ports fe=$fe_port,be=$be_port"
     if [[ "$final_status" == "DONE" ]]; then
       # The wrapper, not the skill, owns this swap and its ping -- reliable
-      # even if the ship session dies before writing anything. `shipping` is
-      # held only for the duration of this phase (push, PR, CI wait), so the
-      # owner can tell "still building" apart from "opening the PR" instead
-      # of the inbox going silently quiet between building and ready-to-test.
+      # even if the ship session dies before writing anything. Implement's
+      # own last step (Phase B step 13) already pushed and opened the PR(s)
+      # before writing this DONE, so `shipping` now covers only the CI wait
+      # and merge prep, not the push/PR-open -- the owner can still tell
+      # "still building" apart from "PR open, waiting on CI" instead of the
+      # inbox going silently quiet between building and ready-to-test.
       if [[ -n "$inbox_issue" && "$inbox_issue" != "null" ]]; then
         gh issue edit "$inbox_issue" --repo "$AP_INBOX_REPO" \
           --add-label shipping --remove-label building \
           >>"$AP_HOME/logs/cycle.log" 2>&1 || true
-        ap-notify.sh "shipping: ${issue:-$action}" "implement done, opening the PR" \
+        ap-notify.sh "shipping: ${issue:-$action}" "implement done, PR open, waiting on CI" \
           "https://github.com/$AP_INBOX_REPO/issues/$inbox_issue" || true
       fi
-      run_claude "ship" "/ship-work $plan_path --headless --no-merge --ports fe=$fe_port,be=$be_port"
+      run_claude "ship" "/ship-work $plan_path --headless --ports fe=$fe_port,be=$be_port"
     fi
     ;;
   ship)
-    # A ship-only retry (Change 2): implement already committed, ship still
-    # owed -- either a prior ship phase failed externally and got re-queued
-    # to `ship-pending` (Change 1), or a human relabelled by hand. The poll
-    # skill already swapped ship-pending -> shipping before emitting this
-    # action, so there's no wrapper-side label swap to do here (unlike the
-    # implement->ship chain above, which swaps building -> shipping itself).
-    run_claude "ship" "/ship-work $plan_path --headless --no-merge --ports fe=$fe_port,be=$be_port"
+    # A ship-only retry (Change 2): implement already committed, pushed, and
+    # opened the PR(s), ship still owed -- either a prior ship phase failed
+    # externally and got re-queued to `ship-pending` (Change 1), or a human
+    # relabelled by hand. The poll skill already swapped ship-pending ->
+    # shipping before emitting this action, so there's no wrapper-side label
+    # swap to do here (unlike the implement->ship chain above, which swaps
+    # building -> shipping itself).
+    run_claude "ship" "/ship-work $plan_path --headless --ports fe=$fe_port,be=$be_port"
     ;;
   *)
     log "poll: unknown action '$action'"

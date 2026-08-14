@@ -103,7 +103,9 @@ actually go anywhere; unconfigured, `ap-notify.sh` just logs to
    changed-pair servers and leaves only your baseline (5173/8000) bound. The
    inbox label swaps `building` → `shipping` the moment `ship-work` starts
    (with its own ping), so you can tell "still building" apart from "opening
-   the PR" — then `ship-work` opens a PR with `--no-merge`. You get a "ready
+   the PR" — then `ship-work` confirms the PR is rebased and locally
+   gate-clean (it never merges, headless or interactive — that's permanently
+   out of scope for this whole pipeline). You get a "ready
    to test" ping with the PR link and the exact relaunch commands (worktree
    paths, ports) — also posted on the inbox issue. Headless autopilot never
    comments on Linear: the claim and the `agent:ready-to-test` label are its
@@ -111,8 +113,11 @@ actually go anywhere; unconfigured, `ap-notify.sh` just logs to
    commands) lands in the private inbox issue.
 5. **Morning:** run the relaunch commands from the inbox issue, test against
    the running servers, then run the interactive `/ship-work` yourself to
-   merge (autonomous merging is permanently out of scope) — it also archives
-   the plan under `docs/plans/completed/`.
+   reconfirm it's rebased and clean, and once CI is green, merge it yourself
+   (GitHub UI or `gh pr merge` — autonomous merging is permanently out of
+   scope). Archiving the plan under `docs/plans/completed/` and the rest of
+   closeout (Linear `Staging`, kata close, worktree removal) happens after
+   that merge, per `/ship-work`'s "After a human merges" reference.
 
 A daily brief (`ap-brief.sh`, 07:00 `AP_TZ` by default) pings a digest of
 what's awaiting approval, ready to test, needs input, or failed, plus cost vs
@@ -151,7 +156,8 @@ inbox label `ship-pending` means "implement committed, ship still owed" —
 set by the orchestrator when a ship phase fails for an external cause (see
 "Two consecutive failures" below), or reachable by relabelling an issue by
 hand. The next cycle claims it (`ship-pending` → `shipping`) and dispatches
-`/ship-work --headless --no-merge` directly, with no plan or implement step
+`/ship-work --headless` directly (there is no `--no-merge` flag anymore —
+`ship-work` never merges, so nothing needs disabling), with no plan or implement step
 first. It claims its own **ship lane** slot (`AP_SHIP_SLOTS`, default `3`) —
 deliberately *not* a build slot: a standalone ship is almost pure CI-wait, so
 it must never queue behind a busy build lane. This is distinct from the ship

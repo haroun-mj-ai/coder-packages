@@ -191,9 +191,10 @@ else
 
 # Global auto-approve: skip waiting for a "go" comment on EVERY plan-review
 # issue and build as soon as the plan lands (still never merges -- ship-work
-# always runs --no-merge). Never applies to a needs-input stop (a blocking
-# question always waits for you). Prefer the per-issue `auto` label or an
-# `auto` comment on one delegation instead of turning this on globally.
+# never merges at all, regardless of flags). Never applies to a needs-input
+# stop (a blocking question always waits for you). Prefer the per-issue
+# `auto` label or an `auto` comment on one delegation instead of turning this
+# on globally.
 # AP_AUTO_APPROVE=0
 
 # Concurrent build slots -- how many implement->ship chains can run at once.

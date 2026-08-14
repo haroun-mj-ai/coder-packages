@@ -433,14 +433,14 @@ case "$final_status" in
       gh issue edit "$inbox_issue" --repo "$AP_INBOX_REPO" \
         --add-label shipping --remove-label building \
         >>"$AP_HOME/logs/cycle.log" 2>&1 || true
-      ap-notify.sh "shipping: ${issue:-ENG-$inbox_issue}" "implement done, opening the PR" "$inbox_url" || true
+      ap-notify.sh "shipping: ${issue:-ENG-$inbox_issue}" "implement done, PR open, waiting on CI" "$inbox_url" || true
       teardown_window "$window"
       ship_window="act_build_${acquired_lock_file##*.}_${issue:-unknown}_ship"
       if window_alive "$ship_window"; then
         log "ship window $ship_window already exists -- refusing to dispatch a duplicate chained ship"
       else
         launch_window_and_wait "$ship_window" \
-          "/ship-work $plan_path --headless --no-merge --ports fe=$fe_port,be=$be_port --run-dir $run_dir" \
+          "/ship-work $plan_path --headless --ports fe=$fe_port,be=$be_port --run-dir $run_dir" \
           "${AP_SHIP_MODEL:-sonnet}" "${issue:-}" ship
         log "chained ship in $ship_window finished with status=$final_status"
         case "$final_status" in

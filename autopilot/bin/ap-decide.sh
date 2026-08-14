@@ -18,8 +18,8 @@
 #   --claim         decide, perform the claiming label swaps, then print.
 #   --busy <lanes>  comma-separated subset of build,ship,plan to skip.
 #
-# No Linear write happens here -- see claude/skills/plan-issue/SKILL.md's
-# headless section for where that claim now lives.
+# No Linear write happens here -- see claude/skills/implement-issue/SKILL.md's
+# headless section (--phase plan) for where that claim now lives.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"

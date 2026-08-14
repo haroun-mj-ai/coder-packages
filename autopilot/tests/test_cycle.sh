@@ -67,8 +67,8 @@ fi
 prompt="$2"
 phase="unknown"
 case "$prompt" in
-  *plan-issue*) phase="plan" ;;
-  *implement-plan*) phase="implement" ;;
+  *"--phase plan"*) phase="plan" ;;
+  *"--phase implement"*) phase="implement" ;;
   *ship-work*) phase="ship" ;;
 esac
 [[ "$prompt" == *--feedback* ]] && phase="replan"
@@ -358,14 +358,14 @@ if [[ -f "$act_args" ]]; then
   assert "case4: act call settings path is absolute autopilot.json" bash -c "grep -q '/autopilot/settings/autopilot.json$' '$act_args'"
   assert "case4: act call prompt has --headless" bash -c "grep -q -- '--headless' '$act_args'"
   assert "case4: act call prompt has --run-dir with the run path" bash -c "grep -q -- '--run-dir /' '$act_args'"
-  assert "case4: act call prompt targets plan-issue ENG-4" bash -c "grep -q 'plan-issue ENG-4' '$act_args'"
+  assert "case4: act call prompt targets implement-issue --phase plan ENG-4" bash -c "grep -q 'implement-issue --phase plan ENG-4' '$act_args'"
   assert "case4: plan DONE pings the owner (plan ready for review)" bash -c \
     "grep -rl 'plan ready for review' '$CASE_STUB_DIR/notify_calls' >/dev/null"
 else
   fail "case4: act call has --settings (no 2.args file)"
   fail "case4: act call settings path is absolute autopilot.json"
   fail "case4: act call prompt has --headless"
-  fail "case4: act call prompt targets plan-issue ENG-4"
+  fail "case4: act call prompt targets implement-issue --phase plan ENG-4"
 fi
 
 # =============================================================================
@@ -926,7 +926,7 @@ assert "laneB(i): poll invoked with --busy-lanes build" bash -c \
   "[ -f '$poll_args' ] && grep -q -- '--busy-lanes build' '$poll_args'"
 act_args="$CASE_STUB_DIR/claude_calls/2.args"
 assert "laneB(i): plan act proceeded (plan lane free)" bash -c \
-  "[ -f '$act_args' ] && grep -q 'plan-issue ENG-2001' '$act_args'"
+  "[ -f '$act_args' ] && grep -q 'implement-issue --phase plan ENG-2001' '$act_args'"
 unset AP_TEST_GH_ISSUES_ALL_OPEN
 
 # --- (ii) plan lane held + go-approval present -> implement proceeds with
@@ -945,7 +945,7 @@ assert "laneB(ii): poll invoked with --busy-lanes plan" bash -c \
   "[ -f '$poll_args' ] && grep -q -- '--busy-lanes plan' '$poll_args'"
 act_args="$CASE_STUB_DIR/claude_calls/2.args"
 assert "laneB(ii): implement act proceeded (build lane free)" bash -c \
-  "[ -f '$act_args' ] && grep -q 'implement-plan' '$act_args'"
+  "[ -f '$act_args' ] && grep -q -- '--phase implement' '$act_args'"
 unset AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_COMMENT_2002
 
 # --- (iii) BOTH lanes held -> no claude call at all (not even the poll).
@@ -1009,7 +1009,7 @@ assert "autoC(a): poll invoked with --auto-approve" bash -c \
   "[ -f '$poll_args' ] && grep -q -- '--auto-approve' '$poll_args'"
 act_args="$CASE_STUB_DIR/claude_calls/2.args"
 assert "autoC(a): implement act proceeded (auto-approved, no 'go' needed)" bash -c \
-  "[ -f '$act_args' ] && grep -q 'implement-plan' '$act_args'"
+  "[ -f '$act_args' ] && grep -q -- '--phase implement' '$act_args'"
 unset AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_COMMENT_3001
 
 # --- (b) same, but a FRESH owner comment that is feedback (not go/auto) ->
@@ -1025,7 +1025,7 @@ act_args="$CASE_STUB_DIR/claude_calls/2.args"
 assert "autoC(b): replan act proceeded (feedback wins over auto-approve)" bash -c \
   "[ -f '$act_args' ] && grep -q -- '--feedback' '$act_args'"
 assert "autoC(b): NOT implement" bash -c \
-  "[ -f '$act_args' ] && ! grep -q 'implement-plan' '$act_args'"
+  "[ -f '$act_args' ] && ! grep -q -- '--phase implement' '$act_args'"
 unset AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_COMMENT_3002
 
 # --- (c) auto-approve on + needs-input issue with no new comment -> no
@@ -1063,7 +1063,7 @@ rc="$(AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-3005 AP_TEST_POLL_PLA
 assert "autoC(e): exit 0" [ "$rc" -eq 0 ]
 act_args="$CASE_STUB_DIR/claude_calls/2.args"
 assert "autoC(e): implement act proceeded (per-issue auto label, global off)" bash -c \
-  "[ -f '$act_args' ] && grep -q 'implement-plan' '$act_args'"
+  "[ -f '$act_args' ] && grep -q -- '--phase implement' '$act_args'"
 poll_args="$CASE_STUB_DIR/claude_calls/1.args"
 assert "autoC(e): poll invoked WITHOUT --auto-approve (global flag stays off)" bash -c \
   "[ -f '$poll_args' ] && ! grep -q -- '--auto-approve' '$poll_args'"
@@ -1079,7 +1079,7 @@ rc="$(AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-3006 AP_TEST_POLL_PLA
 assert "autoC(comment): exit 0" [ "$rc" -eq 0 ]
 act_args="$CASE_STUB_DIR/claude_calls/2.args"
 assert "autoC(comment): implement act proceeded ('auto' comment is a directive, not feedback)" bash -c \
-  "[ -f '$act_args' ] && grep -q 'implement-plan' '$act_args'"
+  "[ -f '$act_args' ] && grep -q -- '--phase implement' '$act_args'"
 unset AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_COMMENT_3006
 
 # =============================================================================
@@ -1192,7 +1192,7 @@ wait "$slot1_holder" 2>/dev/null
 assert "slots(1): exit 0" [ "$rc" -eq 0 ]
 act_args="$CASE_STUB_DIR/claude_calls/2.args"
 assert "slots(1): implement act proceeded (slot 1 busy, slot 2 free)" bash -c \
-  "[ -f '$act_args' ] && grep -q 'implement-plan' '$act_args'"
+  "[ -f '$act_args' ] && grep -q -- '--phase implement' '$act_args'"
 assert "slots(1): prompt carries --ports fe=5175,be=8002 (slot 2)" bash -c \
   "[ -f '$act_args' ] && grep -q -- '--ports fe=5175,be=8002' '$act_args'"
 [[ -f "$act_args" ]] && grep -h -- '--ports fe=' "$act_args" >>"$PORTS_SEEN_FILE"
@@ -1219,7 +1219,7 @@ assert "slots(2): busy-lanes does NOT report plan (plan lane free)" bash -c \
   "[ -f '$poll_args' ] && ! grep -q -- '--busy-lanes build,plan' '$poll_args'"
 act_args="$CASE_STUB_DIR/claude_calls/2.args"
 assert "slots(2): plan act proceeded (plan lane free, build's go-approval skipped)" bash -c \
-  "[ -f '$act_args' ] && grep -q 'plan-issue ENG-2101' '$act_args'"
+  "[ -f '$act_args' ] && grep -q 'implement-issue --phase plan ENG-2101' '$act_args'"
 unset AP_TEST_GH_ISSUES_ALL_OPEN AP_TEST_GH_ISSUES_PLAN_REVIEW AP_TEST_GH_COMMENT_2102
 
 # --- (3) neither slot held -> lowest free wins (slot 1); prompt carries
@@ -1241,7 +1241,7 @@ rc="$(AP_BUILD_SLOTS=1 AP_TEST_POLL_ACTION=implement AP_TEST_POLL_ISSUE=ENG-SLOT
 assert "slots(4): exit 0" [ "$rc" -eq 0 ]
 act_args="$CASE_STUB_DIR/claude_calls/2.args"
 assert "slots(4): AP_BUILD_SLOTS=1 -> implement proceeded on the one slot" bash -c \
-  "[ -f '$act_args' ] && grep -q 'implement-plan' '$act_args'"
+  "[ -f '$act_args' ] && grep -q -- '--phase implement' '$act_args'"
 assert "slots(4): AP_BUILD_SLOTS=1 -> same slot-1 ports as multi-slot case" bash -c \
   "[ -f '$act_args' ] && grep -q -- '--ports fe=5174,be=8001' '$act_args'"
 [[ -f "$act_args" ]] && grep -h -- '--ports fe=' "$act_args" >>"$PORTS_SEEN_FILE"
@@ -1534,7 +1534,7 @@ assert "shipLane(b): poll invoked with --busy-lanes ship" bash -c \
   "[ -f '$poll_args' ] && grep -q -- '--busy-lanes ship' '$poll_args'"
 act_args="$CASE_STUB_DIR/claude_calls/2.args"
 assert "shipLane(b): plan act proceeded (plan lane free, ship-pending skipped)" bash -c \
-  "[ -f '$act_args' ] && grep -q 'plan-issue ENG-706' '$act_args'"
+  "[ -f '$act_args' ] && grep -q 'implement-issue --phase plan ENG-706' '$act_args'"
 assert "shipLane(b): ship-pending item NOT marked seen (re-fires once free)" bash -c \
   "[ ! -f '$CASE_AP_HOME/scan-state.json' ] || python3 -c \"
 import json

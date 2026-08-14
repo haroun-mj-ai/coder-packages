@@ -1,13 +1,14 @@
 ---
 name: ship-work
-description: Take the code an approved plan produced and land it on dev: commit, push, open the PRs, rebase, wait for CI, fix a red check within a strict budget, then merge in dependency order and update Linear. Stops hard on human review comments, semantic conflicts, security findings, or scope creep. Use after /implement-plan when asked to ship, land, or open PRs for finished work. Never touches main or production.
+description: Take the code an approved plan produced and land it on dev: commit, push, open the PRs, rebase, wait for CI, fix a red check within a strict budget, then merge in dependency order and update Linear. Stops hard on human review comments, semantic conflicts, security findings, or scope creep. Use after /implement-issue's --phase implement when asked to ship, land, or open PRs for finished work. Never touches main or production.
 ---
 
 # ship-work
 
-Third and last skill in the chain: `/plan-issue` designs, `/implement-plan` builds,
-this lands it on `dev`. It stops at `dev`. Anything involving `main` is a
-production deploy via Railway and stays a human decision.
+Third and last skill in the chain: `/implement-issue` designs (`--phase plan`)
+and builds (`--phase implement`), this lands it on `dev`. It stops at `dev`.
+Anything involving `main` is a production deploy via Railway and stays a
+human decision.
 
 ## Usage
 
@@ -140,10 +141,11 @@ pattern is literally written here. A hit whose only match is the regex source in
 pattern definition or a test fixture, before treating it as hard stop 3. Never
 loosen the pattern to make a hit go away.
 
-### 3. Local gates before remote gates — reuse `/implement-plan`'s result when it is still valid
+### 3. Local gates before remote gates — reuse `/implement-issue`'s (Phase B) result when it is still valid
 
-Do not blindly re-run what the previous phase already ran. `/implement-plan`
-writes a QA artifact at `docs/plans/qa/<eng-id>-qa.md` whose header names the
+Do not blindly re-run what the previous phase already ran. `/implement-issue`'s
+Phase B (formerly `/implement-plan`) writes a QA artifact at
+`docs/plans/qa/<eng-id>-qa.md` whose header names the
 exact commit the gates ran against and their pass/fail result — read it first:
 
 ```bash
@@ -185,10 +187,10 @@ cd backend  && poetry run pytest
 Mirror what CI runs, not what is convenient: frontend CI runs `test:coverage`, not
 `test:run`, and it runs `tsc --noEmit` separately from `build`. Note also that this
 step's own gate list (`lint`, `tsc --noEmit`, `test:coverage`, `build`) is a
-superset of `/implement-plan`'s (`build`, `test:run`) for frontend — even a
+superset of `/implement-issue`'s Phase B gates (`build`, `test:run`) for frontend — even a
 freshly reused SHA never skips `lint`, `tsc --noEmit`, or `test:coverage`
 unless the artifact's `Gates:` line explicitly names those as having passed
-too. If the artifact only ever records the narrower implement-plan gate set,
+too. If the artifact only ever records the narrower Phase B gate set,
 treat this repo's gates as unrecorded and run the full CI-mirroring set here.
 
 Known noise, which is not a reason to stop: backend endpoint tests failing in
@@ -241,7 +243,7 @@ ship-work)` with the opened URLs, one line, e.g. `PRs: backend
 own, `ENG-<id>: record PR URLs in QA artifact`, staged with the explicit path.
 This is the **only** edit `/ship-work` makes to the artifact: everything else
 in the file (the four QA sections, the `Commit:`/`Gates:`/`Relaunch:` lines) is
-`/implement-plan`'s to write, and this skill does not second-guess or
+`/implement-issue`'s Phase B to write, and this skill does not second-guess or
 re-derive them. `/test-issue` later reads this same line instead of
 re-discovering PR numbers through `gh pr list`.
 
@@ -343,7 +345,7 @@ having been dropped by a force-push that raced the merge.
   every fix attempt spent, and what remains for a human. If anything stopped the
   run, lead with that.
 - Close the kata issue (`kata search "ENG-<id>" --agent` to find the ref
-  `/plan-issue` created and `/implement-plan` kept open): `kata close <ref>
+  `/implement-issue` created in Phase A and kept open through Phase B): `kata close <ref>
   --done --message "<what shipped>" --commit <merge-sha> --agent`, one call
   per merged repo's commit if they differ, or the root's if only one applies.
   This is the one skill in the chain that actually closes it, since "done"
@@ -391,7 +393,7 @@ already swapped `building` → `shipping` before invoking this phase), and
 write `status.json` with `status: NEEDS_HUMAN`, `phase: "ship"`, and
 `question` set to that same text. Also `kata meta set <ref> work.attention
 needs-human --agent` and `work.attention_msg` to the same stop reason —
-`/implement-plan`'s step 1 rule covers the mechanics; this is that same
+`/implement-issue`'s Phase B step 1 rule covers the mechanics; this is that same
 signal, at this phase.
 Never continue past a hard stop headlessly — the interactive rule ("stop,
 report, do not proceed to the next repo") holds unchanged; headless mode only

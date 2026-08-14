@@ -6,15 +6,17 @@ This project uses **Linear** (via MCP) for issue tracking and a **workgraph exec
 
 ## 1. Execution Model
 
-### The three-skill chain
+### The delivery chain
 
-The supported path from ticket to staging is three skills in `.claude/skills/`. Use them rather than improvising a per-ticket workflow:
+The supported path from ticket to staging is two skills in `.claude/skills/`. Use them rather than improvising a per-ticket workflow:
 
 | Skill | Ends at |
 |---|---|
-| `/plan-issue <id or description>` | every repo fetched, a worktree per involved repo cut from fresh `dev`, and a reviewed plan committed on the feature branch. Ticket filed and claimed |
-| `/implement-plan <plan>` | a committed, roborev-reviewed branch in those same worktrees. Never pushes |
+| `/implement-issue <id or description>` (Phase A / no `--phase`, or `--phase plan` headlessly) | every repo fetched, a worktree per involved repo cut from fresh `dev`, and a reviewed plan committed on the feature branch. Ticket filed and claimed. Stops for approval |
+| `/implement-issue <plan>` (Phase B, or `--phase implement` headlessly) | a committed, roborev-reviewed branch in those same worktrees, with a durable QA artifact under `docs/plans/qa/`. Never pushes |
 | `/ship-work <plan>` | merged to `dev`. Never touches `main` |
+
+`implement-issue` supersedes the now-retired `plan-issue`/`implement-plan` — one skill, two phases separated by a hard approval gate, rather than two separate invocations.
 
 Expensive inference goes up front on design; execution runs on a cheap model. The expensive model's job is judgement: reading subagent reports, choosing the approach, deciding whether a flagged problem changes the plan.
 
@@ -28,11 +30,11 @@ Match the model to the task, and pin it in an **agent definition** rather than a
 - `spec-auditor` (sonnet, medium) checks a finished implementation against its spec, and whether each test would actually fail without the behavior it claims to cover
 - `scout` (haiku, low) bulk mechanical lookup: call sites, which tests cover an area
 
-Never dispatch an opus or fable subagent from a skill. Agent definitions load at **session start**, so a fresh pull needs a restart before new ones resolve.
+Never dispatch an opus or fable subagent from a skill, **except `implement-issue`**, which deliberately makes three such calls (an Opus plan drafter, a `fable`-model plan auditor, an Opus fresh-context code reviewer) precisely because each needs a different reasoning tier or a genuinely independent model family from whatever it's checking — see that skill's own "Why this shape" section. Every other skill, and every other unit of work inside `implement-issue` itself, still dispatches through a pinned `subagent_type`. Agent definitions load at **session start**, so a fresh pull needs a restart before new ones resolve.
 
 ### Worktree isolation
 
-Worktrees are the normal case, not the exception: `/plan-issue` cuts one per involved repo off freshly fetched `dev`, named `wt-eng<id>-{root,be,fe}` inside the root checkout. That keeps explorers off the main checkout, which routinely sits 70 or more commits behind `dev`, and isolates the work from the other Claude Code sessions live on this tree.
+Worktrees are the normal case, not the exception: `/implement-issue`'s Phase A cuts one per involved repo off freshly fetched `dev`, named `wt-eng<id>-{root,be,fe}` inside the root checkout. That keeps explorers off the main checkout, which routinely sits 70 or more commits behind `dev`, and isolates the work from the other Claude Code sessions live on this tree.
 
 Always pass **`--no-track`** when creating one. Without it, `worktree add -b <branch> origin/dev` sets the branch's upstream to `origin/dev`, and a later bare `git push` targets **dev directly**.
 
@@ -114,7 +116,7 @@ Linear silently corrupts markdown tables whose cells contain backticks, dropping
 
 ## 3. Planning
 
-For any non-trivial task, prefer `/plan-issue`, which does all of the below. The steps are spelled out here so the process is legible without reading the skill.
+For any non-trivial task, prefer `/implement-issue` (Phase A / `--phase plan`), which does all of the below. The steps are spelled out here so the process is legible without reading the skill.
 
 1. **Explore.** Dispatch `explorer` and `scout` agents rather than reading your way through the codebase on the expensive model. Read `docs/guides/architecture/features/CATALOG.md`, check Linear including the comments, and follow any attached design doc or mockup.
 2. **Ask questions.** Clarify ambiguous requirements, UX decisions, architecture trade-offs. Don't assume.

@@ -75,15 +75,23 @@ def live_acts():
             continue
         rd = re.search(r"--run-dir (\S+)", args)
         skill = re.search(r"-p (/\S+)", args)
-        # the prompt's first token after the skill is the target (issue or plan)
-        tgt = re.search(r"-p /\S+ (\S+)", args)
+        # implement-issue names both plan and implement acts identically (one
+        # skill, two phases) -- its own --phase argument is what disambiguates,
+        # not the skill name, which ship-work has none of.
+        phase_flag = re.search(r"--phase (\S+)", args)
+        if skill and skill.group(1).lstrip("/") == "implement-issue" and phase_flag:
+            phase_label = phase_flag.group(1)
+            tgt = re.search(r"--phase \S+ (\S+)", args)
+        else:
+            phase_label = (skill.group(1).lstrip("/").replace("ship-work", "ship")
+                           if skill else "?")
+            # the prompt's first token after the skill is the target (issue or plan)
+            tgt = re.search(r"-p /\S+ (\S+)", args)
         pid = int(pid_s)
         out.append({
             "pid": pid,
             "run_dir": rd.group(1) if rd else "",
-            "phase": (skill.group(1).lstrip("/").replace("plan-issue", "plan")
-                      .replace("implement-plan", "implement")
-                      .replace("ship-work", "ship") if skill else "?"),
+            "phase": phase_label,
             # implement/ship are handed a plan path, not an issue id; pull the
             # issue out of the filename so the column reads the same as plan's.
             "target": issue_of(tgt.group(1)) if tgt else "",

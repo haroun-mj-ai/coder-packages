@@ -1,7 +1,8 @@
 # Autopilot
 
-A 24/7 scheduler that runs the three-skill delivery chain (`/plan-issue` →
-`/implement-plan` → `/ship-work`) headlessly on this Coder workspace, so that
+A 24/7 scheduler that runs the delivery chain (`/implement-issue --phase plan`
+→ `/implement-issue --phase implement` → `/ship-work`) headlessly on this
+Coder workspace, so that
 Haroun's own touchpoints shrink to: label an issue, review the plan privately
 from his phone, test the result, and merge. It never merges anything itself —
 that gate stays human, every cycle, forever.
@@ -18,9 +19,11 @@ This installs `tmux` and `supercronic` if missing, creates
 `~/.autopilot/{runs,briefs,logs}`, seeds `~/.autopilot/env` (only if absent —
 never overwritten), symlinks `autopilot/bin/*` into `~/.local/bin`, adds a
 managed self-heal block to `~/.bashrc` that runs `ap up --quiet` on every
-interactive login, and wires the skills this feature runs (`plan-issue`,
-`implement-plan`, `ship-work`, `autopilot-poll`, `daily-brief`,
-`autopilot-protocol.md`) as symlinks into the JourneyAI checkout
+interactive login, and wires the skills this feature runs (`implement-issue`
+— superseding the retired `plan-issue`/`implement-plan` stubs, kept
+symlinked only so a stale invocation fails informatively — `ship-work`,
+`autopilot-poll`, `daily-brief`, `autopilot-protocol.md`) as symlinks into
+the JourneyAI checkout
 (`AP_WORK_REPO`, default `/home/coder/root-for-local`) — see "A note on
 `coder-packages/claude/skills/`" below.
 
@@ -89,8 +92,8 @@ actually go anywhere; unconfigured, `ap-notify.sh` just logs to
 4. **Build happens unattended**, on one of `AP_BUILD_SLOTS` (default `2`)
    concurrent build slots, each with its own frontend/backend port pair
    (`5173+n`/`8000+n` for slot `n`; the human's own `5173`/`8000` are never
-   assigned to a slot) — see "Concurrent builds" below. `implement-plan` runs
-   full QA (including the four-server comparison), then tears down the
+   assigned to a slot) — see "Concurrent builds" below. `implement-issue`'s
+   Phase B runs full QA (including the four-server comparison), then tears down the
    changed-pair servers and leaves only your baseline (5173/8000) bound. The
    inbox label swaps `building` → `shipping` the moment `ship-work` starts
    (with its own ping), so you can tell "still building" apart from "opening
@@ -248,8 +251,8 @@ implementations are kept in step deliberately (`autopilot-poll/SKILL.md`
 says so at its top) — if you change one tier's rule, change the other.
 `ap-decide.sh` never touches Linear (no credential available to it — the
 Linear claim on tier 5's new-delegation path now happens inside
-`/plan-issue --headless` itself, at the start of its run, whichever poll
-mode chose it).
+`/implement-issue --phase plan --headless` itself, at the start of its run,
+whichever poll mode chose it).
 
 ## Troubleshooting
 
@@ -293,9 +296,11 @@ mode chose it).
 
 ## A note on `coder-packages/claude/skills/`
 
-This repo's `claude/skills/` is the single source of truth for `plan-issue`,
-`implement-plan`, `ship-work`, `autopilot-poll`, `daily-brief`, and
-`autopilot-protocol.md`. The JourneyAI checkout (`AP_WORK_REPO`) never holds
+This repo's `claude/skills/` is the single source of truth for
+`implement-issue`, `ship-work`, `autopilot-poll`, `daily-brief`, and
+`autopilot-protocol.md` (plus the retired `plan-issue`/`implement-plan`
+stubs, kept symlinked so a stale invocation fails informatively rather than
+404ing). The JourneyAI checkout (`AP_WORK_REPO`) never holds
 its own copies — `scripts/install-autopilot.sh` symlinks each
 `.claude/skills/<name>` entry there straight into this repo, `skip-worktree`s
 any path the team repo still tracks underneath so the substitution never

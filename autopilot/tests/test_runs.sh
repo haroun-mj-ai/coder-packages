@@ -42,7 +42,7 @@ LEDGER
 # Two lines share message id msg_1 to prove per-response dedupe (Claude Code
 # writes one line per content block, each repeating the same usage object).
 cat >"$AP_PROJECTS_DIR/proj/$SID_OK.jsonl" <<T1
-{"type":"user","timestamp":"2026-08-12T01:00:00Z","message":{"content":"<command-args>/plan-issue ENG-1 --headless --run-dir $RUN_OK</command-args>"}}
+{"type":"user","timestamp":"2026-08-12T01:00:00Z","message":{"content":"<command-args>/implement-issue --phase plan ENG-1 --headless --run-dir $RUN_OK</command-args>"}}
 {"type":"assistant","timestamp":"2026-08-12T01:05:00Z","message":{"id":"msg_1","model":"claude-opus-5","content":[{"type":"tool_use","name":"Bash","input":{"command":"git status"}}],"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":500,"cache_creation_input_tokens":100}}}
 {"type":"assistant","timestamp":"2026-08-12T01:05:00Z","message":{"id":"msg_1","model":"claude-opus-5","content":[{"type":"text","text":"Plan committed."}],"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":500,"cache_creation_input_tokens":100}}}
 T1
@@ -54,7 +54,7 @@ echo '{"status":"DONE","issue":"ENG-1","phase":"plan"}' >"$RUN_OK/status.json"
 
 # The FAILED implement: no status.json, an api error, a stderr file.
 cat >"$AP_PROJECTS_DIR/proj/$SID_BAD.jsonl" <<T3
-{"type":"user","timestamp":"2026-08-12T02:00:00Z","message":{"content":"<command-args>/implement-plan /x/docs/plans/2026-08-12-eng-2-thing.md --headless --run-dir $RUN_BAD</command-args>"}}
+{"type":"user","timestamp":"2026-08-12T02:00:00Z","message":{"content":"<command-args>/implement-issue --phase implement /x/docs/plans/2026-08-12-eng-2-thing.md --headless --run-dir $RUN_BAD</command-args>"}}
 {"type":"assistant","timestamp":"2026-08-12T02:05:00Z","message":{"id":"msg_9","model":"claude-sonnet-5","content":[{"type":"text","text":"You've hit your session limit"}],"usage":{"input_tokens":1,"output_tokens":2,"cache_read_input_tokens":3}},"isApiErrorMessage":true}
 T3
 echo "boom: something on stderr" >"$RUN_BAD/implement.stderr"

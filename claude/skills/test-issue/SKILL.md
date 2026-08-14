@@ -9,7 +9,7 @@ Turns `docs/qa-runbook.md` into a run, not a read. This skill does the assemblin
 and the mechanical checking; the human still does the judging that only a human
 can do — whether a screenshot actually looks right, whether a UX gap matters.
 
-**Not this skill's job:** writing or fixing feature code (that is `/implement-plan`,
+**Not this skill's job:** writing or fixing feature code (that is `/implement-issue`,
 or a direct fix if something is broken), and merging (that is `/ship-work`). If
 testing turns up a real bug, report it and stop — do not silently patch it here.
 
@@ -28,7 +28,7 @@ testing turns up a real bug, report it and stop — do not silently patch it her
 If given `next` or no argument, list the inbox (`$AP_INBOX_REPO`, from `ap-env.sh`)
 for open issues labelled `ready-to-test` and take the oldest by creation date.
 
-`/implement-plan` already wrote a durable QA artifact for this issue at
+`/implement-issue`'s Phase B already wrote a durable QA artifact for this issue at
 `docs/plans/qa/<eng-id>-qa.md` in the root worktree, and `/ship-work` already
 filled in its `PRs:` line once the PRs were open. Read that file **before**
 touching `gh` at all:
@@ -40,8 +40,8 @@ touching `gh` at all:
 - The four QA sections (**Verified here**, **Needs a human**, **Interaction
   cases from the blast radius**, **Edge cases**) are this skill's checklist.
   **Your job in steps 4–6 is to execute that checklist, not to re-derive it.**
-  Do not re-run the blast-radius derivation (`/implement-plan` step 6 already
-  dispatched a `scout` for this and paid for it once) — walk the **Needs a
+  Do not re-run the blast-radius derivation (`/implement-issue`'s Phase B
+  step 7 already dispatched a `scout` for this and paid for it once) — walk the **Needs a
   human** and **Interaction cases** sections item by item instead. Items
   already marked **Verified here** get spot-checked at most — pick one or two
   to confirm the artifact's claim still holds, do not repeat the whole list
@@ -153,7 +153,7 @@ ss -ltn | grep -E ':(5173|8000)'
 ### 3. Stand up the comparison
 
 Use the QA artifact's `Relaunch:` header from step 1 to bring the changed pair
-up — it names the exact worktree paths and ports `/implement-plan` used, so
+up — it names the exact worktree paths and ports `/implement-issue`'s Phase B used, so
 this is a copy-paste rather than a rediscovery. Fall back to the runbook's
 Step 1 (same recipe, by convention fe 5174+/be 8001+) only when the artifact
 was missing or had no usable `Relaunch:` line. Baseline stays on 5173/8000,
@@ -217,7 +217,7 @@ the real test credentials. For each screen you touch, screenshot both sides as
 Then walk the QA artifact's **Interaction cases from the blast radius** section
 (or, on the fallback path, the plan's **Interaction surface** list), one item
 at a time, on the changed port: this is exactly the set of neighbouring
-features `/implement-plan`'s `scout` dispatch already flagged as worth
+features `/implement-issue`'s Phase B `scout` dispatch already flagged as worth
 checking, not a smoke test of the whole app, and not a list to re-derive from
 the diff yourself.
 

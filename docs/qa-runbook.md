@@ -3,7 +3,7 @@
 How to take one `ready-to-test` issue from "PRs are open" to "merged", including
 the changed-vs-baseline comparison and the e2e suite.
 
-**Read the QA artifact first.** `/implement-plan` writes one to
+**Read the QA artifact first.** `/implement-issue`'s Phase B writes one to
 `docs/plans/qa/<eng-id>-qa.md` in the root worktree, and `/ship-work` fills in
 its `PRs:` line once the PRs are open. That file already carries the PR list,
 the exact relaunch commands for the changed pair (ports, worktree paths, the
@@ -69,7 +69,7 @@ cd /home/coder/root-for-local/backend && set -a && . ./.env.local && set +a
 ## Step 1 — bring up the pair you are comparing
 
 Use the QA artifact's `Relaunch:` header (`docs/plans/qa/<eng-id>-qa.md`) — it
-already has the exact commands `/implement-plan` used, worktree paths and
+already has the exact commands `/implement-issue`'s Phase B used, worktree paths and
 ports included, so this step is a copy-paste when the artifact exists. What
 follows is the recipe it is built from, and the fallback for when the
 artifact does not exist yet.

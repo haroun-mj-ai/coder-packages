@@ -1,10 +1,13 @@
 # Autopilot headless protocol
 
-Shared contract for the `--headless` mode of `/plan-issue`, `/implement-plan`,
-and `/ship-work`, and for the bash orchestrator (`ap-cycle.sh`) that invokes
-them via `claude -p`. Read this before reading any skill's own headless
-section: it defines the vocabulary and mechanics once so each skill only
-states what maps to what.
+Shared contract for the `--headless` mode of `/implement-issue` (`--phase
+plan` and `--phase implement`) and `/ship-work`, and for the bash
+orchestrator (`ap-cycle.sh`) that invokes them via `claude -p`. Read this
+before reading any skill's own headless section: it defines the vocabulary
+and mechanics once so each skill only states what maps to what.
+(`/plan-issue` and `/implement-plan` are retired, folded into
+`/implement-issue`'s two phases — this document still uses "the plan phase"
+and "the implement phase" as the natural names for what each used to be.)
 
 ## Trigger
 
@@ -76,7 +79,7 @@ Exact shape, every key present on every write:
   the morning brief should surface. On an `implement` phase `DONE`, this is
   where the **QA artifact's absolute path** goes
   (`docs/plans/qa/<eng-id>-qa.md` in the root worktree — see
-  `implement-plan/SKILL.md` step 8): that file, not `detail`, carries the
+  `implement-issue/SKILL.md`'s Phase B step 9): that file, not `detail`, carries the
   relaunch commands, the gates' commit SHA, and the QA checklist, so `detail`
   only needs to point at it rather than duplicate it. Not a substitute for
   `question` or the inbox post; both still happen.
@@ -92,8 +95,8 @@ team-visible.
   the GitHub mobile app, typically — to hand off a Linear issue to the
   pipeline. Title must contain the Linear id (`ENG-<id>`, case-insensitive
   match, e.g. `ENG-1234` or `ENG-1234: whatever note`); anything in the title
-  after the id, plus the issue body, is a note passed to `/plan-issue` as
-  context, not machine-parsed.
+  after the id, plus the issue body, is a note passed to `/implement-issue
+  --phase plan` as context, not machine-parsed.
 - **`Queued` label = new delegation.** An open inbox issue carrying the
   `Queued` label (case-insensitive match on the label name) and none of the
   eight state labels below is unclaimed work waiting for `autopilot-poll` to
@@ -140,7 +143,7 @@ team-visible.
   dead-ended" below) or by a human relabelling by hand. `autopilot-poll`'s
   tier 4 claims it (`ship-pending` → `shipping`) and emits `action:ship`,
   which the orchestrator dispatches as `/ship-work --headless --no-merge`
-  with no `/plan-issue` or `/implement-plan` step first — the plan is
+  with no `/implement-issue` step first — the plan is
   already committed. This `action:ship` claims the orchestrator's SHIP lane
   (its own slot pool, `AP_SHIP_SLOTS`), not the BUILD lane `implement` uses —
   see "Orchestrator guarantees" below for the port-pair mechanics, and
@@ -220,8 +223,8 @@ exactly two writes:
 
 Never set `Staging` or `Done` headlessly — `Staging` means merged
 (`AGENTS.md`), and merging is never autonomous. Never create a Linear issue
-headlessly; the free-text-creation path (`/plan-issue`'s `--no-issue`-adjacent
-step 1b) is interactive-only, since it depends on an ask that has no
+headlessly; the free-text-creation path (`/implement-issue`'s
+`--no-issue`-adjacent step 1) is interactive-only, since it depends on an ask that has no
 headless-safe default.
 
 ## Orchestrator guarantees
@@ -240,7 +243,7 @@ The wrapper (`ap-cycle.sh`), not the skill, guarantees:
   different, non-overlapping range, since ship-work runs no UI server and
   these ports only isolate its local gates from a concurrently running build.
   Either way, bind exactly the two ports given (never the human's baseline
-  5173/8000) — see `implement-plan`'s headless section for the CORS
+  5173/8000) — see `implement-issue`'s headless section for the CORS
   implication, which only applies to the build-lane case.
 - The `building` → `shipping` inbox-label swap happens before the ship phase
   is invoked (see "State labels" above) and the "shipping: `<issue>`" phone

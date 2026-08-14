@@ -10,8 +10,8 @@ only decides (and, in --claim mode, performs the claiming gh writes) and
 prints one JSON object to stdout.
 
 No Linear write happens here (no credential available to this script -- see
-claude/skills/plan-issue/SKILL.md's headless section for where the Linear
-claim now lives).
+claude/skills/implement-issue/SKILL.md's headless section (--phase plan) for
+where the Linear claim now lives).
 """
 import argparse
 import calendar

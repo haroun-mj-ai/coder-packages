@@ -14,18 +14,18 @@ instead of this skill. **The two must be kept in step** — a tier/keyword/
 claim-rule change here needs the matching change in `ap-decide.sh` (and its
 test, `autopilot/tests/test_decide.sh`), and vice versa. Note also that this
 skill's own Linear-claim reference below (tier 5) is stale in one respect:
-the Linear claim now happens inside `/plan-issue --headless` itself, at the
-start of its run, not here — see `plan-issue/SKILL.md`'s headless section
-and `autopilot-protocol.md`'s Linear footprint. Neither poll implementation
-writes to Linear; `ap-decide.sh` in particular has no Linear credential to
-do it with.
+the Linear claim now happens inside `/implement-issue --phase plan
+--headless` itself, at the start of its run, not here — see
+`implement-issue/SKILL.md`'s headless section and `autopilot-protocol.md`'s
+Linear footprint. Neither poll implementation writes to Linear;
+`ap-decide.sh` in particular has no Linear credential to do it with.
 
 Reads the private inbox (`$AP_INBOX_REPO`) — the only channel the owner uses
 to delegate work — decides the single next action for this autopilot cycle,
 claims it (a label swap only — no Linear write, see the note above), and
-emits that decision as JSON. Nothing else. The three real skills (`/plan-issue`,
-`/implement-plan`, `/ship-work`) do the actual work in a later stage of the
-same cycle; this skill only triages and claims.
+emits that decision as JSON. Nothing else. The two real skills
+(`/implement-issue`'s two phases, `/ship-work`) do the actual work in a
+later stage of the same cycle; this skill only triages and claims.
 
 Shared vocabulary — inbox labels, the owner-comment approval rule, the Linear
 footprint — is defined once in `.claude/skills/autopilot-protocol.md`. Read it
@@ -135,7 +135,7 @@ those markers, or the next cycle will read it as the owner talking.
      the issue (body or comments, per the protocol's inbox contract). If no
      such line exists, fall back to listing `docs/plans/*<eng-id-lowercase>*.md`
      in the root worktrees (`$AP_WORK_REPO/wt-*-root/docs/plans/`
-     — the plan-issue worktree naming convention, e.g. `wt-eng1133-root/`)
+     — the implement-issue worktree naming convention, e.g. `wt-eng1133-root/`)
      and the main checkout, newest first, and take the first hit. If neither
      the `Plan file:` line nor the fallback listing yields a path that
      actually exists on disk, do not emit `implement`: swap the label to
@@ -207,12 +207,12 @@ those markers, or the next cycle will read it as the owner talking.
      `gh issue edit <n> --repo "$AP_INBOX_REPO" --remove-label Queued --add-label planning`,
      and emit `{"action":"plan","issue":"ENG-<id>","inboxIssue":<n>}`. Do
      **not** make the Linear claim here — this skill has no reliable Linear
-     credential in every environment it runs in; `/plan-issue --headless`
-     makes that claim itself, at the start of its run, per the protocol's
-     Linear footprint. If the title
+     credential in every environment it runs in; `/implement-issue --phase
+     plan --headless` makes that claim itself, at the start of its run, per
+     the protocol's Linear footprint. If the title
      carries a note after the id, or the issue body is non-empty, include it
-     as `"feedback":"<note text>"` in the same emit so `/plan-issue` sees it
-     as context.
+     as `"feedback":"<note text>"` in the same emit so `/implement-issue`'s
+     `--phase plan` sees it as context.
 
 6. **Otherwise** → emit `{"action":"none"}`.
 

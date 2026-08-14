@@ -76,7 +76,7 @@ Two limits worth knowing:
 
 | Path | What |
 | --- | --- |
-| `claude/skills/` | `plan-issue`, `implement-plan`, `ship-work`, `orchestration-run-analysis` |
+| `claude/skills/` | `implement-issue`, `ship-work`, `orchestration-run-analysis` (plus retired `plan-issue`/`implement-plan` stubs) |
 | `claude/agents/` | `explorer`, `implementer`, `plan-critic`, `scout`, `spec-auditor` |
 | `claude/AGENTS.md` | agent workflow rules — Linear, commits, quality gates, shipping |
 

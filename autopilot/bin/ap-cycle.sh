@@ -864,7 +864,7 @@ case "$action" in
       # ship's local gates can never collide with a running build or the
       # human's baseline. ship-work serves no UI, so these ports only matter
       # for gate isolation; the frontend CORS allowlist is irrelevant here for
-      # the same reason (see implement-plan's headless section for where CORS
+      # the same reason (see implement-issue's headless section for where CORS
       # actually matters, for the build lane).
       fe_port=$((5180 + ship_slot))
       be_port=$((8010 + ship_slot))
@@ -1009,21 +1009,21 @@ pushd "$WORK_REPO" >/dev/null 2>&1 || cd "$WORK_REPO" || exit 1
 
 case "$action" in
   plan)
-    run_claude "plan" "/plan-issue $issue --headless"
+    run_claude "plan" "/implement-issue --phase plan $issue --headless"
     ;;
   replan)
     # Escape embedded single quotes ' -> '\'' so a feedback body containing
     # an apostrophe doesn't break out of the single-quoted --feedback value.
     feedback_escaped="${feedback//\'/\'\\\'\'}"
-    run_claude "replan" "/plan-issue $issue --headless --feedback '$feedback_escaped'"
+    run_claude "replan" "/implement-issue --phase plan $issue --headless --feedback '$feedback_escaped'"
     ;;
   implement)
     # --ports is literal prompt text, same mechanism as --run-dir (the
     # dontAsk profile is path-scoped, so the session cannot read env): tells
     # this slot's implement (and, harmlessly, ship) which changed-pair ports
     # to bind so concurrent build slots never collide. See
-    # claude/skills/implement-plan/SKILL.md's headless section.
-    run_claude "implement" "/implement-plan $plan_path --headless --ports fe=$fe_port,be=$be_port"
+    # claude/skills/implement-issue/SKILL.md's headless section.
+    run_claude "implement" "/implement-issue --phase implement $plan_path --headless --ports fe=$fe_port,be=$be_port"
     if [[ "$final_status" == "DONE" ]]; then
       # The wrapper, not the skill, owns this swap and its ping -- reliable
       # even if the ship session dies before writing anything. `shipping` is

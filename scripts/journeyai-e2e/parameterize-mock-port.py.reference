@@ -1,0 +1,51 @@
+import re
+from pathlib import Path
+
+ROOT = Path("/home/coder/root-for-local/wt-e2e-concurrent-root/tests/e2e")
+LIB_DIR = ROOT / "lib"
+
+PATTERN = re.compile(r'\.port === "8000"')
+IMPORT_LINE_RE = re.compile(r'^import .+;\s*$')
+
+files_changed = []
+skipped_no_import = []
+
+for path in sorted(ROOT.rglob("*.ts")):
+    if path.name == "mock-port.ts":
+        continue
+    text = path.read_text()
+    if '.port === "8000"' not in text:
+        continue
+
+    new_text = PATTERN.sub('.port === MOCK_API_PORT', text)
+
+    if path.parent == LIB_DIR:
+        import_path = "./mock-port"
+    else:
+        import_path = "../../lib/mock-port"
+    import_line = f'import {{ MOCK_API_PORT }} from "{import_path}";\n'
+
+    lines = new_text.splitlines(keepends=True)
+    last_import_idx = None
+    for i, line in enumerate(lines):
+        if IMPORT_LINE_RE.match(line):
+            last_import_idx = i
+        elif last_import_idx is not None and line.strip() == "":
+            break
+
+    if last_import_idx is None:
+        skipped_no_import.append(str(path))
+        continue
+
+    lines.insert(last_import_idx + 1, import_line)
+    path.write_text("".join(lines))
+    files_changed.append(str(path.relative_to(ROOT)))
+
+print(f"Changed {len(files_changed)} files:")
+for f in files_changed:
+    print(f"  {f}")
+
+if skipped_no_import:
+    print(f"\nSKIPPED (no import line found, needs manual handling) {len(skipped_no_import)} files:")
+    for f in skipped_no_import:
+        print(f"  {f}")

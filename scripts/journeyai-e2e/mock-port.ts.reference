@@ -1,0 +1,15 @@
+/**
+ * The port every e2e route mock checks via `url.port === MOCK_API_PORT`
+ * (see cockpit-helpers.ts, explore-mocks.ts, manager-cockpit-mocks.ts, and
+ * every cockpit/explore/manager/org-settings/organization spec that mocks
+ * its own routes inline). Defaults to "8000" to match every existing
+ * local/CI setup unless overridden.
+ *
+ * Concurrent worktrees each need their own backend, which means their own
+ * port — override with E2E_MOCK_API_PORT (loaded from tests/e2e/.env.e2e
+ * via playwright.config.ts's dotenv.config()) so a ticket's own backend on
+ * a free port is still recognized by every existing mock, with zero
+ * per-spec changes. Pair with backend/scripts/run-e2e-instance.sh, which
+ * starts that backend and sets its CORS to match the paired frontend.
+ */
+export const MOCK_API_PORT = process.env.E2E_MOCK_API_PORT || "8000";

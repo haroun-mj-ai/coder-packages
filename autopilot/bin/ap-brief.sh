@@ -97,25 +97,25 @@ print(maxts or "")
 PY
 }
 
-# compose_input <since> <now> <ledger-json> <inbox-json> <max_issues>
+# compose_input <since> <now> <ledger-json> <queue-json> <max_issues>
 #   <max_cost> <today_cost> <today_issues> <newest_age_min-or-empty>
 #   <paused: true|false> <scheduler_alive: true|false> <max_week_cost>
 #   <week_cost>
 compose_input() {
-  local since="$1" now="$2" ledger_json="$3" inbox_json="$4" \
+  local since="$1" now="$2" ledger_json="$3" queue_json="$4" \
     max_issues="$5" max_cost="$6" today_cost="$7" today_issues="$8" \
     newest_age_min="$9" paused="${10}" scheduler_alive="${11}" \
     max_week_cost="${12}" week_cost="${13}"
   if command -v jq >/dev/null 2>&1; then
     jq -nc \
       --arg since "$since" --arg now "$now" \
-      --argjson ledger "$ledger_json" --argjson inbox "$inbox_json" \
+      --argjson ledger "$ledger_json" --argjson queue "$queue_json" \
       --argjson max_issues "$max_issues" --argjson max_cost "$max_cost" \
       --argjson today_cost "$today_cost" --argjson today_issues "$today_issues" \
       --argjson newest_entry_age_min "${newest_age_min:-null}" \
       --argjson paused "$paused" --argjson scheduler_alive "$scheduler_alive" \
       --argjson max_week_cost "$max_week_cost" --argjson week_cost "$week_cost" \
-      '{since: $since, now: $now, ledger: $ledger, inbox: $inbox,
+      '{since: $since, now: $now, ledger: $ledger, queue: $queue,
         budget: {max_issues: $max_issues, max_cost: $max_cost,
                  today_cost: $today_cost, today_issues: $today_issues,
                  max_week_cost: $max_week_cost, week_cost: $week_cost},
@@ -123,11 +123,11 @@ compose_input() {
                   paused: $paused, scheduler_alive: $scheduler_alive}}'
     return
   fi
-  python3 - "$since" "$now" "$ledger_json" "$inbox_json" "$max_issues" \
+  python3 - "$since" "$now" "$ledger_json" "$queue_json" "$max_issues" \
     "$max_cost" "$today_cost" "$today_issues" "$newest_age_min" "$paused" \
     "$scheduler_alive" "$max_week_cost" "$week_cost" <<'PY'
 import json, sys
-(since, now, ledger_json, inbox_json, max_issues, max_cost, today_cost,
+(since, now, ledger_json, queue_json, max_issues, max_cost, today_cost,
  today_issues, newest_age_min, paused, scheduler_alive, max_week_cost,
  week_cost) = sys.argv[1:14]
 try:
@@ -135,14 +135,14 @@ try:
 except Exception:
     ledger = []
 try:
-    inbox = json.loads(inbox_json)
+    queue = json.loads(queue_json)
 except Exception:
-    inbox = []
+    queue = []
 doc = {
     "since": since,
     "now": now,
     "ledger": ledger,
-    "inbox": inbox,
+    "queue": queue,
     "budget": {
         "max_issues": int(max_issues),
         "max_cost": float(max_cost),
@@ -175,8 +175,8 @@ fi
 ledger_json="$(ledger_since "$since")"
 [[ -z "$ledger_json" ]] && ledger_json='[]'
 
-inbox_json="$(gh issue list -R "$AP_INBOX_REPO" --state open --json number,title,labels,url 2>>"$AP_HOME/logs/brief.log")"
-[[ -z "$inbox_json" ]] && inbox_json='[]'
+queue_json="$(python3 "$SCRIPT_DIR/ap_queue.py" --ap-home "$AP_HOME" list 2>>"$AP_HOME/logs/brief.log")"
+[[ -z "$queue_json" ]] && queue_json='[]'
 
 # Today's spend/issue count: same computation the cycle's budget gate uses --
 # scoped to today's ledger file (AP_TZ calendar day), excluding poll rows,
@@ -214,22 +214,14 @@ PY
 today_issues="${today_issues:-0}"
 today_cost="${today_cost:-0}"
 
-# Rolling 7-day cost, reusing ledger_since -- same basis as today_cost
-# (Claude Code's own total_cost_usd), just a wider window. Informational only,
-# matches `ap status`'s week-cost line. See ap-env.sh for AP_MAX_WEEK_COST_USD.
-week_since="$(date -u -d '7 days ago' +%FT%TZ)"
-week_ledger_json="$(ledger_since "$week_since")"
-[[ -z "$week_ledger_json" ]] && week_ledger_json='[]'
-if command -v jq >/dev/null 2>&1; then
-  week_cost="$(jq -n --argjson l "$week_ledger_json" '[$l[] | .cost] | add // 0')"
-else
-  week_cost="$(python3 - "$week_ledger_json" <<'PY'
-import json, sys
-rows = json.loads(sys.argv[1])
-print(sum(float(r.get("cost") or 0) for r in rows))
-PY
-)"
-fi
+# Anchored 7-day cost, from the single shared definition in ap-week-cost.py --
+# same basis as today_cost (Claude Code's own total_cost_usd), just a wider and
+# explicitly anchored window that `ap reset-week` re-bases. Informational only,
+# and identical by construction to `ap status`'s week-cost line: both call the
+# same helper, which is the point (they previously used two different bases --
+# "last 7 files" here vs "last 7 days" there -- and silently disagreed).
+# See ap-env.sh for AP_MAX_WEEK_COST_USD.
+week_cost="$(python3 "$SCRIPT_DIR/ap-week-cost.py" --home "$AP_HOME" --format usd 2>/dev/null)"
 week_cost="${week_cost:-0}"
 
 newest_ts="$(newest_ledger_ts)"
@@ -248,7 +240,7 @@ paused=false
 scheduler_alive=false
 tmux has-session -t autopilot >/dev/null 2>&1 && scheduler_alive=true
 
-input_json="$(compose_input "$since" "$now" "$ledger_json" "$inbox_json" \
+input_json="$(compose_input "$since" "$now" "$ledger_json" "$queue_json" \
   "$AP_MAX_ISSUES_PER_DAY" "$AP_MAX_DAY_COST_USD" "$today_cost" "$today_issues" \
   "$newest_age_min" "$paused" "$scheduler_alive" \
   "$AP_MAX_WEEK_COST_USD" "$week_cost")"

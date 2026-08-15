@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""cc-top — live view of Claude Code sessions on this machine.
+
+Reads ~/.claude/projects/**/*.jsonl (one line per message, each assistant line
+carries `model` + full `usage`) and cross-references /proc to find which
+sessions belong to a live `claude` process.
+
+Cost accuracy: validated against the autopilot ledger's total_cost_usd (which
+comes from Claude Code itself). Exact on single-session runs; 4-6% low on
+subagent-heavy runs (one outlier at 13%), aggregate ~5% low — so treat totals
+as a floor, not a bill.
+
+Usage:
+  cc-top                 # sessions active in the last 60 min
+  cc-top -w 5            # burn-rate window = 5 min (default 10)
+  cc-top -a 240          # look back 240 min for "active" sessions
+  cc-top --live          # only sessions with a live PID
+  cc-top --json          # machine-readable
+  cc-top --watch         # refresh every 5s
+"""
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+
+PROJECTS = Path.home() / ".claude" / "projects"
+
+C = {"dim": "\033[2m", "r": "\033[31m", "g": "\033[32m", "y": "\033[33m", "0": "\033[0m"}
+if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+    C = dict.fromkeys(C, "")
+
+
+def col(k, s):
+    return f"{C[k]}{s}{C['0']}"
+
+# $ per million tokens (input, output). Cache write = in*1.25 (5m) / in*2 (1h);
+# cache read = in*0.1.
+PRICES = {
+    "claude-opus-5":     (5.00, 25.00),
+    "claude-opus-4-8":   (5.00, 25.00),
+    "claude-opus-4-7":   (5.00, 25.00),
+    "claude-opus-4-6":   (5.00, 25.00),
+    "claude-fable-5":    (10.00, 50.00),
+    "claude-mythos-5":   (10.00, 50.00),
+    # NB: Sonnet 5 has an intro rate of $2/$10 through 2026-08-31, but Claude
+    # Code's own total_cost_usd bills at list $3/$15 — validated against the
+    # autopilot ledger, so we match it here.
+    "claude-sonnet-5":   (3.00, 15.00),
+    "claude-sonnet-4-6": (3.00, 15.00),
+    "claude-haiku-4-5":  (1.00, 5.00),
+}
+
+
+def price(model):
+    m = re.sub(r"\[1m\]$", "", model or "")
+    if m in PRICES:
+        return PRICES[m]
+    for k, v in PRICES.items():          # date-suffixed ids
+        if m.startswith(k):
+            return v
+    return (5.00, 25.00)                  # unknown -> assume opus tier
+
+
+WEB_SEARCH_USD = 10.0 / 1000       # $10 per 1,000 searches
+
+
+def cost_of(model, u):
+    inp, out = price(model)
+    cc = u.get("cache_creation") or {}
+    # If cache_creation isn't broken out by TTL, fall back to the flat total at
+    # the 5m rate.
+    writes = (cc.get("ephemeral_5m_input_tokens", 0) * inp * 1.25
+              + cc.get("ephemeral_1h_input_tokens", 0) * inp * 2.0) if cc else \
+             u.get("cache_creation_input_tokens", 0) * inp * 1.25
+    tok = (
+        u.get("input_tokens", 0) * inp
+        + u.get("output_tokens", 0) * out
+        + writes
+        + u.get("cache_read_input_tokens", 0) * inp * 0.1
+    ) / 1e6
+    st = u.get("server_tool_use") or {}
+    return tok + st.get("web_search_requests", 0) * WEB_SEARCH_USD
+
+
+SESSIONS = Path.home() / ".claude" / "sessions"
+
+
+def live_sessions():
+    """session_id -> registry record, from ~/.claude/sessions/<pid>.json.
+
+    Claude Code writes one record per running process (pid, sessionId, kind,
+    status, name). Stale records are dropped by checking /proc/<pid>.
+    """
+    out = {}
+    for f in SESSIONS.glob("*.json"):
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        pid, sid = d.get("pid"), d.get("sessionId")
+        if not (pid and sid) or not Path(f"/proc/{pid}").exists():
+            continue
+        try:
+            cmd = (Path(f"/proc/{pid}") / "cmdline").read_bytes().split(b"\0")
+            d["cmd"] = " ".join(c.decode(errors="replace") for c in cmd if c)
+        except OSError:
+            d["cmd"] = ""
+        out[sid] = d
+    return out
+
+
+def ts(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+
+
+def scan(active_min, window_min):
+    now = time.time()
+    cutoff_active = now - active_min * 60
+    cutoff_win = now - window_min * 60
+    reg = live_sessions()
+
+    # Group transcripts by session. A subagent transcript lives at
+    # <project>/<parent-session-id>/subagents/agent-*.jsonl and carries the
+    # parent's sessionId, so its tokens belong to the parent's total.
+    groups = defaultdict(list)
+    for f in PROJECTS.rglob("*.jsonl"):
+        if f.parent.name == "subagents":
+            groups[f.parent.parent.name].append(f)
+        else:
+            groups[f.stem].append(f)
+
+    rows = []
+    for sid, files in groups.items():
+        try:
+            if max(f.stat().st_mtime for f in files) < cutoff_active:
+                continue
+        except OSError:
+            continue
+
+        s = {
+            "session_id": sid,
+            "file": str(files[0]),
+            "subagents": sum(1 for f in files if f.parent.name == "subagents"),
+            "sub_cost": 0.0,
+            "cwd": "",
+            "branch": "",
+            "version": "",
+            "title": "",
+            "models": defaultdict(int),          # model -> output tokens
+            "tokens": defaultdict(int),
+            "cost": 0.0,
+            "win_out": 0,
+            "win_cost": 0.0,
+            "win_reqs": 0,
+            "first": None,
+            "last": None,
+            "reqs": 0,
+            "effort": "",
+            "headless": False,
+            "api_errors": 0,
+            "cache_bucket_sec": None,
+        }
+        # One API response is written as several JSONL lines (one per content
+        # block), each repeating the identical `usage` object. Count each
+        # response once, keyed by message.id.
+        seen_msgs = set()
+        for f in files:
+            is_sub = f.parent.name == "subagents"
+            try:
+                fh = f.open(errors="replace")
+            except OSError:
+                continue
+            with fh:
+                for line in fh:
+                    try:
+                        d = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    t = d.get("type")
+                    if d.get("cwd"):
+                        s["cwd"] = d["cwd"]
+                    if d.get("gitBranch"):
+                        s["branch"] = d["gitBranch"]
+                    if d.get("version"):
+                        s["version"] = d["version"]
+                    if d.get("effort"):
+                        s["effort"] = d["effort"]
+                    if t in ("ai-title", "custom-title"):
+                        s["title"] = d.get("aiTitle") or d.get("customTitle") or s["title"]
+                    if d.get("entrypoint") and "headless" in str(d.get("entrypoint")):
+                        s["headless"] = True
+                    if d.get("isApiErrorMessage"):
+                        s["api_errors"] += 1
+                    if t != "assistant":
+                        continue
+                    msg = d.get("message") or {}
+                    u = msg.get("usage")
+                    if not u:
+                        continue
+                    key = msg.get("id") or d.get("requestId")
+                    if key:
+                        if key in seen_msgs:
+                            continue
+                        seen_msgs.add(key)
+                    model = msg.get("model") or "?"
+                    when = ts(d["timestamp"]) if d.get("timestamp") else None
+                    c = cost_of(model, u)
+                    s["reqs"] += 1
+                    s["cost"] += c
+                    if is_sub:
+                        s["sub_cost"] += c
+                    s["models"][model] += u.get("output_tokens", 0)
+                    for k in ("input_tokens", "output_tokens", "cache_read_input_tokens",
+                              "cache_creation_input_tokens"):
+                        s["tokens"][k] += u.get(k, 0)
+                    s["tokens"]["thinking"] += (u.get("output_tokens_details") or {}).get(
+                        "thinking_tokens", 0)
+                    # Which TTL bucket this turn's cache-write used, if any -- 1h
+                    # takes priority and stays sticky over a later 5m write, so a
+                    # session that ever used the 1h bucket keeps that as its clock.
+                    cc = u.get("cache_creation") or {}
+                    if cc.get("ephemeral_1h_input_tokens"):
+                        s["cache_bucket_sec"] = 3600
+                    elif cc.get("ephemeral_5m_input_tokens") and not s["cache_bucket_sec"]:
+                        s["cache_bucket_sec"] = 300
+                    if when:
+                        s["first"] = min(s["first"] or when, when)
+                        s["last"] = max(s["last"] or when, when)
+                        if when >= cutoff_win:
+                            s["win_out"] += u.get("output_tokens", 0)
+                            s["win_cost"] += c
+                            s["win_reqs"] += 1
+
+        if not s["reqs"]:
+            continue
+        r = reg.get(s["session_id"], {})
+        s["pid"] = r.get("pid")
+        s["status"] = r.get("status", "")
+        s["kind"] = r.get("kind", "")
+        s["name"] = r.get("name", "")
+        s["cmd"] = r.get("cmd", "")[:120]
+        if s["name"] and not s["title"]:
+            s["title"] = s["name"]
+        s["idle_min"] = (now - s["last"]) / 60 if s["last"] else None
+        # Approximate: treats the session as having one TTL clock (last
+        # cache-touch + whichever bucket it most recently wrote), when Claude
+        # Code may in principle keep more than one independent cache
+        # breakpoint. Good enough for a glanceable heuristic, not exact.
+        ttl_bucket = s["cache_bucket_sec"] or 300
+        s["ttl_bucket_sec"] = ttl_bucket
+        s["ttl_remaining_sec"] = (max(0, ttl_bucket - (now - s["last"]))
+                                   if s["last"] else None)
+        s["model"] = max(s["models"], key=s["models"].get) if s["models"] else "?"
+        s["models"] = dict(s["models"])
+        s["tokens"] = dict(s["tokens"])
+        s["out_per_min"] = s["win_out"] / window_min
+        s["usd_per_hr"] = s["win_cost"] * 60 / window_min
+        rows.append(s)
+
+    rows.sort(key=lambda r: (-r["usd_per_hr"], r["idle_min"] or 1e9))
+    return rows
+
+
+def human(n):
+    for unit, div in (("B", 1e9), ("M", 1e6), ("k", 1e3)):
+        if n >= div:
+            return f"{n/div:.1f}{unit}"
+    return str(int(n))
+
+
+def ttl_str(r):
+    """Colored 'time left in this session's cache TTL' cell, e.g. '42m',
+    '<1m', or 'EXP+7m' once it's lapsed -- glanceable at a distance."""
+    remaining = r.get("ttl_remaining_sec")
+    if remaining is None:
+        return col("dim", f"{'-':>7}")
+    if remaining > 0:
+        mins = remaining / 60
+        s = "<1m" if mins < 1 else f"{mins:.0f}m"
+        cl = "g" if remaining > 600 else "y"
+        return col(cl, f"{s:>7}")
+    overdue = ((time.time() - r["last"]) - r["ttl_bucket_sec"]) / 60
+    return col("r", f"{'EXP+%.0fm' % overdue:>7}")
+
+
+def render(rows, window_min):
+    if not rows:
+        print("no active sessions")
+        return
+    hdr = (f"{'SESSION':9} {'PID':>7} {'STATUS':7} {'MODEL':14} {'EFF':4} "
+           f"{'OUT/min':>8} {'$/hr':>7} {'$TOT':>8} {'OUT':>7} {'CACHE-R':>8} "
+           f"{'REQ':>4} {'IDLE':>6} {'TTL':>7}  WHERE")
+    print(hdr)
+    print("-" * len(hdr))
+    tot_hr = tot = 0.0
+    for r in rows:
+        if r["pid"]:
+            status = r.get("status") or "live"
+        else:
+            status = "sub" if r["session_id"].startswith("agent-") else "ended"
+        where = f"{Path(r['cwd']).name}@{r['branch']}" if r["cwd"] else "?"
+        if r["subagents"]:
+            where += f" +{r['subagents']}sub"
+        if r["title"]:
+            where += f"  {r['title'][:38]}"
+        print(f"{r['session_id'][:8]:9} {r['pid'] or '-':>7} {status[:7]:7} "
+              f"{r['model'].replace('claude-','')[:14]:14} {r['effort'][:4]:4} "
+              f"{human(r['out_per_min']):>8} {r['usd_per_hr']:>7.2f} {r['cost']:>8.2f} "
+              f"{human(r['tokens'].get('output_tokens',0)):>7} "
+              f"{human(r['tokens'].get('cache_read_input_tokens',0)):>8} "
+              f"{r['reqs']:>4} {r['idle_min']:>5.0f}m {ttl_str(r)}  {where}")
+        tot_hr += r["usd_per_hr"]
+        tot += r["cost"]
+    print("-" * len(hdr))
+    print(f"{len(rows)} transcripts · {sum(1 for r in rows if r['pid'])} live processes · "
+          f"${tot_hr:.2f}/hr (trailing {window_min:g}m) · ${tot:.2f} lifetime")
+    print("STATUS: busy/idle = live process (from ~/.claude/sessions) · "
+          "sub = subagent sidechain · ended = no live process")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-w", "--window", type=float, default=10, help="burn-rate window (min)")
+    ap.add_argument("-a", "--active", type=float, default=60, help="lookback for active (min)")
+    ap.add_argument("--live", action="store_true", help="only sessions with a live PID")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--watch", nargs="?", type=float, const=5, help="refresh every N sec")
+    a = ap.parse_args()
+
+    while True:
+        rows = scan(a.active, a.window)
+        if a.live:
+            rows = [r for r in rows if r["pid"]]
+        if a.json:
+            print(json.dumps(rows, indent=2, default=str))
+        else:
+            if a.watch:
+                print("\033[2J\033[H", end="")
+                print(f"cc-top  {datetime.now().strftime('%H:%M:%S')}\n")
+            render(rows, a.window)
+        if not a.watch:
+            break
+        time.sleep(a.watch)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)

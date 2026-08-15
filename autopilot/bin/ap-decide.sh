@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
-# Deterministic replacement for the haiku-model /autopilot-poll: implements
-# the exact tiers, keywords and claim rules in
-# claude/skills/autopilot-poll/SKILL.md against live `gh` data -- every step
-# there is a label query, a first-line marker check, an exact-word match, a
-# regex, a priority ordering, or a label swap, so a model call buys nothing.
-# The decision logic itself lives in ap-decide.py (plain Python is easier to
-# get exactly right and to unit-test than another layer of bash-JSON
-# plumbing); this script only parses flags, sources env, and logs.
+# The ONLY decision path (the haiku-model /autopilot-poll and its
+# AP_POLL_MODE switch are gone): implements the exact tiers/priority
+# ordering against the local queue ($AP_HOME/queue/<ENG-ID>.json, see
+# ap_queue.py) -- every step there is a state check, a field check, a
+# regex, or a state write, always deterministic, always free. The decision
+# logic itself lives in ap-decide.py (plain Python is easier to get exactly
+# right and to unit-test than another layer of bash-JSON plumbing); this
+# script only parses flags, sources env, and logs.
 #
 # Prints ONE JSON object to stdout, always, exit 0 always:
 #   {"action":"plan|implement|ship|replan|none","issue":"ENG-<id>",
-#    "planPath":"...","inboxIssue":<n>,"feedback":"..."}
+#    "planPath":"...","feedback":"..."}
 # (fields present only when relevant; "action" always present.)
 #
 # Flags:
-#   --dry-run       decide and print; perform NO gh writes (default).
-#   --claim         decide, perform the claiming label swaps, then print.
+#   --dry-run       decide and print; perform NO queue writes (default).
+#   --claim         decide, perform the claiming state writes, then print.
 #   --busy <lanes>  comma-separated subset of build,ship,plan to skip.
 #
 # No Linear write happens here -- see claude/skills/implement-issue/SKILL.md's
@@ -65,7 +65,7 @@ trap cleanup_decide_tmp EXIT
 rc=0
 python3 "$SCRIPT_DIR/ap-decide.py" \
   --mode "$mode" --busy "$busy" \
-  --ap-home "$AP_HOME" --inbox-repo "$AP_INBOX_REPO" --work-repo "$WORK_REPO" \
+  --ap-home "$AP_HOME" --work-repo "$WORK_REPO" \
   --auto-approve "$AP_AUTO_APPROVE" \
   >"$decide_out" 2>"$decide_err" || rc=$?
 

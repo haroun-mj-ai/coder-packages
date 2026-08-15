@@ -18,7 +18,7 @@ assert() {
   if "$@"; then pass "$desc"; else fail "$desc"; fi
 }
 
-SKILL_NAMES=(plan-issue implement-plan ship-work autopilot-poll daily-brief autopilot-protocol.md)
+SKILL_NAMES=(plan-issue implement-plan ship-work daily-brief autopilot-protocol.md)
 
 skip_worktree_bit() {
   # skip_worktree_bit <repo> <path> -> the ls-files -v status letter
@@ -29,11 +29,11 @@ skip_worktree_bit() {
 # Case A: fresh fake JourneyAI checkout with one dummy tracked file under
 # .claude/skills/plan-issue/SKILL.md (standing in for the team-tracked
 # SKILL.md files the real checkout has). Running the installer once must:
-#   - symlink all six .claude/skills/<name> entries into this repo's
+#   - symlink all five .claude/skills/<name> entries into this repo's
 #     claude/skills/<name> (the real source -- ROOT_DIR is fixed, not faked)
 #   - skip-worktree the one path git already tracks (plan-issue/SKILL.md)
-#   - leave the other five untouched by the skip-worktree step (nothing
-#     tracked there in this fake repo, same as autopilot-poll/daily-brief/
+#   - leave the other four untouched by the skip-worktree step (nothing
+#     tracked there in this fake repo, same as daily-brief/
 #     autopilot-protocol.md in the real one)
 #   - append the marked fence block to .git/info/exclude
 # =============================================================================

@@ -725,11 +725,12 @@ plainly what was **not** covered.
 Commit the artifact in its own commit, subject `ENG-<id>: add QA plan
 artifact` — not folded into a work-unit commit, since `/ship-work`'s later
 one-line edit to the `PRs:` line then touches a file nothing else is
-mid-editing. Report it in chat (step 10), and in headless mode post its
-header + a one-line pointer to the inbox issue marked `Phase: implement`
-(informational, not a question) — the **file is the source of truth**, the
-inbox post is a courtesy copy. Headless runs also record the artifact's
-absolute path in `status.json`'s `detail`.
+mid-editing. Report it in chat (step 10), and in headless mode record its
+header + a one-line pointer on the ticket's `history` (`ap_queue.py set
+<ENG-ID> --event "Phase: implement — QA artifact at <path>"`, informational,
+not a question) — the **file is the source of truth**, the queue write is a
+courtesy copy. Headless runs also record the artifact's absolute path in
+`status.json`'s `detail`.
 
 ### 10. Stop and report
 
@@ -746,7 +747,8 @@ human's own separate action) and Linear writes.
 
 ### 11. Commit, then review
 
-Subject `ENG-<id>: <what changed>`, one coherent unit per commit:
+**11a. Commit every repo first.** Subject `ENG-<id>: <what changed>`, one
+coherent unit per commit:
 
 - stage with **explicit paths**, never `git add -A` (has leaked live
   secrets from this tree before);
@@ -757,6 +759,13 @@ Subject `ENG-<id>: <what changed>`, one coherent unit per commit:
   them by hand there, verify with `git -C <path> log -1 --format=%B`;
 - small fixups on an unmerged branch of the human's own → `--amend`, not a
   follow-up commit.
+
+Do this for **every repo the ticket touches** before moving on to review —
+do not run roborev yet, even if a repo's commit is already done and another
+repo's isn't.
+
+**11b. Review every repo, only once all of them are committed.** Run once
+per repo, per ticket, not interleaved with 11a:
 
 ```bash
 roborev review --branch --base origin/dev --wait --repo <abs-repo-path>
@@ -936,13 +945,24 @@ These cost real runs real money to rediscover; do not re-derive them.
   the threshold talking, not your change.
 - **Playwright is available** — chromium installed, `mcp__playwright__*`
   allowed in the autopilot profile. Browser QA is expected, not optional.
+  **NEVER run `npx playwright install` or `playwright install`** — it
+  silently overwrites the shared nix-provided Chromium for the whole
+  workspace, breaking every other concurrent session; if Playwright seems
+  broken, stop and report it instead of trying to reinstall/repair it.
 
 ## Headless mode (`--headless`)
 
 Read `.claude/skills/autopilot-protocol.md` first — the `status.json` shape,
-the inbox contract, the ask→fallback rule, the Linear footprint are defined
-once there. This section states only what this skill's own ask points map
-to.
+the local queue contract, the ask→fallback rule, the Linear footprint are
+defined once there. This section states only what this skill's own ask
+points map to.
+
+**Resolve `$QUEUE_PY` once, before any `ap_queue.py` write below** (it isn't
+on `PATH` the way `ap` is — see autopilot-protocol.md's local queue
+contract):
+```bash
+QUEUE_PY="$(dirname "$(readlink -f "$(command -v ap)")")/ap_queue.py"
+```
 
 **The interactive/headless fork, stated plainly:** with no `--phase` flag,
 this skill behaves exactly as described above — `ExitPlanMode`'s approval
@@ -955,21 +975,25 @@ potentially hours apart, decided by two separate poll cycles.
 
 ### `--phase plan`
 
-**Input is always an existing issue id**, extracted by `autopilot-poll` from
-the inbox issue's title — never free text: `--phase plan <description>
+**Input is always an existing issue id**, taken from the queue ticket the
+decider dispatched — never free text: `--phase plan <description>
 --headless` with no issue id is `FAILED`, `detail: "headless requires an
 issue id"`. Step 1's create-a-ticket path is interactive-only.
 
-This phase's `NEEDS_HUMAN` inbox comments start with `Phase: plan`.
+This phase's `NEEDS_HUMAN` writes record `phase_at_question: "plan"` on the
+ticket.
 
 **Ask-point mapping** (step 1, only reachable given an issue id):
 
 - **Duplicate-ticket match**: plan the existing matching issue instead of
-  the one passed in, record the choice as an inbox comment. Do not ask.
-- **Description too thin**: `NEEDS_HUMAN` — post the specific question that
-  resolves it.
+  the one passed in, record the choice in the ticket's `history`
+  (`ap_queue.py set <ENG-ID> --event "planning <other-id> instead: duplicate
+  match"`). Do not ask.
+- **Description too thin**: `NEEDS_HUMAN` — record the specific question
+  that resolves it.
 - **Project-selection coin flip**: take the first matching rule in step 1's
-  priority order, record the assumption as an inbox comment. Do not ask.
+  priority order, record the assumption in the ticket's `history`. Do not
+  ask.
 - **"agent type not found" dispatch failure**: `FAILED` with that detail — no
   unattended remedy for a session predating the agent definitions.
 
@@ -977,8 +1001,8 @@ This phase's `NEEDS_HUMAN` inbox comments start with `Phase: plan`.
 correction. Revise the committed plan in place — same file, same branch, a
 new commit — and **re-run step 7's audit against the revision** before
 recommitting (a small strengthening beyond simply reposting: a revision
-changes claims that need re-verification). Post the revised plan to the
-inbox as a comment, same as a fresh plan.
+changes claims that need re-verification). Record the revised `plan_path` on
+the ticket, same as a fresh plan.
 
 **Linear claim + kata mirror, first thing:** at the start of a headless run,
 before any exploration or drafting — claim the issue (`assignee: me`,
@@ -986,24 +1010,41 @@ before any exploration or drafting — claim the issue (`assignee: me`,
 `work.attention ok` calls, unconditionally, `--feedback` re-plans included
 (re-claiming an already-claimed issue, or re-finding an already-created kata
 issue, is a harmless no-op). This is the only place the Linear claim can
-happen headlessly — `ap-decide.sh` has no Linear credential of its own.
+happen headlessly — `ap-decide.py` has no Linear credential of its own.
 `kata` needs no permission-profile ask beyond the allow-listed `Bash(kata
 *)`; if it errors for any reason other than "no match," record a one-line
 note in `status.json`'s `detail` and continue.
 
-**End state:** commit the plan exactly as step 7 does interactively. Create
-or update the inbox issue with the **full** plan markdown, prefixed `Plan
-file: <absolute path>`, label `plan-review`, write `status.json` with
-`status: DONE`, `phase: "plan"`, `plan_path` set. **Stop there — do not
-begin Phase B.** Step 9's Linear plan-summary comment is interactive-only
-and skipped headlessly; the claim already happened above.
+**End state:** commit the plan exactly as step 7 does interactively. Swap
+the ticket from `planning` to `plan-review` and record the plan's absolute
+path, in a single write:
+```bash
+python3 "$QUEUE_PY" --ap-home "$AP_HOME" set <ENG-ID> --state plan-review \
+  --field plan_path=/absolute/path/to/plan.md \
+  --event "plan ready for review"
+```
+This is the write that used to be a `Plan file: <path>` GitHub comment plus
+a label swap — without it the ticket never leaves `planning` and the
+pipeline stalls after every plan, so do not skip it or reorder it before the
+commit lands. Then write `status.json` with `status: DONE`, `phase: "plan"`,
+`plan_path` set. **Stop there — do not begin Phase B.** Step 9's Linear
+plan-summary comment is interactive-only and skipped headlessly; the claim
+already happened above.
 
 **Blocking open question surviving the audit** (step 5's `BLOCKING` marker):
-still post the plan to the inbox, but label `needs-input` instead of
-`plan-review`, write `status.json` with `status: NEEDS_HUMAN` and `question`
-set to the blocking text. Also `kata meta set <ref> work.attention
-needs-human --agent` and `work.attention_msg` to the same question — clear
-back to `ok` on whichever later run resolves it.
+instead of the `plan-review` swap above, set the ticket to `needs-input` and
+record the blocking question:
+```bash
+python3 "$QUEUE_PY" --ap-home "$AP_HOME" set <ENG-ID> --state needs-input \
+  --field plan_path=/absolute/path/to/plan.md \
+  --field question='"<the blocking question>"' \
+  --field phase_at_question='"plan"' \
+  --event "blocked: <short reason>"
+```
+Write `status.json` with `status: NEEDS_HUMAN` and `question` set to the
+blocking text. Also `kata meta set <ref> work.attention needs-human --agent`
+and `work.attention_msg` to the same question — clear back to `ok` on
+whichever later run resolves it.
 
 ### `--phase implement <plan_path>`
 
@@ -1011,7 +1052,7 @@ back to `ok` on whichever later run resolves it.
 inference and "confirm with the human" are interactive-only. A headless
 invocation with no explicit plan path writes `status.json` with `status:
 FAILED`, `detail: "headless requires an explicit plan path"`, and ends
-without touching the inbox.
+without touching the queue.
 
 **Before writing `NEEDS_HUMAN` at any of these stop points, stop any dev
 servers this run has already started** (the worktree frontend/backend from
@@ -1051,9 +1092,9 @@ comparison, exactly as interactive — headless QA is not lighter QA. Stop the
 changed-pair servers this run started; the baseline pair is never something
 this run started either way. Write the relaunch recipe into the QA
 artifact's `Relaunch:` header (the durable copy), then record the
-**artifact's absolute path** in `status.json`'s `detail` and post it as an
-inbox comment prefixed `Phase: implement`. Verify teardown with `ss -ltnp`
-before/after.
+**artifact's absolute path** in `status.json`'s `detail` and in the ticket's
+`history` (`ap_queue.py set <ENG-ID> --event "Phase: implement — QA artifact
+at <path>"`). Verify teardown with `ss -ltnp` before/after.
 
 **`--ports fe=<n>,be=<m>`** overrides steps 2/12's 5173-5176 range — bind
 exactly those two ports (never the baseline pair 5173/8000), and start the
@@ -1062,16 +1103,18 @@ worktree backend with `BACKEND_CORS_ORIGINS` set to a JSON list containing
 allowlist — omitting it reproduces the same broken-page failure for a
 different port range).
 
-**End state:** commit exactly as interactive (step 11), run `roborev`
-exactly as interactive, then run step 13 exactly as interactive — gate on
-scope/secrets, rebase, push, open the PR(s), fill and commit the QA
-artifact's `PRs:` line. Write `status.json` with `status: DONE`, `phase:
-"implement"`, `plan_path` set, `pr_urls` filled with every opened PR URL,
-`detail` = the QA artifact's absolute path. Post the PR URL(s) as part of
-the same `Phase: implement` inbox comment step 9 already writes. Do **not**
-change the inbox label — it stays `building`; the wrapper swaps it to
-`shipping` right after seeing this `DONE`, before invoking the ship phase.
-Roborev findings never block a `DONE` write — record in `detail`.
+**End state:** commit exactly as interactive (step 11a, every repo first),
+run `roborev` exactly as interactive (step 11b, every repo only once all are
+committed), then run step 13 exactly as interactive — gate on scope/secrets,
+rebase, push, open the PR(s), fill and commit the QA artifact's `PRs:` line.
+Write `status.json` with `status: DONE`, `phase: "implement"`, `plan_path`
+set, `pr_urls` filled with every opened PR URL, `detail` = the QA artifact's
+absolute path. Record the PR URL(s) on the ticket as part of the same
+`history` write step 9 already makes (`--field pr_urls='["<url>", ...]'`).
+Do **not** change the ticket's `state` — it stays `building`; the wrapper
+(`ap-cycle.sh`) swaps it to `shipping` right after seeing this `DONE`, before
+invoking the ship phase. Roborev findings never block a `DONE` write —
+record in `detail`.
 
 **Pushing and opening PRs is pre-approved headlessly** — step 13 runs
 exactly as interactive, no different gate. Merging is never autonomous:

@@ -16,13 +16,15 @@ cd coder-packages
 ```
 
 This installs `tmux` and `supercronic` if missing, creates
-`~/.autopilot/{runs,briefs,logs}`, seeds `~/.autopilot/env` (only if absent —
-never overwritten), symlinks `autopilot/bin/*` into `~/.local/bin`, adds a
-managed self-heal block to `~/.bashrc` that runs `ap up --quiet` on every
-interactive login, and wires the skills this feature runs (`implement-issue`
-— superseding the retired `plan-issue`/`implement-plan` stubs, kept
-symlinked only so a stale invocation fails informatively — `ship-work`,
-`autopilot-poll`, `daily-brief`, `autopilot-protocol.md`) as symlinks into
+`~/.autopilot/{runs,briefs,logs}` (`~/.autopilot/queue/` — the local queue,
+one JSON file per ticket — is created lazily by `ap_queue.py` on first use),
+seeds `~/.autopilot/env` (only if absent — never overwritten), symlinks
+`autopilot/bin/*` into `~/.local/bin`,
+adds a managed self-heal block to `~/.bashrc` that runs `ap up --quiet` on
+every interactive login, and wires the skills this feature runs
+(`implement-issue` — superseding the retired `plan-issue`/`implement-plan`
+stubs, kept symlinked only so a stale invocation fails informatively —
+`ship-work`, `daily-brief`, `autopilot-protocol.md`) as symlinks into
 the JourneyAI checkout
 (`AP_WORK_REPO`, default `/home/coder/root-for-local`) — see "A note on
 `coder-packages/claude/skills/`" below.
@@ -44,16 +46,6 @@ what you need:
   `~/.autopilot/runs/YYYY-MM-DD.jsonl`.
 - `AP_TZ` (default `UTC`) — timezone used for day boundaries (ledger,
   crontab, budget resets).
-- `AP_INBOX_REPO` (default `haroun-mj-ai/autopilot-inbox`) — the private
-  GitHub repo used for plan review, and the only intake channel autopilot
-  scans.
-- `AP_FULL_POLL_INTERVAL_MIN` (default `360`, i.e. 6h) — minutes between the
-  pre-scan gate's fallback full poll. Intake is fully deterministic via the
-  two inbox legs above, so this is pure insurance against (a) a human
-  comment misclassified as agent-authored by the `Plan file:` / `Phase:`
-  marker heuristic, and (b) a claim stranded by a mid-cycle crash that the
-  poll skill's own stale-claim sweep would recover — not a queue-pickup
-  mechanism. Set to `0` to disable this leg entirely.
 - `AP_BUILD_SLOTS` (default `2`, clamped to `1`-`4`) — concurrent
   implement→ship chains. Safe here specifically because backend tests run on
   mongomock (in-memory, per-test, never shared) and every build works in its
@@ -69,9 +61,6 @@ what you need:
   (see "Two consecutive failures" below) waits before clearing itself. `0`
   disables auto-resume entirely, so every pause then waits for a human,
   same as before this existed.
-- `AP_POLL_MODE` (default `model`) — `model` runs the haiku `/autopilot-poll`
-  skill every cycle; `deterministic` runs `ap-decide.sh` instead, for $0. See
-  "Poll modes" below before flipping this.
 - `AP_ACT_LAUNCH_MODE` (default `persistent`) — `persistent` runs every act
   as a real interactive `claude` session in its own tmux window, so a
   mid-run blocking question parks alive (`tmux attach -t autopilot` to
@@ -85,66 +74,61 @@ actually go anywhere; unconfigured, `ap-notify.sh` just logs to
 
 ## Daily flow
 
-1. **Label** a Linear issue `agent:queue`. Autopilot claims it (assignee +
-   `In Progress`) and plans it on the next cycle.
-2. **Review privately.** The full plan markdown is posted as an issue in the
-   private inbox repo (`AP_INBOX_REPO`) — readable from the GitHub mobile app,
-   invisible to the rest of the team. A phone ping links you there.
-3. **Approve or give feedback**, as a comment on that inbox issue:
-   - Comment `go` (exact word, case-insensitive) to approve — the very next
-     cycle claims it and starts building.
-   - Comment anything else and it is treated as feedback: the next cycle
-     re-plans in place, quoting your comment.
+1. **Queue it**: `ap queue ENG-1234 ["optional note"]` from anywhere on this
+   workspace. Autopilot claims it (Linear assignee + `In Progress`) and plans
+   it on the next cycle (every cycle is a decision pass now — see "The
+   decider" below).
+2. **Review privately.** The full plan markdown is committed to the branch as
+   always; the ticket's `plan_path` field points at it and its state moves to
+   `plan-review`. A phone ping tells you it's ready — `ap sessions` (or
+   `ap run <eng-id>`) shows the plan.
+3. **Approve or give feedback**:
+   - `ap approve ENG-1234` to approve — the very next cycle claims it and
+     starts building. `ap approve ENG-1234 --auto` also flips this ticket's
+     persistent auto-approve switch, so future plan phases on it skip this
+     step entirely (unless you `ap reply` with objecting feedback first).
+   - `ap reply ENG-1234 "..."` for anything else — treated as feedback: the
+     next cycle re-plans in place, quoting your text.
 4. **Build happens unattended**, on one of `AP_BUILD_SLOTS` (default `2`)
    concurrent build slots, each with its own frontend/backend port pair
    (`5173+n`/`8000+n` for slot `n`; the human's own `5173`/`8000` are never
    assigned to a slot) — see "Concurrent builds" below. `implement-issue`'s
    Phase B runs full QA (including the four-server comparison), then tears down the
    changed-pair servers and leaves only your baseline (5173/8000) bound. The
-   inbox label swaps `building` → `shipping` the moment `ship-work` starts
+   ticket's state swaps `building` → `shipping` the moment `ship-work` starts
    (with its own ping), so you can tell "still building" apart from "opening
    the PR" — then `ship-work` confirms the PR is rebased and locally
    gate-clean (it never merges, headless or interactive — that's permanently
    out of scope for this whole pipeline). You get a "ready
    to test" ping with the PR link and the exact relaunch commands (worktree
-   paths, ports) — also posted on the inbox issue. Headless autopilot never
-   comments on Linear: the claim and the `agent:ready-to-test` label are its
-   only Linear writes; everything else (PR links, QA notes, relaunch
-   commands) lands in the private inbox issue.
-5. **Morning:** run the relaunch commands from the inbox issue, test against
-   the running servers, then run the interactive `/ship-work` yourself to
-   reconfirm it's rebased and clean, and once CI is green, merge it yourself
-   (GitHub UI or `gh pr merge` — autonomous merging is permanently out of
-   scope). Archiving the plan under `docs/plans/completed/` and the rest of
-   closeout (Linear `Staging`, kata close, worktree removal) happens after
-   that merge, per `/ship-work`'s "After a human merges" reference.
+   paths, ports) — also recorded on the ticket's `pr_urls`. Headless autopilot
+   never comments on Linear: the claim and the `agent:ready-to-test` label are
+   its only Linear writes; everything else (PR links, QA notes, relaunch
+   commands) lands on the local queue ticket.
+5. **Morning:** run `/test-issue` (or the relaunch commands from `ap
+   sessions`), test against the running servers, then run the interactive
+   `/ship-work` yourself to reconfirm it's rebased and clean, and once CI is
+   green, merge it yourself (GitHub UI or `gh pr merge` — autonomous merging
+   is permanently out of scope). Archiving the plan under
+   `docs/plans/completed/` and the rest of closeout (Linear `Staging`, kata
+   close, worktree removal, and setting the ticket's state to `done`) happens
+   after that merge, per `/ship-work`'s "After a human merges" reference.
 
 A daily brief (`ap-brief.sh`, 07:00 `AP_TZ` by default) pings a digest of
 what's awaiting approval, ready to test, needs input, or failed, plus cost vs
 budget and any scheduler gap.
 
-### The 1-minute pre-scan gate
+### The decider
 
-`ap-cycle.sh` fires every minute, but the haiku poll (`/autopilot-poll`) —
-the only step that spends tokens before there's something to act on — only
-runs when a zero-token bash `gh` scan finds a plausible reason to wake it.
-The private inbox repo (`AP_INBOX_REPO`) is the only intake channel (no
-Linear polling): intake happens by opening a new inbox issue titled with the
-Linear id (e.g. `ENG-1234`) from the GitHub mobile app to delegate work, or
-by commenting on an existing `plan-review` / `needs-input` inbox issue.
-Concretely, the gate wakes the poll when it finds: an open inbox issue with
-none of the eight state labels (`planning`/`plan-review`/`building`/
-`shipping`/`ready-to-test`/`needs-input`/`failed`/`ship-pending`) — a fresh
-delegation; an unseen human comment (not one of autopilot's own `Plan file:`
-/ `Phase:`-stamped posts) on a `plan-review` or `needs-input` inbox issue; an
-open inbox issue labeled `ship-pending` (implement finished and committed,
-ship still owed — see "Ship-only retry" below); or — as pure insurance
-against a misclassified comment or a crash-stranded claim, not a
-queue-pickup mechanism — more than `AP_FULL_POLL_INTERVAL_MIN` minutes
-(default `360`, i.e. 6h; `0` disables this leg entirely) since the last
-poll. The gate is deliberately biased toward waking: a wrong "maybe" costs
-one idle haiku poll, which is what the old `*/20` cadence spent on every
-single fire.
+`ap-cycle.sh` fires every minute and, unlike the old haiku poll, decides
+every single cycle unconditionally — there is no gate to wake it, because
+deciding is now $0 and purely mechanical: a queue-file read, a state check,
+an exact-word match, a regex, a priority ordering, or a queue write. There is
+no GitHub inbox and no Linear polling for intake either — the only intake
+path is `ap queue ENG-<id>`, run by hand. `ap-decide.py` (invoked via
+`ap-decide.sh`) reads `$AP_HOME/queue/*.json`, applies its tiers in priority
+order, and either claims the highest-priority actionable ticket (a queue
+state write) or returns `action: none` for that cycle.
 
 ### Ship-only retry
 
@@ -152,10 +136,11 @@ Sometimes `implement` succeeds — the code is committed — and only the ship
 phase fails (an external cause such as a session/rate limit trip, or a hard
 CI stop). Re-running the whole `implement → ship` chain would be wasteful and
 risk re-doing already-good work, so the pipeline retries just the ship: the
-inbox label `ship-pending` means "implement committed, ship still owed" —
+queue state `ship-pending` means "implement committed, ship still owed" —
 set by the orchestrator when a ship phase fails for an external cause (see
-"Two consecutive failures" below), or reachable by relabelling an issue by
-hand. The next cycle claims it (`ship-pending` → `shipping`) and dispatches
+"Two consecutive failures" below), or reachable by `ap retry <target>`
+(human-triggered). The next cycle claims it (`ship-pending` → `shipping`) and
+dispatches
 `/ship-work --headless` directly (there is no `--no-merge` flag anymore —
 `ship-work` never merges, so nothing needs disabling), with no plan or implement step
 first. It claims its own **ship lane** slot (`AP_SHIP_SLOTS`, default `3`) —
@@ -178,8 +163,9 @@ already exited cleanly after committing the plan):
   and per-issue lock are released immediately, so a question that takes you
   hours to answer doesn't tie up one of the pipeline's 2 build slots for that
   whole time.
-- **Reply from your phone**, same as always — a GitHub inbox comment gets
-  relayed into the parked session automatically (`ap-cycle.sh` detects it and
+- **Reply from your phone**, same as always — `ap reply ENG-1234 "..."` gets
+  relayed into the parked session automatically (`ap-cycle.sh`'s
+  `scan_parked_replies` notices the ticket's `feedback_seq` advanced and
   backgrounds `ap-resume.sh`, which re-acquires a slot and injects the reply
   via `tmux send-keys`).
 - **Or reply at the workspace**: `tmux attach -t autopilot`, find the window
@@ -273,68 +259,45 @@ Budgets are the other brake: `AP_MAX_ISSUES_PER_DAY` and
 `AP_MAX_DAY_COST_USD` in `~/.autopilot/env`, checked against the day's ledger
 before every acting cycle.
 
-## Poll modes
-
-Every cycle's poll step decides the single next action for that cycle
-(triage of the private inbox) and, if there is one, claims it (a label
-swap). `AP_POLL_MODE` in `~/.autopilot/env` picks how that decision gets
-made:
-
-- **`model`** (default) — invokes the `/autopilot-poll` skill on a haiku
-  `claude -p` call, same as always. This is judgement-shaped prose: it reads
-  the inbox, reasons about which tier applies, and emits a JSON decision.
-  Costs real money every cycle it runs (~$0.13/poll observed), even on the
-  ~25% of polls that decide nothing.
-- **`deterministic`** — calls `autopilot/bin/ap-decide.sh --claim` instead.
-  Every step the poll makes is mechanical — a label query, a first-line
-  marker check (`Plan file:`/`Phase:`/`Autopilot:`), an exact-word match
-  (`go`/`auto`), a regex (`ENG-\d+`), a priority ordering, or a label swap —
-  so `ap-decide.sh` implements the exact same tiers as
-  `claude/skills/autopilot-poll/SKILL.md` in bash + Python against live
-  `gh` data, for $0. It also makes the claim (the label swap) enforced
-  rather than advisory: the model poll's claim is prose that can lag or be
-  skipped, which is how two implementers raced on the same worktree for
-  ENG-1308 (two consecutive polls both emitted `implement` for it).
-
-Compare the two before flipping the switch:
+## Deciding (`ap decide`)
 
 ```bash
-ap decide     # runs ap-decide.sh --dry-run against the REAL inbox, no
-              # writes, and pretty-prints the decision plus a one-line
-              # reason per tier it evaluated
+ap decide     # runs the decider (ap-decide.sh --dry-run) against the
+              # REAL local queue, no writes, and pretty-prints the
+              # decision plus a one-line reason per tier it evaluated
 ```
 
-Run `ap decide` for a while side by side with the live `model`-mode pipeline
-and confirm it would have made the same call on the same inbox state before
-setting `AP_POLL_MODE=deterministic` in `~/.autopilot/env`. The two
-implementations are kept in step deliberately (`autopilot-poll/SKILL.md`
-says so at its top) — if you change one tier's rule, change the other.
-`ap-decide.sh` never touches Linear (no credential available to it — the
-Linear claim on tier 5's new-delegation path now happens inside
-`/implement-issue --phase plan --headless` itself, at the start of its run,
-whichever poll mode chose it).
+`ap-decide.py` (invoked via `ap-decide.sh`) is the only decision path — there
+is no model-based alternative anymore, no haiku call, and nothing to flip
+between: every tier is mechanical (a queue-state read, an exact-field check,
+a regex, a priority ordering, or a queue write), so it's free and
+deterministic every cycle. It never touches Linear (no credential available
+to it — the Linear claim on the new-delegation tier happens inside
+`/implement-issue --phase plan --headless` itself, at the start of its run).
+Use `ap decide` any time you want to see what the next cycle would do
+without risking a write.
 
 ## Troubleshooting
 
 - **Permission denials under `dontAsk`:** an acting run fails fast (`FAILED`),
-  and the denial string lands both in the inbox issue's comment and in the
+  and the denial string lands both in the ticket's `history` and in the
   day's ledger line. This is the expected tightening loop — extend the allow
   list in `autopilot/settings/autopilot.json` once you've seen what was
   denied, rather than pre-approving broadly up front. `ship-work` can also
   retry a flaky CI job once, per its own retry budget, now that `gh run *`
   (`list`/`view`/`rerun`/`watch`) is on the allow list — no more stopping to
   ask a human to re-run a hung Actions job by hand.
-- **A claim looks stuck** (inbox issue stuck at `planning`/`building`): the
+- **A claim looks stuck** (ticket stuck at `planning`/`building`): the
   stale-claim sweep flags anything with no ledger entry in 3 hours and no
-  held lock as `failed`, with a comment. This covers both a workspace restart
-  mid-run and a legitimate crash.
+  held lock as `failed`, with a `history` entry. This covers both a
+  workspace restart mid-run and a legitimate crash.
 - **A failure was caused by something outside the plan/code** (a
   rate/usage/session limit trip, or the provider itself erroring —
   `overloaded`, `529`, `API Error`): the orchestrator does not dead-end this
   at `failed`. It restores the state the failed phase started from
-  (`plan`/`replan` → `Queued`, `implement` → `plan-review`, `ship` →
-  `ship-pending`) and comments on the inbox issue naming the matched
-  signature, so the next cycle picks the same work back up once things
+  (`plan`/`replan` → `queued`, `implement` → `plan-review`, `ship` →
+  `ship-pending`) and records the matched signature in the ticket's
+  `history`, so the next cycle picks the same work back up once things
   clear. The notify title says `requeued after external failure: <issue>`
   instead of `FAILED`. This still counts toward the two-consecutive-failure
   counter below — that backoff is what stops a re-queue from thrashing.
@@ -357,7 +320,7 @@ whichever poll mode chose it).
 ## A note on `coder-packages/claude/skills/`
 
 This repo's `claude/skills/` is the single source of truth for
-`implement-issue`, `ship-work`, `autopilot-poll`, `daily-brief`, and
+`implement-issue`, `ship-work`, `daily-brief`, and
 `autopilot-protocol.md` (plus the retired `plan-issue`/`implement-plan`
 stubs, kept symlinked so a stale invocation fails informatively rather than
 404ing). The JourneyAI checkout (`AP_WORK_REPO`) never holds

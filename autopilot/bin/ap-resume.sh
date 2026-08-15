@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ap-resume.sh <inbox-issue> [<reply-text>]
+# ap-resume.sh <eng-id> [<reply-text>] [<feedback-seq>]
 #
 # Resumes a parked act (see ap-cycle.sh's persistent-mode NEEDS_HUMAN
 # handling and park_registry_write): re-acquires its original lane slot,
@@ -10,26 +10,25 @@
 # registry and both locks either way.
 #
 # Two callers, same script, same locking -- never two independent
-# mechanisms both deciding whether an issue is parked or dead:
-#   - ap-cycle.sh's scan_parked_replies (a fresh GitHub inbox comment on a
-#     parked issue) passes the comment text.
+# mechanisms both deciding whether a ticket is parked or dead:
+#   - ap-cycle.sh's scan_parked_replies (the ticket's feedback_seq advanced,
+#     via `ap reply`) passes the reply text and the new feedback_seq.
 #   - ap-cycle.sh's sweep_manual_resumes (the parked act's status/window
 #     already changed with no resume in flight) passes an empty string.
 #
 # Never drops a reply silently: if the window is gone, or no slot is free,
 # this exits WITHOUT marking anything consumed and removes the (now-stale)
-# registry entry, so the ordinary fallback path -- the next cron tick's
-# scan_inbox_comments, once is_parked() no longer excludes this issue --
-# picks the same comment up as a ordinary fresh reply, exactly as if this
-# whole feature didn't exist.
+# registry entry, so the ordinary fallback path -- ap-decide.py's tier3,
+# once its parked-exclusion no longer applies -- picks the same reply up as
+# an ordinary fresh answer, exactly as if this whole feature didn't exist.
 #
 # Known simplification, not silently: this reconcile does NOT replicate
 # ap-cycle.sh's Stage 3 external-failure-signature requeue logic (a
 # usage-limit/rate-limit/provider-outage FAILED gets requeued to its
-# pre-act label there instead of dead-ending at `failed`). A resumed act
+# pre-act state there instead of dead-ending at `failed`). A resumed act
 # that FAILs for an external cause here dead-ends at `failed` like any
-# other failure; a human relabelling it is the fallback, same as this
-# pipeline's behavior before that logic existed.
+# other failure; `ap retry` is the fallback, same as this pipeline's
+# behavior before that logic existed.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
@@ -37,15 +36,20 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 source "$SCRIPT_DIR/ap-env.sh"
 
 SETTINGS_PATH="$(cd "$SCRIPT_DIR/.." && pwd)/settings/autopilot.json"
+QUEUE_PY="$SCRIPT_DIR/ap_queue.py"
 
-inbox_issue="${1:?usage: ap-resume.sh <inbox-issue> [<reply-text>] [<comment-id>]}"
+eng_id="${1:?usage: ap-resume.sh <eng-id> [<reply-text>] [<feedback-seq>]}"
 reply_text="${2:-}"
-comment_id="${3:-}"
+feedback_seq="${3:-}"
 
 mkdir -p "$AP_HOME/logs"
 
 log() {
-  echo "$(date -u +%FT%TZ) resume[$inbox_issue]: $*" >>"$AP_HOME/logs/cycle.log"
+  echo "$(date -u +%FT%TZ) resume[$eng_id]: $*" >>"$AP_HOME/logs/cycle.log"
+}
+
+queue_set() {
+  python3 "$QUEUE_PY" --ap-home "$AP_HOME" set "$eng_id" "$@" >>"$AP_HOME/logs/cycle.log" 2>&1 || true
 }
 
 json_field() {
@@ -118,10 +122,10 @@ session_id_for_window() {
 # ledger_path/append_ledger -- same shape and O_APPEND-is-safe reasoning as
 # ap-cycle.sh's copy (see there for the full comment); duplicated rather
 # than sourced for the same reason window_alive/park_registry_write already
-# are here. Without this, every act that gets parked-and-resumed (GitHub
-# reply or manual tmux attach) would vanish from `ap runs`/`ap status`
-# entirely once its window is torn down -- a blind spot on exactly the acts
-# this feature exists to support, not just an inaccurate cost figure.
+# are here. Without this, every act that gets parked-and-resumed (a reply or
+# manual tmux attach) would vanish from `ap runs`/`ap status` entirely once
+# its window is torn down -- a blind spot on exactly the acts this feature
+# exists to support, not just an inaccurate cost figure.
 ledger_path() {
   echo "$AP_HOME/runs/$(TZ="$AP_TZ" date +%F).jsonl"
 }
@@ -168,39 +172,37 @@ model_for_session() {
   python3 "$SCRIPT_DIR/ap-runs.py" model "$sid" 2>>"$AP_HOME/logs/cycle.log"
 }
 
-# park_registry_write <inbox-issue> <issue> <phase> <lane> <window> <session_id> <run_dir> <plan_path> <fe_port> <be_port> <question>
+# park_registry_write <eng-id> <phase> <lane> <window> <session_id> <run_dir> <plan_path> <fe_port> <be_port> <question>
 # Same shape ap-cycle.sh's own park_registry_write writes -- kept as a
 # single definition here (not duplicated per call site) since this script
-# writes it from three places: re-parking after a resumed NEEDS_HUMAN, and
+# writes it from two places: re-parking after a resumed NEEDS_HUMAN, and
 # parking the chained ship dispatch below.
 park_registry_write() {
-  local p_inbox="$1" p_issue="$2" p_phase="$3" p_lane="$4" p_window="$5" p_session_id="$6" \
-        p_run_dir="$7" p_plan_path="$8" p_fe="$9" p_be="${10}" p_question="${11}"
+  local p_eng="$1" p_phase="$2" p_lane="$3" p_window="$4" p_session_id="$5" \
+        p_run_dir="$6" p_plan_path="$7" p_fe="$8" p_be="$9" p_question="${10}"
   mkdir -p "$AP_HOME/parked"
-  python3 - "$AP_HOME/parked/$p_inbox.json" "$p_inbox" "$p_issue" "$p_phase" "$p_lane" \
+  python3 - "$AP_HOME/parked/$p_eng.json" "$p_eng" "$p_phase" "$p_lane" \
     "$p_window" "$p_session_id" "$p_run_dir" "$p_plan_path" "$p_fe" "$p_be" "$(date -u +%FT%TZ)" "$p_question" <<'PY'
 import json, os, sys
-(path, inbox_issue, issue, phase, lane, window, session_id,
- run_dir, plan_path, fe_port, be_port, parked_at, question) = sys.argv[1:14]
-# Preserve last_relayed_comment_id across the overwrite -- same reasoning as
-# ap-cycle.sh's copy of this function: losing it makes an already-handled
-# comment look new again and re-inject into a session now parked on a
+(path, issue, phase, lane, window, session_id,
+ run_dir, plan_path, fe_port, be_port, parked_at, question) = sys.argv[1:13]
+# Preserve last_relayed_feedback_seq across the overwrite -- same reasoning
+# as ap-cycle.sh's copy of this function: losing it makes an already-handled
+# reply look new again and re-inject into a session now parked on a
 # different question. Applies both to a re-park after a resumed
-# NEEDS_HUMAN, and to the chained-ship park (a new window, same inbox
-# issue's comment thread).
-last_relayed = None
+# NEEDS_HUMAN, and to the chained-ship park (a new window, same ticket).
+last_relayed = 0
 try:
     with open(path) as f:
-        last_relayed = json.load(f).get("last_relayed_comment_id")
+        last_relayed = json.load(f).get("last_relayed_feedback_seq", 0)
 except Exception:
     pass
-d = {"inbox_issue": int(inbox_issue) if inbox_issue.isdigit() else inbox_issue,
-     "issue": issue or None, "phase": phase or None, "lane": lane or None,
+d = {"issue": issue or None, "phase": phase or None, "lane": lane or None,
      "window": window or None, "session_id": session_id or None,
      "run_dir": run_dir or None, "plan_path": plan_path or None,
      "ports": {"fe": fe_port, "be": be_port} if fe_port else None,
      "parked_at": parked_at, "question": question or None,
-     "last_relayed_comment_id": last_relayed}
+     "last_relayed_feedback_seq": last_relayed}
 tmp = path + ".tmp"
 with open(tmp, "w") as f:
     json.dump(d, f)
@@ -250,13 +252,12 @@ lane_free() {
   return 1
 }
 
-registry_file="$AP_HOME/parked/$inbox_issue.json"
-inbox_url="https://github.com/$AP_INBOX_REPO/issues/$inbox_issue"
+registry_file="$AP_HOME/parked/$eng_id.json"
 
-# Non-blocking: a resume already in flight for this exact issue owns it --
-# guards against a near-simultaneous second GitHub comment, or a comment
-# racing a manual tmux attach.
-exec {resume_fd}>"$AP_HOME/lock.resume.$inbox_issue"
+# Non-blocking: a resume already in flight for this exact ticket owns it --
+# guards against a near-simultaneous second `ap reply`, or a reply racing a
+# manual tmux attach.
+exec {resume_fd}>"$AP_HOME/lock.resume.$eng_id"
 if ! flock -n "$resume_fd"; then
   log "already has a resume in flight -- not double-injecting"
   exit 0
@@ -270,7 +271,6 @@ fi
 registry_json="$(cat "$registry_file" 2>/dev/null)"
 window="$(json_field "$registry_json" ".window")"
 lane="$(json_field "$registry_json" ".lane")"
-issue="$(json_field "$registry_json" ".issue")"
 phase="$(json_field "$registry_json" ".phase")"
 run_dir="$(json_field "$registry_json" ".run_dir")"
 plan_path="$(json_field "$registry_json" ".plan_path")"
@@ -282,9 +282,8 @@ if [[ -z "$window" ]] || ! window_alive "$window"; then
   log "window ($window) is gone -- falling back to the ordinary re-derive-from-plan-file path, reply NOT consumed"
   rm -f "$registry_file"
   if [[ -n "$reply_text" ]]; then
-    ap-notify.sh "live session gone for ${issue:-ENG-$inbox_issue}" \
-      "the parked window disappeared; your reply will be picked up by a fresh run instead of the live one" \
-      "$inbox_url" || true
+    ap-notify.sh "live session gone for $eng_id" \
+      "the parked window disappeared; your reply will be picked up by a fresh run instead of the live one" || true
   fi
   exit 0
 fi
@@ -333,12 +332,10 @@ if ! flock -n "$lane_fd"; then
   exit 0
 fi
 
-if [[ -n "$issue" ]]; then
-  exec {issue_fd}>"$AP_HOME/lock.issue.$issue"
-  if ! flock -n "$issue_fd"; then
-    log "issue $issue is already locked by another act -- not consuming, retry later"
-    exit 0
-  fi
+exec {issue_fd}>"$AP_HOME/lock.issue.$eng_id"
+if ! flock -n "$issue_fd"; then
+  log "ticket $eng_id is already locked by another act -- not consuming, retry later"
+  exit 0
 fi
 
 old_status_content="$(cat "$status_file" 2>/dev/null)"
@@ -353,25 +350,25 @@ if [[ -n "$reply_text" ]]; then
   sleep 1
   tmux send-keys -t "$AP_TMUX_SESSION:$window" Enter
   log "injected reply into $window"
-  # Mark the triggering comment consumed HERE, now that injection has
-  # actually happened -- not in ap-cycle.sh's scan_parked_replies before
-  # this script even ran. Marking it there was a real bug: every bail-out
-  # above (no free slot, lock busy, window gone) is meant to be retried on
-  # a later cycle, exactly like every other busy-lane skip in this
-  # pipeline, but pre-marking would have made "no free slot" silently drop
-  # the reply forever instead of retrying -- the same class of caught-live
-  # bug this whole feature exists to avoid, not introduce.
-  if [[ -n "$comment_id" ]]; then
-    python3 - "$registry_file" "$comment_id" <<'PY'
+  # Mark the triggering reply consumed HERE, now that injection has actually
+  # happened -- not in ap-cycle.sh's scan_parked_replies before this script
+  # even ran. Marking it there was a real bug: every bail-out above (no free
+  # slot, lock busy, window gone) is meant to be retried on a later cycle,
+  # exactly like every other busy-lane skip in this pipeline, but
+  # pre-marking would have made "no free slot" silently drop the reply
+  # forever instead of retrying -- the same class of caught-live bug this
+  # whole feature exists to avoid, not introduce.
+  if [[ -n "$feedback_seq" ]]; then
+    python3 - "$registry_file" "$feedback_seq" <<'PY'
 import json, os, sys
-path, cid = sys.argv[1], sys.argv[2]
+path, seq = sys.argv[1], sys.argv[2]
 try:
     with open(path) as f:
         d = json.load(f)
 except Exception:
     d = {}
 try:
-    d["last_relayed_comment_id"] = int(cid)
+    d["last_relayed_feedback_seq"] = int(seq)
 except ValueError:
     pass
 tmp = path + ".tmp"
@@ -404,9 +401,9 @@ final_status="$(json_field "$status_json" ".status")"
 # One ledger row for THIS resumed act's own outcome, regardless of which of
 # DONE/NEEDS_HUMAN/FAILED it landed on -- mirrors ap-cycle.sh's run_claude(),
 # which logs once per invocation no matter the status. Without this, a
-# parked-and-resumed act (GitHub reply or manual tmux attach) is invisible
-# to `ap runs`/`ap status` entirely, not just missing its cost.
-append_ledger "${issue:-}" "${phase:-unknown}" "$final_status" \
+# parked-and-resumed act (a reply or manual tmux attach) is invisible to
+# `ap runs`/`ap status` entirely, not just missing its cost.
+append_ledger "$eng_id" "${phase:-unknown}" "$final_status" \
   "$(cost_for_session "$session_id")" "$session_id" "$model"
 
 # Debounce before tearing down, same reasoning as ap-cycle.sh's run_claude().
@@ -422,46 +419,44 @@ case "$final_status" in
     if [[ "$phase" == "ship" ]]; then
       teardown_window "$window"
       pr_urls="$(json_join "$status_json" ".pr_urls")"
-      ap-notify.sh "ready to test: ${issue:-ENG-$inbox_issue}" "${pr_urls:-see inbox}" "$inbox_url" || true
+      ap-notify.sh "ready to test: $eng_id" "${pr_urls:-see ap sessions}" || true
     elif [[ "$phase" == "plan" || "$phase" == "replan" ]]; then
       teardown_window "$window"
-      ap-notify.sh "plan ready for review: ${issue:-ENG-$inbox_issue}" "comment 'go' to build, anything else = feedback" "$inbox_url" || true
+      ap-notify.sh "plan ready for review: $eng_id" "\`ap approve $eng_id\` to build, \`ap reply $eng_id \"...\"\` = feedback" || true
     elif [[ "$phase" == "implement" ]]; then
       # Same chain ap-cycle.sh's own implement arm runs: swap building ->
       # shipping, ping, then dispatch the ship phase in a NEW window on the
       # SAME slot -- this act's own window is done, ship gets its own.
-      gh issue edit "$inbox_issue" --repo "$AP_INBOX_REPO" \
-        --add-label shipping --remove-label building \
-        >>"$AP_HOME/logs/cycle.log" 2>&1 || true
-      ap-notify.sh "shipping: ${issue:-ENG-$inbox_issue}" "implement done, PR open, waiting on CI" "$inbox_url" || true
+      queue_set --state shipping --event "implement done, PR open -> shipping"
+      ap-notify.sh "shipping: $eng_id" "implement done, PR open, waiting on CI" || true
       teardown_window "$window"
-      ship_window="act_build_${acquired_lock_file##*.}_${issue:-unknown}_ship"
+      ship_window="act_build_${acquired_lock_file##*.}_${eng_id}_ship"
       if window_alive "$ship_window"; then
         log "ship window $ship_window already exists -- refusing to dispatch a duplicate chained ship"
       else
         launch_window_and_wait "$ship_window" \
           "/ship-work $plan_path --headless --ports fe=$fe_port,be=$be_port --run-dir $run_dir" \
-          "${AP_SHIP_MODEL:-sonnet}" "${issue:-}" ship
+          "${AP_SHIP_MODEL:-sonnet}" "$eng_id" ship
         log "chained ship in $ship_window finished with status=$final_status"
         case "$final_status" in
           DONE)
             teardown_window "$ship_window"
             pr_urls="$(json_join "$status_json" ".pr_urls")"
-            ap-notify.sh "ready to test: ${issue:-ENG-$inbox_issue}" "${pr_urls:-see inbox}" "$inbox_url" || true
+            ap-notify.sh "ready to test: $eng_id" "${pr_urls:-see ap sessions}" || true
             ;;
           NEEDS_HUMAN)
             question="$(json_field "$status_json" ".question")"
-            gh issue comment "$inbox_issue" --repo "$AP_INBOX_REPO" --body "Autopilot: needs input (phase ship).
-
-$question" >>"$AP_HOME/logs/cycle.log" 2>&1 || true
-            ap-notify.sh "autopilot needs input: ${issue:-ENG-$inbox_issue}" "${question:-see inbox}" "$inbox_url" || true
-            park_registry_write "$inbox_issue" "$issue" ship build "$ship_window" "$launch_session_id" "$run_dir" "$plan_path" "$fe_port" "$be_port" "$question"
+            queue_set --state needs-input \
+              --field "question=$(printf '%s' "$question" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')" \
+              --field 'phase_at_question="ship"' \
+              --event "needs input (phase ship)"
+            ap-notify.sh "autopilot needs input: $eng_id" "${question:-see ap sessions}" || true
+            park_registry_write "$eng_id" ship build "$ship_window" "$launch_session_id" "$run_dir" "$plan_path" "$fe_port" "$be_port" "$question"
             exit 0
             ;;
           *)
-            gh issue edit "$inbox_issue" --repo "$AP_INBOX_REPO" \
-              --add-label failed --remove-label shipping >>"$AP_HOME/logs/cycle.log" 2>&1 || true
-            ap-notify.sh "autopilot FAILED: ${issue:-ENG-$inbox_issue}" "ship phase failed after resume; see $ship_window's transcript" "$inbox_url" || true
+            queue_set --state failed --event "ship phase failed after resume"
+            ap-notify.sh "autopilot FAILED: $eng_id" "ship phase failed after resume; see $ship_window's transcript" || true
             teardown_window "$ship_window"
             ;;
         esac
@@ -471,13 +466,14 @@ $question" >>"$AP_HOME/logs/cycle.log" 2>&1 || true
 
   NEEDS_HUMAN)
     question="$(json_field "$status_json" ".question")"
-    gh issue comment "$inbox_issue" --repo "$AP_INBOX_REPO" --body "Autopilot: needs input (phase ${phase:-unknown}).
-
-$question" >>"$AP_HOME/logs/cycle.log" 2>&1 || true
-    ap-notify.sh "autopilot needs input: ${issue:-ENG-$inbox_issue}" "${question:-see inbox}" "$inbox_url" || true
+    queue_set --state needs-input \
+      --field "question=$(printf '%s' "$question" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')" \
+      --field "phase_at_question=\"${phase:-plan}\"" \
+      --event "needs input (phase ${phase:-unknown})"
+    ap-notify.sh "autopilot needs input: $eng_id" "${question:-see ap sessions}" || true
     # Re-park under the SAME window (still alive) -- everything is unchanged
     # from the original entry except parked_at/question.
-    park_registry_write "$inbox_issue" "$issue" "$phase" "$lane" "$window" "$session_id" "$run_dir" "$plan_path" "$fe_port" "$be_port" "$question"
+    park_registry_write "$eng_id" "$phase" "$lane" "$window" "$session_id" "$run_dir" "$plan_path" "$fe_port" "$be_port" "$question"
     ;;
 
   *)
@@ -488,13 +484,8 @@ $question" >>"$AP_HOME/logs/cycle.log" 2>&1 || true
     rm -f "$registry_file"
     teardown_window "$window"
     stdout_tail="transcript output isn't captured for a resumed persistent act; see $window's transcript via ap tail if it still exists"
-    ap-notify.sh "autopilot FAILED: ${issue:-ENG-$inbox_issue}" "$stdout_tail" "$inbox_url" || true
-    gh issue edit "$inbox_issue" --repo "$AP_INBOX_REPO" \
-      --add-label failed --remove-label planning --remove-label building \
-      --remove-label shipping --remove-label ship-pending \
-      >>"$AP_HOME/logs/cycle.log" 2>&1 || true
-    gh issue comment "$inbox_issue" --repo "$AP_INBOX_REPO" --body "Autopilot: run failed after resume." \
-      >>"$AP_HOME/logs/cycle.log" 2>&1 || true
+    ap-notify.sh "autopilot FAILED: $eng_id" "$stdout_tail" || true
+    queue_set --state failed --event "run failed after resume"
     ;;
 esac
 

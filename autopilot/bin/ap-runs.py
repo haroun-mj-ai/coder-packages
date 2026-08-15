@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Inspect individual autopilot acts. Backend for `ap runs|run|tail`.
+"""Inspect individual autopilot acts. Backend for `ap runs|run|tail`, and
+(via ap_queue.py) the local queue's mutation commands: `ap queue`/`ap
+approve`/`ap reply`/`ap retry` -- the CLI-only replacement for what used to
+be a GitHub inbox comment/label.
 
-An act is a headless `claude -p` session, so there is no pane to attach to.
-What there is:
+A persistent-mode act (the default) runs in a real tmux window, so
+`ap sessions`'s `[a]ttach` action (see _attach_act) can jump a terminal into
+it directly. What there is for inspecting any act, live or finished:
 
   * the ledger row      ~/.autopilot/runs/<date>.jsonl   (phase, status, cost)
   * the run dir         ~/.autopilot/runs/<ts>-<pid>/    (status.json, *.stderr)
@@ -14,6 +18,8 @@ session id through ~/.claude/sessions/<pid>.json; a finished act comes from the
 ledger, and its run dir is recovered from the --run-dir in its own prompt.
 """
 import argparse
+import curses
+import curses.textpad
 import json
 import os
 import re
@@ -24,7 +30,17 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import ap_queue
+
 AP_HOME = Path(os.environ.get("AP_HOME", Path.home() / ".autopilot"))
+# cc-top lives in the sibling coder-packages/bin/, not autopilot/bin/ --
+# shelled out to (not imported) so the two tools stay decoupled; `ap
+# sessions` is the one place that needs cc-top's full per-session stats
+# (cost/model/TTL/idle) merged onto its own act/queue-oriented rows.
+CC_TOP = Path(__file__).resolve().parents[2] / "bin" / "cc-top"
+if not CC_TOP.exists():
+    _found = shutil.which("cc-top")
+    CC_TOP = Path(_found) if _found else None
 RUNS = AP_HOME / "runs"
 # Overridable so the test harness can point at fixture transcripts instead of
 # the real ~/.claude; nothing in normal use sets these.
@@ -407,100 +423,732 @@ def age_str(ts_str):
     return f"{secs // 86400}d"
 
 
+QUEUE_DASHBOARD_STATES = ("queued", "plan-review", "needs-input", "ship-pending")
+
+
+def _cc_top_stats():
+    """session_id -> cc-top's row for it (cost/model/effort/out-per-min/
+    $/hr/$tot/tokens/reqs/idle/ttl) -- every session on this machine, not
+    just autopilot's, via `cc-top --json`. Empty dict (never raises) if
+    cc-top can't be found or the call fails for any reason -- this is a
+    display enrichment, never load-bearing for `ap sessions`'s own act/
+    queue logic. -a is generous (7 days) since a parked act can idle far
+    longer than cc-top's own 60-minute default before a human gets to it."""
+    if not CC_TOP:
+        return {}
+    try:
+        out = subprocess.run(
+            [sys.executable, str(CC_TOP), "--json", "-a", "10080"],
+            capture_output=True, text=True, timeout=15).stdout
+        rows = json.loads(out)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return {}
+    return {r["session_id"]: r for r in rows if r.get("session_id")}
+
+
 def _dashboard_rows():
-    """Every live act, plus each OTHER issue's most recent finished outcome
-    (so a FAILED/DONE/NEEDS_HUMAN act doesn't just disappear from the
-    dashboard once its window is gone) -- one row per issue, live wins."""
+    """Every live act, plus every queue ticket waiting on a human decision
+    (queued/plan-review/needs-input/ship-pending), plus each OTHER issue's
+    most recent finished outcome (so a FAILED/DONE/NEEDS_HUMAN act doesn't
+    just disappear from the dashboard once its window is gone) -- one row
+    per issue, live wins, then a pending queue state, then the ledger. Live
+    rows additionally carry `stats` (cc-top's per-session cost/model/TTL/
+    idle, keyed by session_id) when a match is found -- None otherwise.
+
+    A queue ticket's state ALWAYS wins over the ledger's historical status
+    once one exists for that issue, no matter which state it's in -- not
+    just the 4 "awaiting decision" ones. Marking a stale row done/resolved
+    via the [s]tatus action would otherwise keep silently losing to the old
+    ledger row here, which is exactly the bug that made it look like nothing
+    happened."""
     live = live_acts()
     live_issues = {a["target"] for a in live if a.get("target")}
+    all_queue = {e["eng_id"]: e for e in ap_queue.list_queue(str(AP_HOME))}
+    queue_entries = [e for eng_id, e in all_queue.items()
+                      if e.get("state") in QUEUE_DASHBOARD_STATES
+                      and eng_id not in live_issues]
+    queue_pending_issues = {e["eng_id"] for e in queue_entries}
     by_issue = {}
+    latest_session_for_issue = {}
     for r in ledger_rows(days=7):
-        if r.get("phase") == "poll" or not r.get("issue") or r["issue"] in live_issues:
+        if r.get("phase") == "poll" or not r.get("issue"):
             continue
-        by_issue[r["issue"]] = r  # ledger_rows() is chronological -- last write wins
+        # Unfiltered: even a queue-pending issue (e.g. needs-input, its
+        # window long dead) had a real session at some point -- keep that
+        # around so its row can still show cc-top's historical stats for it,
+        # not just issues that fall through to a "done" ledger row.
+        if r.get("session_id"):
+            latest_session_for_issue[r["issue"]] = r["session_id"]  # chronological -- last wins
+        if r["issue"] in live_issues or r["issue"] in queue_pending_issues:
+            continue
+        by_issue[r["issue"]] = r
+    cc_stats = _cc_top_stats()
     rows = [{"kind": "live", "issue": a["target"], "phase": a["phase"], "status": "LIVE",
               "note": "parked (needs input)" if a["parked"] else
                       ("interactive" if a["window"] else "headless"),
-              "rec": a}
+              "rec": a, "stats": cc_stats.get(a.get("session_id"))}
             for a in sorted(live, key=lambda a: a["target"] or "")]
-    rows += [{"kind": "done", "issue": iss, "phase": r.get("phase"),
-               "status": r.get("status"), "note": f"{age_str(r.get('ts'))} ago", "rec": r}
-             for iss, r in sorted(by_issue.items(), key=lambda kv: kv[1].get("ts", ""))]
+    rows += [{"kind": "queue", "issue": e["eng_id"], "phase": None,
+               "status": e["state"].upper(), "note": _queue_note(e), "rec": e,
+               "stats": cc_stats.get(latest_session_for_issue.get(e["eng_id"]))}
+             for e in sorted(queue_entries, key=lambda e: e.get("seq", 0))]
+    for iss, r in sorted(by_issue.items(), key=lambda kv: kv[1].get("ts", "")):
+        # The ledger row always carries the real session_id for this
+        # issue's last act, even once it's finished -- cc-top's own scan
+        # still has stats for it as long as the transcript is within its
+        # lookback window, so a DONE/FAILED/etc. row isn't stuck showing all
+        # dashes just because it's not live anymore.
+        row_stats = cc_stats.get(r.get("session_id"))
+        q = all_queue.get(iss)
+        if q is not None and iss not in live_issues and iss not in queue_pending_issues:
+            # A non-pending queue state (done/failed/building/planning/
+            # shipping/ready-to-test) with no live act for it -- show the
+            # queue's own state/note, not the possibly long-stale ledger row.
+            rows.append({"kind": "queue", "issue": iss, "phase": r.get("phase"),
+                         "status": q["state"].upper(), "note": _queue_note(q),
+                         "rec": q, "stats": row_stats})
+        else:
+            rows.append({"kind": "done", "issue": iss, "phase": r.get("phase"),
+                         "status": r.get("status"), "note": f"{age_str(r.get('ts'))} ago",
+                         "rec": r, "stats": row_stats})
     return rows
+
+
+def _queue_note(entry):
+    """A custom note (set via the [e]dit-note action) always wins over the
+    state-derived default text -- except needs-input, where the blocking
+    question is too operationally important to bury, so a custom note is
+    appended to it instead of replacing it."""
+    state = entry.get("state")
+    custom = entry.get("note")
+    if state == "needs-input":
+        q = (entry.get("question") or "blocking question")[:50]
+        return f"{q} | {custom}" if custom else q
+    if custom:
+        return custom
+    if state == "queued":
+        return "awaiting plan"
+    if state == "plan-review":
+        if entry.get("auto_approve"):
+            return "auto-approve on"
+        if entry.get("pending_approval"):
+            return "approved -- building next cycle"
+        return "awaiting `ap approve`"
+    if state == "ship-pending":
+        return "will ship automatically next cycle"
+    if state == "done":
+        return "marked done"
+    if state == "failed":
+        return "failed"
+    if state == "ready-to-test":
+        pr_urls = entry.get("pr_urls") or []
+        return "PRs open" + (f": {', '.join(pr_urls)}" if pr_urls else "")
+    if state in ("building", "planning", "shipping"):
+        return "no live session for this state -- possibly stale, check `ap decide`"
+    return state or "-"
+
+
+DASHBOARD_HDR = (f"{'#':>2} {'ISSUE':<10} {'PHASE':<10} {'STATUS':<8} "
+                  f"{'MODEL':<14} {'EFF':<4} {'OUT/min':>7} {'$/hr':>6} "
+                  f"{'$TOT':>7} {'OUT':>6} {'CACHE-R':>7} {'REQ':>4} "
+                  f"{'IDLE':>6} {'TTL':>7}  NOTE")
+
+
+def _ttl_cell(stats):
+    """(text, color_class) for the TTL column -- color_class is 'g'/'y'/'r'
+    (only meaningful in the curses renderer; the plain fallback ignores it).
+    Same thresholds/formula as cc-top's own ttl_str()."""
+    if not stats:
+        return "-", None
+    remaining = stats.get("ttl_remaining_sec")
+    if remaining is None:
+        return "-", None
+    if remaining > 0:
+        mins = remaining / 60
+        return ("<1m" if mins < 1 else f"{mins:.0f}m"), ("g" if remaining > 600 else "y")
+    overdue = ((time.time() - (stats.get("last") or time.time()))
+               - (stats.get("ttl_bucket_sec") or 300)) / 60
+    return f"EXP+{overdue:.0f}m", "r"
+
+
+def _stat_cells(stats):
+    """Plain-text values for cc-top's numeric columns, given a row's `stats`
+    (or None if this row has no live session cc-top could match)."""
+    if not stats:
+        return dict(model="-", eff="-", out_min="-", usd_hr="-", tot="-",
+                     out="-", cache_r="-", req="-", idle="-", ttl="-")
+    tokens = stats.get("tokens") or {}
+    ttl, _ = _ttl_cell(stats)
+    return dict(
+        model=(stats.get("model") or "?").replace("claude-", "")[:14],
+        eff=(stats.get("effort") or "")[:4],
+        out_min=human(stats.get("out_per_min") or 0),
+        usd_hr=f"{stats.get('usd_per_hr') or 0:.2f}",
+        tot=f"{stats.get('cost') or 0:.2f}",
+        out=human(tokens.get("output_tokens", 0)),
+        cache_r=human(tokens.get("cache_read_input_tokens", 0)),
+        req=str(stats.get("reqs") or 0),
+        idle=(f"{stats['idle_min']:.0f}m" if stats.get("idle_min") is not None else "-"),
+        ttl=ttl,
+    )
+
+
+def _row_parts(i, row):
+    """(prefix, ttl_cell, suffix) for one dashboard line, split around the
+    TTL cell specifically -- built from exact field widths, not string
+    search, so the curses renderer can recolor just that cell without any
+    risk of a coincidental text match elsewhere in the line (e.g. inside a
+    long NOTE)."""
+    c = _stat_cells(row.get("stats"))
+    prefix = (f"{i:>2} {row['issue'] or '-':<10} {(row['phase'] or '-'):<10} "
+              f"{row['status']:<8} {c['model']:<14} {c['eff']:<4} "
+              f"{c['out_min']:>7} {c['usd_hr']:>6} {c['tot']:>7} {c['out']:>6} "
+              f"{c['cache_r']:>7} {c['req']:>4} {c['idle']:>6} ")
+    ttl_cell = f"{c['ttl']:>7}"
+    suffix = f"  {row['note']}"
+    return prefix, ttl_cell, suffix
+
+
+def _row_line(i, row):
+    """One plain-text dashboard line -- shared by the non-tty fallback and
+    (cell-by-cell, for TTL coloring) the curses renderer."""
+    prefix, ttl_cell, suffix = _row_parts(i, row)
+    return prefix + ttl_cell + suffix
 
 
 def _print_dashboard(rows):
     if not rows:
         print("no live or recent acts")
         return
-    print(f"{'#':>2}  {'ISSUE':<10} {'PHASE':<10} {'STATUS':<8} NOTE")
+    print(DASHBOARD_HDR)
     for i, row in enumerate(rows, 1):
-        print(f"{i:>2}  {row['issue'] or '-':<10} {(row['phase'] or '-'):<10} "
-              f"{row['status']:<8} {row['note']}")
+        print(_row_line(i, row))
 
 
-def _session_detail(row):
-    """Detail + contextual action for one dashboard row -- the 'button' the
-    owner asked for: LIVE acts can be paused (or replied to, if parked);
-    FAILED ones show why (from the transcript, not just the empty
-    stdout/stderr a persistent act leaves behind -- see tail-text) and can
-    be retried."""
-    issue, kind, rec = row["issue"], row["kind"], row["rec"]
-    print(f"\n=== {issue or '?'}  (phase={row['phase']}, status={row['status']}) ===")
-    t = transcript(rec.get("session_id"))
-    if t:
-        s = summarize(t)
-        print(f"model: {main_model(s)}   requests: {s['reqs']}   subagents: {s['subagents']}")
-        if s.get("final"):
-            print(f"latest message: {s['final'][:600]}")
-    else:
-        print("(no transcript found)")
+def _attach_act(window):
+    """Jump this terminal into a live act's real tmux window, so you can
+    watch/type into it directly instead of the read-only `ap tail`. Same
+    nested-attach / no-tty fallback cmd_watch uses -- print the command
+    instead of exec'ing into it when we can't actually attach."""
+    target = f"{AP_TMUX_SESSION}:{window}"
+    if os.environ.get("TMUX") or not sys.stdout.isatty():
+        print(f"attach with:  tmux attach -t {target}")
+        return
+    os.execvp("tmux", ["tmux", "attach-session", "-t", target])
 
-    if kind == "live":
-        if rec.get("parked"):
-            print("\nparked -- waiting on a reply.")
-            msg = input("type a reply to send (blank = back): ").strip()
-            if msg:
-                ok, lines = continue_act(issue, msg)
-                print("\n".join(lines))
-        elif rec.get("window"):
-            print(f"\nlive, interactive, in tmux window '{rec['window']}'.")
-            if input("[p]ause  [b]ack: ").strip().lower() == "p":
-                ok, lines = interrupt_act(issue)
-                print("\n".join(lines))
+
+def _wait_key(msg="[Enter to return] "):
+    try:
+        input(msg)
+    except EOFError:
+        pass
+
+
+def _kill_window_and_registry(window, issue):
+    """Force-end a tmux window and drop any parked-registry entry for it --
+    the shared mechanics behind both the standalone [K]ill action and
+    _action_status_curses's auto-kill when a terminal status is set on a
+    still-live row."""
+    subprocess.run(["tmux", "kill-window", "-t", f"{AP_TMUX_SESSION}:{window}"], check=False)
+    if issue:
+        (AP_HOME / "parked" / f"{issue}.json").unlink(missing_ok=True)
+
+
+LEDGER_STATUS_TO_STATE = {"DONE": "done", "FAILED": "failed", "NEEDS_HUMAN": "needs-input"}
+
+
+def _row_initial_state(row):
+    """Best-guess queue state to seed a brand-new ticket with, for a
+    ledger-only row that has no queue file yet -- preserves its real
+    historical outcome instead of silently defaulting to `queued` (which is
+    exactly what setting a note on it used to do as a side effect)."""
+    if row["kind"] == "done":
+        return LEDGER_STATUS_TO_STATE.get(row["status"])
+    return None
+
+
+def _action_attach(row):
+    """Jump straight into the row's live tmux window -- no reply/back prompt
+    first. You can always reply by just typing into the attached session,
+    so a reply-or-attach-or-back menu ahead of it was pure friction. The one
+    action that still drops to the plain terminal (see _dispatch_attach) --
+    a real tmux attach needs the actual terminal handed over, which a
+    curses popup fundamentally can't do."""
+    rec = row["rec"]
+    if row["kind"] != "live" or not rec.get("window"):
+        print("not applicable: no live tmux window for this row (headless act, or not live)")
+        _wait_key()
+        return
+    _attach_act(rec["window"])  # execvp's into tmux directly on success; falls
+    # back to printing the attach command (and returning normally) only when
+    # already nested in tmux or stdout isn't a real tty
+
+
+def _repaint_base(stdscr):
+    """Force a clean repaint of the plain dashboard before drawing a new
+    popup -- a newwin() overlay never touches stdscr's own buffer, so any
+    two popups shown back-to-back (e.g. confirm-then-message, or two text
+    inputs in a row) would otherwise overlap the previous popup's leftover
+    pixels instead of starting from a clean base. Called at the top of
+    every popup function so callers never have to remember it themselves."""
+    stdscr.touchwin()
+    stdscr.refresh()
+
+
+def _popup_menu(stdscr, title, options, initial=0):
+    """Modal, arrow-navigable popup listing `options` on top of the current
+    curses screen (no drop to plain terminal) -- returns the chosen string,
+    or None if cancelled (Esc/q). Up/Down or j/k move, Enter chooses."""
+    if not options:
+        return None
+    _repaint_base(stdscr)
+    h, w = stdscr.getmaxyx()
+    box_h = min(len(options) + 4, max(5, h - 2))
+    box_w = min(max(len(title), max(len(o) for o in options)) + 6, max(20, w - 2))
+    y0 = max(0, (h - box_h) // 2)
+    x0 = max(0, (w - box_w) // 2)
+    win = curses.newwin(box_h, box_w, y0, x0)
+    win.keypad(True)
+    sel = max(0, min(initial, len(options) - 1))
+    while True:
+        win.erase()
+        win.border()
+        win.addnstr(0, 2, f" {title} ", max(1, box_w - 4), curses.A_BOLD)
+        for i, opt in enumerate(options):
+            row_y = i + 2
+            if row_y >= box_h - 1:
+                break
+            attr = curses.A_REVERSE if i == sel else curses.A_NORMAL
+            win.addnstr(row_y, 2, opt, max(1, box_w - 4), attr)
+        win.addnstr(box_h - 1, 2, "↑/↓ select, Enter choose, Esc cancel", max(1, box_w - 4), curses.A_DIM)
+        win.refresh()
+        try:
+            key = win.getch()
+        except curses.error:
+            key = -1
+        if key in (curses.KEY_UP, ord("k")):
+            sel = max(0, sel - 1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            sel = min(len(options) - 1, sel + 1)
+        elif key in (10, 13, curses.KEY_ENTER):
+            return options[sel]
+        elif key in (27, ord("q")):
+            return None
+        elif key == curses.KEY_RESIZE:
+            stdscr.erase()
+            stdscr.refresh()
+            h, w = stdscr.getmaxyx()
+
+
+def _popup_confirm(stdscr, message):
+    """Yes/No confirm popup, same arrow-navigable mechanics as _popup_menu."""
+    return _popup_menu(stdscr, message, ["No", "Yes"], initial=0) == "Yes"
+
+
+def _popup_text_input(stdscr, title, initial=""):
+    """Modal text-entry popup on top of the current curses screen -- type,
+    Enter submits, Esc cancels. Returns the entered text (str, possibly
+    empty) or None if cancelled. Backspace/arrow-key line editing comes free
+    from curses.textpad.Textbox; the validator below just remaps Enter/Esc
+    onto Textbox's own Ctrl-G "done editing" trigger."""
+    _repaint_base(stdscr)
+    h, w = stdscr.getmaxyx()
+    box_w = min(max(len(title) + 4, 54), max(20, w - 4))
+    box_h = 4
+    y0 = max(0, (h - box_h) // 2)
+    x0 = max(0, (w - box_w) // 2)
+    win = curses.newwin(box_h, box_w, y0, x0)
+    win.keypad(True)
+    win.border()
+    win.addnstr(0, 2, f" {title} ", max(1, box_w - 4), curses.A_BOLD)
+    win.addnstr(box_h - 1, 2, "Enter submit, Esc cancel", max(1, box_w - 4), curses.A_DIM)
+    win.refresh()
+    edit_w = max(1, box_w - 4)
+    edit_win = win.derwin(1, edit_w, 2, 2)
+    edit_win.erase()
+    if initial:
+        try:
+            edit_win.addnstr(0, 0, initial, edit_w - 1)
+        except curses.error:
+            pass
+    edit_win.refresh()
+    box = curses.textpad.Textbox(edit_win, insert_mode=True)
+    cancelled = False
+
+    def _validator(ch):
+        nonlocal cancelled
+        if ch == 27:  # Esc
+            cancelled = True
+            return 7  # Ctrl-G: Textbox's own "stop editing" trigger
+        if ch in (10, curses.KEY_ENTER):  # Enter submits, same trigger
+            return 7
+        return ch
+
+    curses.curs_set(1)
+    try:
+        box.edit(_validator)
+    finally:
+        curses.curs_set(0)
+    return None if cancelled else box.gather().strip()
+
+
+def _popup_message(stdscr, title, lines):
+    """Modal info/result popup -- shows text, dismissed by any key. Replaces
+    the old plain-terminal print()+wait-for-Enter pattern everywhere except
+    attach (which must hand over the real terminal)."""
+    if isinstance(lines, str):
+        lines = lines.splitlines() or [""]
+    lines = lines or ["(nothing to show)"]
+    _repaint_base(stdscr)
+    h, w = stdscr.getmaxyx()
+    content_w = max((len(l) for l in lines), default=10)
+    box_w = min(max(len(title) + 4, content_w + 4), max(20, w - 4))
+    box_h = min(len(lines) + 3, max(4, h - 2))
+    y0 = max(0, (h - box_h) // 2)
+    x0 = max(0, (w - box_w) // 2)
+    win = curses.newwin(box_h, box_w, y0, x0)
+    win.keypad(True)
+    win.border()
+    win.addnstr(0, 2, f" {title} ", max(1, box_w - 4), curses.A_BOLD)
+    for i, line in enumerate(lines):
+        row_y = i + 1
+        if row_y >= box_h - 1:
+            break
+        win.addnstr(row_y, 2, line, max(1, box_w - 4))
+    win.addnstr(box_h - 1, 2, "any key to dismiss", max(1, box_w - 4), curses.A_DIM)
+    win.refresh()
+    try:
+        win.getch()
+    except curses.error:
+        pass
+
+
+TERMINAL_STATES = {"done", "failed", "ready-to-test"}
+
+
+def _action_status_curses(stdscr, row):
+    """The general status-change action -- also how a stale ledger-only row
+    (no queue file at all, e.g. an old NEEDS_HUMAN/FAILED the human already
+    resolved by hand) gets marked done: force_state creates the ticket on
+    the fly if it doesn't exist yet. Arrow-navigable popup to pick the new
+    state, then a second popup to confirm -- distinct from the other
+    actions (which are direct keys with no menu): a status is inherently a
+    pick-one-of-N-known-values choice, so browsing beats typing the exact
+    state name.
+
+    Setting a terminal state (done/failed/ready-to-test) on a row that's
+    STILL live also ends its tmux window in the same motion -- a ticket
+    can't be both "done" and "live" at once, and leaving the window running
+    is exactly why marking something done previously kept showing LIVE no
+    matter what the queue file said (a tmux window existing is the only
+    live-ness signal this dashboard has; it never consulted queue state)."""
+    issue = row["issue"]
+    if not issue:
+        return
+    current = (row.get("rec") or {}).get("state")
+    is_live = row["kind"] == "live"
+    window = (row.get("rec") or {}).get("window") if is_live else None
+    states = sorted(ap_queue.STATES)
+    choice = _popup_menu(stdscr, f"Set {issue}'s status",
+                          states, initial=states.index(current) if current in states else 0)
+    if choice is None or choice == current:
+        return
+    will_kill = bool(is_live and window and choice in TERMINAL_STATES)
+    confirm_msg = (f"Set {issue} -> {choice} AND end its live tmux window?"
+                   if will_kill else f"Set {issue} -> {choice}?")
+    if not _popup_confirm(stdscr, confirm_msg):
+        return
+    ap_queue.force_state(str(AP_HOME), issue, choice)
+    if will_kill:
+        _kill_window_and_registry(window, issue)
+
+
+def _action_retry_curses(stdscr, row):
+    if row["status"] != "FAILED":
+        _popup_message(stdscr, "Retry", "not applicable: only a FAILED row can be retried")
+        return
+    ok, lines = retry_act(row["issue"])
+    _popup_message(stdscr, "Retry", lines)
+
+
+def _action_pause_curses(stdscr, row):
+    rec = row["rec"]
+    if row["kind"] != "live" or rec.get("parked") or not rec.get("window"):
+        _popup_message(stdscr, "Pause", "not applicable: only a live, non-parked, interactive act can be paused")
+        return
+    ok, lines = interrupt_act(row["issue"])
+    _popup_message(stdscr, "Pause", lines)
+
+
+def _action_approve_curses(stdscr, row):
+    if row["kind"] != "queue" or row["rec"].get("state") != "plan-review":
+        _popup_message(stdscr, "Approve", "not applicable: only a plan-review ticket can be approved")
+        return
+    entry = ap_queue.approve_ticket(str(AP_HOME), row["issue"])
+    _popup_message(stdscr, "Approved", f"approved {entry['eng_id']}" if entry else "no such ticket")
+
+
+def _action_feedback_curses(stdscr, row):
+    if row["kind"] != "queue" or row["rec"].get("state") not in ("plan-review", "needs-input"):
+        _popup_message(stdscr, "Feedback",
+                        "not applicable: only a plan-review or needs-input ticket takes feedback here")
+        return
+    if row["rec"].get("state") == "needs-input":
+        _popup_message(stdscr, "Blocking question", row["rec"].get("question") or "(none recorded)")
+    text = _popup_text_input(stdscr, f"Feedback/answer for {row['issue']}")
+    if not text:
+        return
+    entry = ap_queue.reply_ticket(str(AP_HOME), row["issue"], text)
+    _popup_message(stdscr, "Recorded", f"recorded for {entry['eng_id']}" if entry else "no such ticket")
+
+
+def _action_note_curses(stdscr, row):
+    """Set/clear a free-text note on any row's ticket -- creates the ticket
+    if the row was ledger-only (no queue file yet), preserving its known
+    historical state (see _row_initial_state) instead of resetting it."""
+    issue = row["issue"]
+    if not issue:
+        _popup_message(stdscr, "Edit note", "not applicable: this row has no ticket id")
+        return
+    current_note = (row.get("rec") or {}).get("note") or ""
+    text = _popup_text_input(stdscr, f"Note for {issue}", initial=current_note)
+    if text is None:
+        return
+    entry = ap_queue.set_note(str(AP_HOME), issue, text, initial_state=_row_initial_state(row))
+    _popup_message(stdscr, "Note updated", f"{entry['eng_id']} note -> {text or '(cleared)'}")
+
+
+def _action_kill_curses(stdscr, row):
+    """Force-end a live act's tmux window -- for a session that's actually
+    stale (already handled/shipped outside the pipeline, or just stuck)
+    rather than genuinely still working, which `ap sessions` otherwise has
+    no way to tell apart from a real live act. Removes any parked-registry
+    entry too, so the ticket becomes claimable/settable again; press [s]
+    right after to record its real final state (or set a terminal state
+    there directly -- it now kills the window itself too)."""
+    rec = row["rec"]
+    if row["kind"] != "live" or not rec.get("window"):
+        _popup_message(stdscr, "Kill", "not applicable: no live tmux window for this row")
+        return
+    window = rec["window"]
+    if not _popup_confirm(stdscr, f"Really kill '{window}' for {row['issue'] or '?'}?"):
+        return
+    _kill_window_and_registry(window, row["issue"])
+    _popup_message(stdscr, "Killed",
+                   [f"killed {window}.",
+                    f"Press [s] now to record {row['issue'] or 'this ticket'}'s real final status."])
+
+
+def _action_info_curses(stdscr, row):
+    """Read-only peek at a row's transcript summary (model/requests/
+    subagents/latest message) or queue detail (note/question) without
+    committing to a full attach -- the old Enter-opens-detail view's
+    content, as a dismissable popup instead of a blocking prompt."""
+    lines = [f"{row['issue'] or '?'}   phase={row['phase'] or '-'}   status={row['status']}"]
+    rec = row.get("rec") or {}
+    if row["kind"] == "live" and rec.get("session_id"):
+        t = transcript(rec["session_id"])
+        if t:
+            s = summarize(t)
+            lines.append(f"model: {main_model(s)}   requests: {s['reqs']}   subagents: {s['subagents']}")
+            if s.get("final"):
+                lines.append("")
+                lines.append("latest message:")
+                lines.extend(s["final"][:600].splitlines())
         else:
-            print("\nheadless (oneshot mode) -- no interactive session to pause.")
-    elif row["status"] == "FAILED":
-        if input("\n[r]etry (re-queue to its pre-phase label)  [b]ack: ").strip().lower() == "r":
-            ok, lines = retry_act(issue)
-            print("\n".join(lines))
-    else:
-        input("\n[b]ack: ")
+            lines.append("(no transcript found)")
+    elif row["kind"] == "queue":
+        lines.append(f"note: {rec.get('note') or '-'}")
+        if rec.get("question"):
+            lines.append(f"question: {rec['question']}")
+    _popup_message(stdscr, "Info", lines)
+
+
+def _action_queue_new_curses(stdscr):
+    """Queue a brand-new ticket without leaving the dashboard -- the CLI-only
+    replacement for opening a GitHub inbox issue, reachable right from `ap
+    sessions` instead of a separate `ap queue` invocation."""
+    eng_id = _popup_text_input(stdscr, "ENG-id to queue")
+    if not eng_id:
+        return
+    if not ap_queue.valid_eng_id(eng_id):
+        _popup_message(stdscr, "Queue", f"not a valid ENG-<n> id: {eng_id!r}")
+        return
+    if ap_queue.read_ticket(str(AP_HOME), eng_id) is not None:
+        _popup_message(stdscr, "Queue", f"{eng_id} is already queued")
+        return
+    note = _popup_text_input(stdscr, "Note (optional)") or ""
+    auto = _popup_confirm(stdscr, "Auto-approve this ticket?")
+    entry = ap_queue.new_ticket(str(AP_HOME), eng_id, note, auto)
+    _popup_message(stdscr, "Queued", f"queued {entry['eng_id']}" + (" [auto-approve]" if auto else ""))
+
+
+# Direct single-key actions on the selected row -- no arrow-driven menu:
+# press the letter, it happens. Listed in the header so the binding never
+# has to be memorized. 'n' (queue new) and 'q' (quit) act independently of
+# the current selection; every other key here acts on the selected row.
+# 's' (status) is handled separately in _curses_main -- it's the one
+# genuine pick-one-of-N-known-values action, so it gets an arrow-navigable
+# popup instead of a direct key, per its own nature (see
+# _action_status_curses). Every action here stays fully inside curses
+# (popups only) EXCEPT attach, which is handled separately too -- a real
+# tmux attach needs the terminal itself handed over, which no popup can do.
+ROW_ACTIONS = {
+    ord("p"): ("pause", _action_pause_curses),
+    ord("g"): ("go/approve", _action_approve_curses),
+    ord("f"): ("feedback", _action_feedback_curses),
+    ord("t"): ("retry", _action_retry_curses),
+    ord("e"): ("edit note", _action_note_curses),
+    ord("K"): ("kill", _action_kill_curses),
+    ord("i"): ("info", _action_info_curses),
+}
+ACTION_HDR = "[a]ttach [i]nfo [p]ause [g]o [f]eedback [s]tatus [e]dit-note [K]ill [t]retry [n]ew [q]uit"
+
+
+TTL_CURSES_COLOR = {"g": 1, "y": 2, "r": 3}
+
+
+def _curses_main(stdscr):
+    curses.curs_set(0)
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_GREEN, -1)
+    curses.init_pair(2, curses.COLOR_YELLOW, -1)
+    curses.init_pair(3, curses.COLOR_RED, -1)
+    stdscr.keypad(True)
+    stdscr.timeout(5000)  # live-refresh every 5s, same default cc-top --watch uses
+
+    selected = 0
+    rows = []
+    last_scan = 0.0
+    while True:
+        now = time.time()
+        if now - last_scan >= 5 or not rows:
+            rows = _dashboard_rows()
+            last_scan = now
+            if rows:
+                selected = max(0, min(selected, len(rows) - 1))
+            else:
+                selected = 0
+
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        stdscr.addnstr(0, 0, "ap sessions -- central control point  (↑/↓ or j/k select)", w - 1, curses.A_BOLD)
+        stdscr.addnstr(1, 0, ACTION_HDR, w - 1, curses.A_BOLD | curses.color_pair(1))
+        stdscr.addnstr(2, 0, DASHBOARD_HDR, w - 1, curses.A_DIM)
+        if not rows:
+            stdscr.addnstr(4, 0, "no live or recent acts", w - 1)
+        for i, row in enumerate(rows):
+            if i + 3 >= h - 1:
+                break  # more rows than fit -- truncate rather than error
+            attr = curses.A_REVERSE if i == selected else curses.A_NORMAL
+            prefix, ttl_cell, suffix = _row_parts(i + 1, row)
+            stdscr.addnstr(i + 3, 0, prefix + ttl_cell + suffix, w - 1, attr)
+            # Recolor just the TTL cell on top (exact offset, not a text
+            # search), so it's still visible under A_REVERSE (selected row).
+            _, ttl_color = _ttl_cell(row.get("stats"))
+            if ttl_color:
+                col = len(prefix)
+                pair = curses.color_pair(TTL_CURSES_COLOR[ttl_color])
+                stdscr.addnstr(i + 3, col, ttl_cell, w - 1 - col, attr | pair | curses.A_BOLD)
+        stdscr.refresh()
+
+        try:
+            key = stdscr.getch()
+        except curses.error:
+            key = -1
+
+        def _dispatch_attach(row):
+            # attach is the ONLY action that still drops to the plain
+            # terminal -- a real tmux attach hands over the terminal itself
+            # (execvp), which no curses popup can do. Every other action
+            # stays fully inside curses (see ROW_ACTIONS/_action_status_curses).
+            curses.def_prog_mode()
+            curses.endwin()
+            try:
+                _action_attach(row)
+            except EOFError:
+                pass
+            # attach's own "not applicable" print()/input() can print more
+            # lines than fit below curses' last-drawn frame, physically
+            # scrolling the terminal -- which desyncs curses' internal row
+            # bookkeeping from reality. Force a real terminal clear+home
+            # first so the resumed curses frame always repaints onto a
+            # known-blank screen, however much was printed.
+            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.flush()
+            curses.reset_prog_mode()
+            stdscr.touchwin()
+
+        if key in (curses.KEY_UP, ord("k")):
+            selected = max(0, selected - 1) if rows else 0
+        elif key in (curses.KEY_DOWN, ord("j")):
+            selected = min(len(rows) - 1, selected + 1) if rows else 0
+        elif key in (ord("q"), 27):
+            return
+        elif key == curses.KEY_RESIZE:
+            continue
+        elif key == ord("n"):
+            _action_queue_new_curses(stdscr)
+            rows = []  # force an immediate re-scan+redraw next loop iteration
+        elif key in (10, 13, curses.KEY_ENTER):
+            # Enter = the fast path: attach straight into the selected live
+            # act. No reply/back menu first -- you can always reply once
+            # you're actually in the session.
+            if rows:
+                _dispatch_attach(rows[selected])
+                rows = []
+        elif key == ord("a"):
+            if rows:
+                _dispatch_attach(rows[selected])
+                rows = []
+        elif key == ord("s"):
+            if rows:
+                _action_status_curses(stdscr, rows[selected])
+                rows = []
+        elif rows and key in ROW_ACTIONS:
+            ROW_ACTIONS[key][1](stdscr, rows[selected])
+            rows = []
+        # any other key (including -1 on timeout): just loop and re-render
 
 
 def cmd_sessions(args):
-    """`ap sessions` -- interactive dashboard over every live act plus each
-    other issue's most recent finished outcome. Select a row for detail and,
-    when applicable, a one-key action (pause a live act, reply to a parked
-    one, retry a failed one) instead of hand-crafting tmux/gh commands."""
-    if not sys.stdin.isatty():
+    """`ap sessions` -- the central control point for the pipeline: every
+    live act, every queue ticket awaiting a decision, and each other issue's
+    most recent finished outcome, merged with cc-top's live per-session
+    cost/model/TTL/idle stats. Arrow keys (or j/k) ONLY move the row
+    selection; every action is a direct, always-visible single key (see
+    ACTION_HDR) -- never an arrow-picked menu of ACTIONS -- but every
+    action's own input/confirmation is a popup on top of the live
+    dashboard, never a drop to the plain terminal, with one unavoidable
+    exception: [a]ttach (or Enter), which hands over the real terminal via
+    tmux attach -- no popup can do that. [i]nfo peeks at a row's transcript
+    summary or queue detail without committing to a full attach. [p]ause,
+    [g]o/approve and [f]eedback (popup text entry) for a queue ticket.
+    [s]tatus is the one pick-one-of-N-known-values action: an arrow-navigable
+    popup to choose the new state, then a second popup to confirm -- this is
+    also how you mark a stale ledger-only row done/resolved, and setting a
+    terminal state (done/failed/ready-to-test) on a row that's still LIVE
+    also ends its tmux window in the same motion, so it actually stops
+    showing live afterward. [e]dit-note (popup text entry) sets/clears a
+    free-text note that wins over the state-derived default text, for any
+    row -- preserves the row's real historical state if it didn't have a
+    queue file yet. [K]ill force-ends a live act's tmux window on its own,
+    for when the underlying work is already done/stale (a window existing
+    is the only "live" signal this dashboard has -- it can't tell a
+    genuinely-running act from an already-shipped one left open) but you
+    want to record its final status separately via [s]. [t]retry a FAILED
+    row. [n]ew queues a brand-new ticket (popup text entry) without leaving
+    the dashboard. q quits. Live-refreshes every 5s, same cadence as
+    `cc-top --watch`'s default."""
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
         _print_dashboard(_dashboard_rows())
         return 0
-    while True:
-        rows = _dashboard_rows()
-        _print_dashboard(rows)
-        try:
-            choice = input("\nselect # for detail/actions (Enter to refresh, q to quit): ").strip()
-        except EOFError:
-            return 0
-        if choice.lower() == "q":
-            return 0
-        if not choice:
-            continue
-        if not choice.isdigit() or not (1 <= int(choice) <= len(rows)):
-            print("not a valid selection")
-            continue
-        _session_detail(rows[int(choice) - 1])
+    try:
+        curses.wrapper(_curses_main)
+    except KeyboardInterrupt:
+        pass
+    return 0
 
 
 def cmd_list(args):
@@ -619,33 +1267,16 @@ def cmd_continue(args):
     return 0 if ok else 1
 
 
-REQUEUE_MAP = {
-    "plan": ("Queued", "planning"),
-    "replan": ("Queued", "planning"),
-    "implement": ("plan-review", "building"),
-    "ship": ("ship-pending", "shipping"),
+REQUEUE_STATE = {
+    "plan": "queued",
+    "replan": "queued",
+    "implement": "plan-review",
+    "ship": "ship-pending",
 }
 
 
-def inbox_issue_for(eng_id):
-    """GitHub inbox issue number for a Linear id, via title search -- the
-    ledger only ever stores the Linear id (e.g. ENG-1308), never the GitHub
-    issue number, so this is the same lookup a human would do by hand."""
-    repo = os.environ.get("AP_INBOX_REPO", "")
-    if not repo or not eng_id:
-        return None
-    try:
-        out = subprocess.run(
-            ["gh", "issue", "list", "--repo", repo, "--search", f"{eng_id} in:title",
-             "--json", "number", "-q", ".[0].number"],
-            capture_output=True, text=True, timeout=15).stdout.strip()
-        return int(out) if out.isdigit() else None
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return None
-
-
 def retry_act(target):
-    """Manually re-queue a FAILED act to the label it started from -- the
+    """Manually re-queue a FAILED act to the state it started from -- the
     same requeue ap-cycle.sh's own external-failure classifier already does
     automatically for a recognized signature (see the ENG-1308 usage-limit
     mislabel this was built alongside). Works for ANY FAILED act, not just
@@ -661,20 +1292,18 @@ def retry_act(target):
     if rec.get("status") != "FAILED":
         return False, [f"'{target}' is {rec.get('status')}, not FAILED -- nothing to retry"]
     phase = rec.get("phase")
-    add, remove = REQUEUE_MAP.get(phase, (None, None))
-    if not add:
+    new_state = REQUEUE_STATE.get(phase)
+    if not new_state:
         return False, [f"don't know how to re-queue phase '{phase}'"]
     eng_id = rec.get("issue")
-    num = inbox_issue_for(eng_id) if eng_id else None
-    if not num:
-        return False, [f"could not resolve a GitHub inbox issue for '{eng_id}'"]
-    repo = os.environ.get("AP_INBOX_REPO", "")
-    subprocess.run(["gh", "issue", "edit", str(num), "--repo", repo,
-                    "--add-label", add, "--remove-label", remove], check=False)
-    subprocess.run(["gh", "issue", "comment", str(num), "--repo", repo, "--body",
-                    f"Autopilot: manually re-queued via `ap retry` (was FAILED, phase {phase})."],
-                   check=False)
-    return True, [f"re-queued {eng_id} (issue #{num}): {remove} -> {add}"]
+    if not eng_id:
+        return False, ["this act's ledger row has no issue id -- cannot re-queue"]
+    entry = ap_queue.transition(
+        str(AP_HOME), eng_id, "claim", state=new_state,
+        event=f"manually re-queued via `ap retry` (was FAILED, phase {phase})")
+    if entry is None:
+        return False, [f"no queue entry for {eng_id} -- was it ever `ap queue`d?"]
+    return True, [f"re-queued {eng_id}: failed -> {new_state}"]
 
 
 def cmd_retry(args):
@@ -682,6 +1311,47 @@ def cmd_retry(args):
     for line in lines:
         print(line, file=sys.stdout if ok else sys.stderr)
     return 0 if ok else 1
+
+
+def cmd_queue(args):
+    """`ap queue ENG-1400 ["note"] [--auto]` -- new-work intake, the CLI-only
+    replacement for opening a GitHub inbox issue titled ENG-<id> and
+    labelling it Queued. ap-decide.py's tier5 picks this up next cycle."""
+    if not ap_queue.valid_eng_id(args.eng_id):
+        print(f"not a valid ENG-<n> id: {args.eng_id!r}", file=sys.stderr)
+        return 1
+    if ap_queue.read_ticket(str(AP_HOME), args.eng_id) is not None:
+        print(f"{args.eng_id} is already queued (see `ap sessions`)", file=sys.stderr)
+        return 1
+    entry = ap_queue.new_ticket(str(AP_HOME), args.eng_id, args.note or "", args.auto)
+    print(f"queued {entry['eng_id']} (seq {entry['seq']}){' [auto-approve]' if args.auto else ''}")
+    return 0
+
+
+def cmd_approve(args):
+    """`ap approve ENG-1400 [--auto]` -- approve a plan-review ticket ("go"),
+    the CLI-only replacement for commenting go/auto on a GitHub inbox issue.
+    --auto also flips the ticket's persistent auto-approve switch, so future
+    plans on this same ticket build without a further `ap approve`."""
+    entry = ap_queue.approve_ticket(str(AP_HOME), args.eng_id, args.auto)
+    if entry is None:
+        print(f"no queue entry for {args.eng_id}", file=sys.stderr)
+        return 1
+    print(f"approved {entry['eng_id']}" + (" (auto)" if args.auto else ""))
+    return 0
+
+
+def cmd_reply(args):
+    """`ap reply ENG-1400 "text"` -- plan-revision feedback OR a needs-input
+    answer, the CLI-only replacement for commenting on a GitHub inbox issue.
+    ap-decide.py's tiers already discriminate purely by the ticket's current
+    state (plan-review vs needs-input), so one write serves both."""
+    entry = ap_queue.reply_ticket(str(AP_HOME), args.eng_id, args.text)
+    if entry is None:
+        print(f"no queue entry for {args.eng_id}", file=sys.stderr)
+        return 1
+    print(f"reply recorded for {entry['eng_id']} (state={entry['state']})")
+    return 0
 
 
 def cmd_cost(args):
@@ -919,9 +1589,25 @@ def main():
     p.add_argument("message", nargs="?", default="continue")
     p.set_defaults(fn=cmd_continue)
 
-    p = sub.add_parser("retry", help="re-queue a FAILED act to its pre-phase label")
+    p = sub.add_parser("retry", help="re-queue a FAILED act to its pre-phase state")
     p.add_argument("target", nargs="?", default="latest")
     p.set_defaults(fn=cmd_retry)
+
+    p = sub.add_parser("queue", help="new-work intake: queue an ENG-<id> for the pipeline")
+    p.add_argument("eng_id")
+    p.add_argument("note", nargs="?", default="")
+    p.add_argument("--auto", action="store_true", help="also set this ticket's auto-approve switch")
+    p.set_defaults(fn=cmd_queue)
+
+    p = sub.add_parser("approve", help="approve a plan-review ticket (\"go\")")
+    p.add_argument("eng_id")
+    p.add_argument("--auto", action="store_true", help="also set this ticket's auto-approve switch")
+    p.set_defaults(fn=cmd_approve)
+
+    p = sub.add_parser("reply", help="plan feedback or a needs-input answer")
+    p.add_argument("eng_id")
+    p.add_argument("text")
+    p.set_defaults(fn=cmd_reply)
 
     p = sub.add_parser("sessions", help="interactive dashboard: list, inspect, act")
     p.set_defaults(fn=cmd_sessions)

@@ -181,20 +181,11 @@ else
 # Timezone for "day" boundaries (ledger, crontab, budget resets).
 # AP_TZ=UTC
 
-# Private GitHub repo used as the plan-review inbox (owner/repo).
-# AP_INBOX_REPO=haroun-mj-ai/autopilot-inbox
-
-# Minutes between the pre-scan gate's fallback full poll -- pure insurance
-# against a misclassified inbox comment or a crash-stranded claim, not a
-# queue-pickup mechanism. Set to 0 to disable this leg entirely.
-# AP_FULL_POLL_INTERVAL_MIN=360
-
-# Global auto-approve: skip waiting for a "go" comment on EVERY plan-review
-# issue and build as soon as the plan lands (still never merges -- ship-work
+# Global auto-approve: skip waiting for `ap approve` on EVERY plan-review
+# ticket and build as soon as the plan lands (still never merges -- ship-work
 # never merges at all, regardless of flags). Never applies to a needs-input
-# stop (a blocking question always waits for you). Prefer the per-issue
-# `auto` label or an `auto` comment on one delegation instead of turning this
-# on globally.
+# stop (a blocking question always waits for you). Prefer `ap approve --auto`
+# on one ticket, or `ap queue --auto`, instead of turning this on globally.
 # AP_AUTO_APPROVE=0
 
 # Concurrent build slots -- how many implement->ship chains can run at once.
@@ -287,7 +278,7 @@ ensure_managed_block "$BASHRC" "$BLOCK_START" "$BLOCK_END" "$BLOCK_BODY" \
 AP_WORK_REPO="${AP_WORK_REPO:-/home/coder/root-for-local}"
 SKILLS_SRC_DIR="$ROOT_DIR/claude/skills"
 SKILLS_DEST_DIR="$AP_WORK_REPO/.claude/skills"
-SKILL_NAMES=(plan-issue implement-plan implement-issue ship-work autopilot-poll daily-brief test-issue autopilot-protocol.md)
+SKILL_NAMES=(plan-issue implement-plan implement-issue ship-work daily-brief test-issue autopilot-protocol.md)
 
 if [[ ! -d "$AP_WORK_REPO/.git" ]]; then
   report MISSING "$AP_WORK_REPO is not a git checkout (skipping autopilot skills wiring)"
@@ -339,7 +330,6 @@ else
 .claude/skills/implement-plan
 .claude/skills/implement-issue
 .claude/skills/ship-work
-.claude/skills/autopilot-poll
 .claude/skills/daily-brief
 .claude/skills/autopilot-protocol.md"
 

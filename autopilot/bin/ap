@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# Autopilot CLI: up / down / status / pause / resume / runs / run / tail / watch.
+# Autopilot CLI: up / down / status / pause / resume / runs / run / tail /
+# watch / queue / approve / reply / retry.
+#
+# All intake, plan approval, blocking-question answers and ship retries are
+# CLI-only (queue/approve/reply/retry, backed by $AP_HOME/queue/<ENG-ID>.json
+# -- see ap_queue.py) -- there is no GitHub inbox and no haiku poll.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
@@ -11,7 +16,24 @@ CRONTAB_RENDERED="$AP_HOME/crontab.rendered"
 TMUX_SESSION="${AP_TMUX_SESSION:-autopilot}"
 
 usage() {
-  echo "Usage: ap {up [--quiet]|down|status|pause|resume|runs|run|tail|watch|sweep|sessions|pause-act|resume-act|retry|decide|--print-paths}" >&2
+  echo "Usage: ap {up [--quiet]|down|status|pause|resume|reset-week|runs|run|tail|watch|sweep|sessions|pause-act|resume-act|retry|queue|approve|reply|decide|--print-paths}" >&2
+  echo "  queue ENG-<id> [NOTE] [--auto]  New-work intake: queue a ticket for" >&2
+  echo "                 the pipeline (replaces opening a GitHub inbox issue)." >&2
+  echo "                 --auto also sets this ticket's persistent" >&2
+  echo "                 auto-approve switch." >&2
+  echo "  approve ENG-<id> [--auto]       Approve a plan-review ticket (\"go\")" >&2
+  echo "                 so it builds. --auto also flips its persistent" >&2
+  echo "                 auto-approve switch for future phases." >&2
+  echo "  reply ENG-<id> TEXT             Leave plan-revision feedback, or" >&2
+  echo "                 answer a needs-input blocking question -- routes by" >&2
+  echo "                 the ticket's current state either way." >&2
+  echo "  reset-week [SEED] [--days N]    Re-anchor the weekly cost window to" >&2
+  echo "                 now; it then resets every N days (default 7). SEED" >&2
+  echo "                 starts the count at a dollar amount (43.40) or a" >&2
+  echo "                 percentage of the weekly cap (14%), for syncing to the" >&2
+  echo "                 account's real usage -- the pipeline's ledger only sees" >&2
+  echo "                 its own spend, not interactive sessions'. SEED applies" >&2
+  echo "                 to the first period only. Never edits past ledgers." >&2
   echo "  runs [-n N]    List recent acts; live ones are marked LIVE." >&2
   echo "  run  [TARGET]  One act in detail: main-loop model, tokens, tool mix," >&2
   echo "                 status.json, stderr, final message. --timeline for" >&2
@@ -22,35 +44,46 @@ usage() {
   echo "                 branches. Defaults to --dry-run (report only); pass" >&2
   echo "                 --yes to actually remove. Never --force, never" >&2
   echo "                 'branch -D'." >&2
-  echo "  sessions       Interactive dashboard: live acts + each other issue's" >&2
-  echo "                 last outcome, numbered. Select one to see detail and," >&2
-  echo "                 if applicable, a one-key action: pause a live act," >&2
-  echo "                 reply to a parked one, or retry a failed one." >&2
+  echo "  sessions       Interactive dashboard: live acts + queue tickets" >&2
+  echo "                 awaiting a decision + each other issue's last outcome," >&2
+  echo "                 numbered. Select one to see detail and, if applicable," >&2
+  echo "                 a one-key action: pause/attach a live act, approve or" >&2
+  echo "                 reply to a plan-review/needs-input ticket, or retry a" >&2
+  echo "                 failed one." >&2
   echo "  pause-act [TARGET]        Interrupt one live persistent act mid-turn" >&2
   echo "                 (Escape) -- resumable, unlike 'ap pause' which only" >&2
   echo "                 stops NEW dispatches. Note: does NOT free its lane" >&2
   echo "                 slot -- ap-cycle.sh is still waiting on it." >&2
   echo "  resume-act [TARGET] [MESSAGE]   Resume an interrupted/idle live act" >&2
   echo "                 by injecting MESSAGE (default: \"continue\")." >&2
-  echo "  retry [TARGET] Re-queue a FAILED act to the label it started from" >&2
+  echo "  retry [TARGET] Re-queue a FAILED act to the state it started from" >&2
   echo "                 (same requeue an external-failure signature already" >&2
-  echo "                 does automatically), so the next poll picks it up." >&2
-  echo "  decide         Run the deterministic decider (ap-decide.sh --dry-run)" >&2
-  echo "                 against the REAL inbox, no writes, and pretty-print the" >&2
-  echo "                 decision plus a one-line reason per tier it evaluated --" >&2
-  echo "                 for comparing against what AP_POLL_MODE=model actually" >&2
-  echo "                 chose before flipping to AP_POLL_MODE=deterministic." >&2
+  echo "                 does automatically), so the next cycle picks it up." >&2
+  echo "  decide         Run the decider (ap-decide.sh --dry-run) against the" >&2
+  echo "                 REAL local queue, no writes, and pretty-print the" >&2
+  echo "                 decision plus a one-line reason per tier it evaluated." >&2
   echo "  TARGET is a session-id prefix, an issue id (ENG-1234), or 'latest'." >&2
   echo "  --print-paths  Debug: render the crontab and print resolved paths" >&2
   echo "                 (script dir, crontab template/rendered, AP_HOME); exits 0." >&2
   exit 1
 }
 
-# An act is a headless `claude -p`, so there is no pane to attach to. These
-# four read its transcript, run dir and ledger row instead; the backend is one
-# python script so the joining logic lives in one place.
+# A persistent-mode act (the default) runs in a real tmux window (`ap
+# sessions`'s [a]ttach jumps a terminal into it); these commands read its
+# transcript, run dir and ledger row, or mutate the local queue -- the
+# backend is one python script so the joining logic lives in one place.
 RUNS_PY="$SCRIPT_DIR/ap-runs.py"
-cmd_runs() { python3 "$RUNS_PY" list "$@"; }
+# "ap runs" defaults to the "list" subcommand (so bare flags like "-n 5" still
+# mean "list -n 5"), but a real ap-runs.py subcommand (cost/model/show/...)
+# must pass straight through instead of getting "list" wedged in front of it.
+RUNS_SUBCOMMANDS="list show tail watch cost model tail-text interrupt continue retry sessions queue approve reply"
+cmd_runs() {
+  if [ "$#" -gt 0 ] && [[ " $RUNS_SUBCOMMANDS " == *" $1 "* ]]; then
+    python3 "$RUNS_PY" "$@"
+  else
+    python3 "$RUNS_PY" list "$@"
+  fi
+}
 cmd_run() { python3 "$RUNS_PY" show "$@"; }
 cmd_tail() { python3 -u "$RUNS_PY" tail "$@"; }
 cmd_watch() { python3 "$RUNS_PY" watch "$@"; }
@@ -59,19 +92,21 @@ cmd_pause_act() { python3 "$RUNS_PY" interrupt "${1:-latest}"; }
 cmd_resume_act() { python3 "$RUNS_PY" continue "${1:-latest}" "${2:-continue}"; }
 cmd_retry() { python3 "$RUNS_PY" retry "${1:-latest}"; }
 cmd_sessions() { python3 "$RUNS_PY" sessions; }
+cmd_queue() { python3 "$RUNS_PY" queue "$@"; }
+cmd_approve() { python3 "$RUNS_PY" approve "$@"; }
+cmd_reply() { python3 "$RUNS_PY" reply "$@"; }
 
-# `ap decide` runs the deterministic decider in --dry-run (no gh writes,
-# ever) against the REAL inbox, and pretty-prints the decision plus its
-# per-tier trace, so the owner can compare it against what the model poll
-# actually chose on live data before flipping AP_POLL_MODE. See
-# autopilot/README.md's "poll modes" section.
+# `ap decide` runs the decider in --dry-run (no queue writes, ever) against
+# the REAL local queue, and pretty-prints the decision plus its per-tier
+# trace -- useful for seeing what the next cycle would do without waiting
+# for one, or for debugging why a ticket isn't advancing.
 cmd_decide() {
   local out_file err_file
   out_file="$(mktemp)"
   err_file="$(mktemp)"
   "$SCRIPT_DIR/ap-decide.sh" --dry-run >"$out_file" 2>"$err_file"
 
-  echo "decision (dry-run -- no gh writes were performed):"
+  echo "decision (dry-run -- no queue writes were performed):"
   python3 -c '
 import json, sys
 try:
@@ -332,43 +367,34 @@ except Exception:
     echo "  (no entries yet today)"
   fi
 
-  # Rolling 7-day cost, across whatever daily ledger files exist -- not a
-  # calendar week, just "last 7 files on disk" (simplest thing that's still
-  # useful; ledgers roll daily and old ones aren't pruned). Informational
-  # only: nothing auto-pauses on AP_MAX_WEEK_COST_USD, this just reports
-  # against it. See ap-env.sh for why this is a SHARE of the account's pool,
-  # not the whole thing.
-  local week_files week_cost
-  # Ledger filenames are our own YYYY-MM-DD.jsonl, never contain whitespace
-  # or globbing metacharacters -- ls+word-splitting is safe here.
-  # shellcheck disable=SC2012
-  week_files="$(ls -1t "$AP_HOME"/runs/*.jsonl 2>/dev/null | head -7)"
-  if [[ -n "$week_files" ]]; then
-    if command -v jq >/dev/null 2>&1; then
-      # shellcheck disable=SC2086
-      week_cost="$(jq -s '[.[] | .cost] | add // 0' $week_files 2>/dev/null)"
-    else
-      # shellcheck disable=SC2086
-      week_cost="$(python3 - $week_files <<'PYEOF'
+  # Anchored 7-day cost window -- see ap-week-cost.py for the definition and
+  # for why it is anchored (resets on a fixed cadence) rather than rolling.
+  # Informational only: nothing auto-pauses on AP_MAX_WEEK_COST_USD, this just
+  # reports against it. See ap-env.sh for why this is a SHARE of the account's
+  # pool, not the whole thing. `ap reset-week` re-anchors it.
+  local week_json
+  week_json="$(python3 "$SCRIPT_DIR/ap-week-cost.py" --home "$AP_HOME" --format json 2>/dev/null)"
+  if [[ -n "$week_json" ]]; then
+    python3 - "$week_json" "$AP_MAX_WEEK_COST_USD" <<'PYEOF'
 import json, sys
-cost = 0.0
-for path in sys.argv[1:]:
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                d = json.loads(line)
-            except Exception:
-                continue
-            cost += float(d.get("cost") or 0)
-print(cost)
+
+d = json.loads(sys.argv[1])
+cap = sys.argv[2]
+line = "week cost: $%.2f / $%s" % (d["cost"], cap)
+try:
+    pct = 100.0 * d["cost"] / float(cap)
+    line += " (%.0f%%)" % pct
+except (ValueError, ZeroDivisionError):
+    pass
+if d["anchored"]:
+    line += ", window %s -> %s, %.1fd left" % (
+        d["window_start"][:10], d["window_end"][:10], d["days_left"])
+    if d["baseline_applied"]:
+        line += ", incl. $%.2f reset baseline" % d["baseline_usd"]
+else:
+    line += " (trailing 7 days, never reset -- run 'ap reset-week' to anchor)"
+print(line)
 PYEOF
-)"
-    fi
-    printf "week cost: \$%.2f / \$%s (last %d daily ledgers, share of the account's weekly pool -- see ap-env.sh)\n" \
-      "${week_cost:-0}" "$AP_MAX_WEEK_COST_USD" "$(wc -w <<<"$week_files")"
   fi
 }
 
@@ -387,6 +413,93 @@ cmd_resume() {
   echo "resumed"
 }
 
+# Re-anchor the weekly cost window to now, optionally seeding it with the
+# account's real current usage. The pipeline's ledger only sees its own spend,
+# but the weekly pool is shared with interactive Claude Code sessions -- so
+# when you reset, you usually want to start from where the account actually
+# is, not from zero. That seed applies to the first period only.
+#
+#   ap reset-week              # anchor at now, start from $0
+#   ap reset-week 14%          # anchor at now, start at 14% of the weekly cap
+#   ap reset-week 43.40        # anchor at now, start at $43.40
+#   ap reset-week 14% --days 7 # non-default period length
+#
+# Historical ledger entries are never modified -- the window simply starts
+# here, so past spend stays on record and just falls outside the current week.
+cmd_reset_week() {
+  local seed="${1:-0}" days=7
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --days) days="${2:-7}"; shift 2 ;;
+      *) echo "ap reset-week: unknown argument '$1'" >&2; return 2 ;;
+    esac
+  done
+  mkdir -p "$AP_HOME"
+  python3 - "$AP_HOME" "$seed" "$days" "$AP_MAX_WEEK_COST_USD" <<'PYEOF'
+import datetime, json, os, sys
+
+home, seed_raw, days_raw, cap_raw = sys.argv[1:5]
+
+try:
+    days = int(days_raw)
+    if days < 1:
+        raise ValueError
+except ValueError:
+    print("ap reset-week: --days must be a positive integer", file=sys.stderr)
+    sys.exit(2)
+
+seed_raw = str(seed_raw).strip().lstrip("$")
+try:
+    if seed_raw.endswith("%"):
+        baseline = float(seed_raw[:-1]) / 100.0 * float(cap_raw)
+    else:
+        baseline = float(seed_raw or 0)
+except ValueError:
+    print("ap reset-week: seed must be a dollar amount or a percentage "
+          "(e.g. 43.40 or 14%)", file=sys.stderr)
+    sys.exit(2)
+if baseline < 0:
+    print("ap reset-week: seed cannot be negative", file=sys.stderr)
+    sys.exit(2)
+
+now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+stamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+path = os.path.join(home, "week-reset.json")
+
+prev = None
+if os.path.exists(path):
+    try:
+        with open(path) as handle:
+            prev = json.load(handle).get("anchor")
+    except (OSError, ValueError):
+        prev = None
+
+state = {
+    "anchor": stamp,
+    "period_days": days,
+    "baseline_usd": round(baseline, 2),
+    "baseline_note": (
+        "One-time sync to real account usage at reset time. Applies to the "
+        "first period only; subsequent periods start from zero."
+    ),
+    "reset_at": stamp,
+    "previous_anchor": prev,
+}
+with open(path, "w") as handle:
+    json.dump(state, handle, indent=2)
+    handle.write("\n")
+
+end = now + datetime.timedelta(days=days)
+print("week cost window re-anchored")
+print("  anchor:   %s" % stamp)
+print("  resets:   %s (every %d days)" % (end.strftime("%Y-%m-%dT%H:%M:%SZ"), days))
+print("  starting: $%.2f" % baseline)
+print("  state:    %s" % path)
+print("  (historical ledger entries were not modified)")
+PYEOF
+}
+
 [[ $# -ge 1 ]] || usage
 sub="$1"; shift
 case "$sub" in
@@ -395,6 +508,7 @@ case "$sub" in
   status) cmd_status ;;
   pause) cmd_pause ;;
   resume) cmd_resume ;;
+  reset-week) cmd_reset_week "$@" ;;
   runs) cmd_runs "$@" ;;
   run) cmd_run "$@" ;;
   tail) cmd_tail "$@" ;;
@@ -404,6 +518,9 @@ case "$sub" in
   pause-act) cmd_pause_act "${1:-}" ;;
   resume-act) cmd_resume_act "${1:-}" "${2:-}" ;;
   retry) cmd_retry "${1:-}" ;;
+  queue) cmd_queue "$@" ;;
+  approve) cmd_approve "$@" ;;
+  reply) cmd_reply "$@" ;;
   decide) cmd_decide "$@" ;;
   --print-paths) cmd_print_paths ;;
   *) usage ;;

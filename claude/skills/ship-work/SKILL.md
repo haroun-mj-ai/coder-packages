@@ -205,8 +205,19 @@ nothing about the code actually about to be pushed. When in doubt, re-run.
 
 ```bash
 cd frontend && npm run lint && npx tsc --noEmit && npm run test:coverage && npm run build
-cd backend  && poetry run pytest
+cd backend  && poetry run pytest <paths touched, or exercising the change>
 ```
+
+**Backend is scoped, not whole-repo** — same rule and same reasoning as
+`/implement-issue`'s Phase B step 5, so the two skills don't disagree about what
+counts as a gate. Scope it to the directories/files the plan's units actually
+touched or that exercise the changed behavior. A full-repo run takes many minutes
+here and has never been the thing that caught a real regression in practice; the
+per-unit scoped runs plus the spec-auditor / code-review / blast-radius passes are
+what carry that weight. Widen to the touched top-level package(s) if you genuinely
+suspect unrelated fallout — never to a bare unscoped invocation. Frontend stays
+unscoped: its CI gates on `lint`/`tsc`/`test:coverage`/`build` as whole-project
+commands and there is nothing to scope them to.
 
 Mirror what CI runs, not what is convenient: frontend CI runs `test:coverage`, not
 `test:run`, and it runs `tsc --noEmit` separately from `build`. Note also that this
@@ -380,15 +391,15 @@ ever.
 
 ## Headless mode (--headless)
 
-Shared vocabulary, `status.json` shape, inbox contract, and the ask→fallback
-rule live in `.claude/skills/autopilot-protocol.md` — read it first; this
-section only states what maps to what for this skill.
+Shared vocabulary, `status.json` shape, the local queue contract, and the
+ask→fallback rule live in `.claude/skills/autopilot-protocol.md` — read it
+first; this section only states what maps to what for this skill.
 
 Headless and interactive are now the same shape for this skill, because
 neither one ever waits on CI or merges — there is no `--no-merge` to imply
 anymore, since merging was never in scope to begin with. The only thing
-headless mode changes is *how a stop or a success gets reported* (an inbox
-comment and `status.json` instead of a chat message).
+headless mode changes is *how a stop or a success gets reported* (a local
+queue write and `status.json` instead of a chat message).
 
 Pushing feature branches and opening PRs against `dev` **is** pre-approved
 under `--headless`, same as interactive — but the normal headless case is
@@ -400,29 +411,43 @@ lease-guarded `git push --force-with-lease` in step 6's rebase, exactly as
 interactive.
 
 Each of the five **Hard stops** above, hit under `--headless`, ends the run as
-`NEEDS_HUMAN` per the protocol's ask→fallback rule: post the stop reason
+`NEEDS_HUMAN` per the protocol's ask→fallback rule: record the stop reason
 (which numbered hard stop, and the evidence — the review comment, the
 conflicting diff, the finding string, the out-of-plan file list, or the
-main/force-push/merge attempt) as a comment on the inbox issue, prefixed with
-the line `Phase: ship` per the protocol's ask→fallback rule, swap its label
-`shipping` → `needs-input` (the wrapper already swapped `building` →
-`shipping` before invoking this phase), and write `status.json` with `status:
-NEEDS_HUMAN`, `phase: "ship"`, and `question` set to that same text. Also
-`kata meta set <ref> work.attention needs-human --agent` and
-`work.attention_msg` to the same stop reason — `/implement-issue`'s Phase B
-step 1 rule covers the mechanics; this is that same signal, at this phase.
-Never continue past a hard stop headlessly — the interactive rule ("stop,
-report, do not proceed to the next repo") holds unchanged; headless mode only
-changes where the stop is reported.
+main/force-push/merge attempt) on the ticket and swap its state `shipping` →
+`needs-input` (the wrapper already swapped `building` → `shipping` before
+invoking this phase), in one write:
+```bash
+python3 "$QUEUE_PY" --ap-home "$AP_HOME" set <ENG-ID> --state needs-input \
+  --field question='"<the stop reason + evidence>"' \
+  --field phase_at_question='"ship"' \
+  --event "hard stop: <short reason>"
+```
+Write `status.json` with `status: NEEDS_HUMAN`, `phase: "ship"`, and
+`question` set to that same text. Also `kata meta set <ref> work.attention
+needs-human --agent` and `work.attention_msg` to the same stop reason —
+`/implement-issue`'s Phase B step 1 rule covers the mechanics; this is that
+same signal, at this phase. Never continue past a hard stop headlessly — the
+interactive rule ("stop, report, do not proceed to the next repo") holds
+unchanged; headless mode only changes where the stop is reported.
 
 **Success end state** (all local gates clear, PRs open and pushed, rebased
-current): PR URLs — normally already posted by `/implement-issue`'s own
-`Phase: implement` comment, restate them here alongside the local gate result —
-are posted as a comment on the inbox issue and the inbox label is swapped
-`shipping` → `ready-to-test`. On Linear — the one write beyond the claim, and
+current): PR URLs — normally already recorded by `/implement-issue`'s own
+`history` write at its Phase B step 13 — are (re)recorded on the ticket
+alongside the local gate result, and the ticket's state is swapped
+`shipping` → `ready-to-test`, in one write:
+```bash
+python3 "$QUEUE_PY" --ap-home "$AP_HOME" set <ENG-ID> --state ready-to-test \
+  --field pr_urls='["<url>", ...]' \
+  --event "ship done, local gates clean -> ready to test"
+```
+This is the write that used to be a PR-URL comment plus a `shipping` →
+`ready-to-test` label swap — without it the ticket never leaves `shipping`
+and a human running `ap sessions`/`ap status` never sees the finished work
+surfaced, so do not skip it. On Linear — the one write beyond the claim, and
 it is a label, not a comment — add label `agent:ready-to-test`; Linear status
 stays `In Progress`. Headless ship-work never posts a Linear comment, success
-or failure; the PR link(s) live on the inbox issue only. Never `Staging`
+or failure; the PR link(s) live on the ticket's `pr_urls` only. Never `Staging`
 (that's the human's job once they've actually merged, per **After a human
 merges** above) and never `Done`. Write `status.json` with `status: "DONE"`,
 `phase: "ship"`, and `pr_urls` filled with every opened PR URL. Leave the kata

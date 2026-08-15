@@ -18,8 +18,8 @@ fi
 export AP_HOME="${AP_HOME:-$HOME/.autopilot}"
 
 # User config: NTFY_TOPIC, SLACK_WEBHOOK_URL, AP_MAX_ISSUES_PER_DAY,
-# AP_MAX_DAY_COST_USD, AP_TZ, AP_INBOX_REPO, AP_FULL_POLL_INTERVAL_MIN. Never
-# overwritten by defaults below if already set here.
+# AP_MAX_DAY_COST_USD, AP_TZ. Never overwritten by defaults below if already
+# set here.
 if [[ -f "$AP_HOME/env" ]]; then
   # shellcheck disable=SC1091
   source "$AP_HOME/env"
@@ -41,32 +41,14 @@ export AP_MAX_DAY_COST_USD="${AP_MAX_DAY_COST_USD:-50}"
 # same basis as the $523 estimate, so they're directly comparable.
 export AP_MAX_WEEK_COST_USD="${AP_MAX_WEEK_COST_USD:-310}"
 export AP_TZ="${AP_TZ:-UTC}"
-export AP_INBOX_REPO="${AP_INBOX_REPO:-haroun-mj-ai/autopilot-inbox}"
-# Minutes between the pre-scan gate's fallback full poll -- pure insurance
-# against (a) a human inbox comment misclassified as agent-authored by the
-# `Plan file:` / `Phase:` marker heuristic, and (b) a claim stranded by a
-# mid-cycle crash that the poll skill's own stale-claim sweep would recover.
-# Not a queue-pickup mechanism (intake is fully deterministic via the inbox
-# legs). 0 disables this leg entirely.
-export AP_FULL_POLL_INTERVAL_MIN="${AP_FULL_POLL_INTERVAL_MIN:-360}"
 
-# Global auto-approve: 1 = build every plan-review issue as soon as it lands,
-# without waiting for a "go" comment. Never applies to needs-input (a
-# blocking question always waits for the owner). Two other switches
-# auto-approve a single delegation without this global flag: the `auto`
-# label on the inbox issue, or an owner comment whose first line is exactly
-# `auto`. See autopilot-protocol.md's inbox contract.
+# Global auto-approve: 1 = build every plan-review ticket as soon as it lands,
+# without waiting for `ap approve`. Never applies to needs-input (a blocking
+# question always waits for the owner). A per-ticket auto-approve switch
+# (`ap approve --auto`, or `ap queue --auto` at intake time) works the same
+# way for a single ticket without this global flag. See
+# autopilot-protocol.md's local queue contract.
 export AP_AUTO_APPROVE="${AP_AUTO_APPROVE:-0}"
-
-# Poll decider: "model" (default) invokes the haiku /autopilot-poll skill
-# every cycle, same as always -- no behaviour change until this is flipped.
-# "deterministic" calls ap-decide.sh instead: every step the poll makes is a
-# label query, a first-line marker check, an exact-word match, a regex, a
-# priority ordering, or a label swap -- no judgement a model call buys
-# anything for -- and ap-decide.sh implements those exact tiers in bash/
-# Python against live `gh` data for $0. Compare the two with `ap decide`
-# before flipping this; see autopilot/README.md's "poll modes" section.
-export AP_POLL_MODE="${AP_POLL_MODE:-model}"
 
 # Marker inherited by every claude process autopilot spawns; the user's
 # global Stop hook checks it to avoid phone-pinging on headless cycles.

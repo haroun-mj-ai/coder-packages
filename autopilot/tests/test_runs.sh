@@ -145,40 +145,57 @@ assert "tail-text: unknown session prints empty, not an error" \
   bash -c "[ -z \"\$(python3 '$RUNS_PY' tail-text does-not-exist 2>/dev/null)\" ]"
 
 # --- retry: manual re-queue for a FAILED act, backend for the dashboard's
-# [r]etry action -- gh is stubbed so this never touches a real repo --------
-FAKE_BIN="$(mktemp -d)"
-GH_LOG="$FIX/gh.log"
-: >"$GH_LOG"
-cat >"$FAKE_BIN/gh" <<GHSTUB
-#!/usr/bin/env bash
-echo "gh \$*" >>"$GH_LOG"
-if [ "\$1" = "issue" ] && [ "\$2" = "list" ]; then
-  echo "77"
-fi
-GHSTUB
-chmod +x "$FAKE_BIN/gh"
-export AP_INBOX_REPO="fake/inbox"
+# [r]etry action -- goes straight through ap_queue.transition() now, no gh
+# call and no inbox issue number involved at all -----------------------------
+# ENG-2's ledger row is phase=implement/FAILED (see LEDGER above), so a queue
+# ticket must exist for it first (retry_act looks it up by eng_id, same as a
+# live pipeline would have from `ap queue`/plan/implement already having run).
+python3 "$BIN_DIR/ap_queue.py" --ap-home "$AP_HOME" new ENG-2 >/dev/null
 
-out="$(PATH="$FAKE_BIN:$PATH" python3 "$RUNS_PY" retry ENG-2 2>&1)"
+out="$(python3 "$RUNS_PY" retry ENG-2 2>&1)"
 assert "retry: re-queues a FAILED implement act to plan-review" \
   grep -q 'plan-review' <<<"$out"
-assert "retry: reports the resolved inbox issue number" \
-  grep -q 'issue #77' <<<"$out"
-assert "retry: calls gh issue edit with the right labels" \
-  grep -q -- '--add-label plan-review --remove-label building' "$GH_LOG"
-assert "retry: posts an explanatory comment" \
-  grep -q 'issue comment 77' "$GH_LOG"
+assert "retry: reports the re-queue in eng-id terms, not a gh issue number" \
+  grep -q 'ENG-2' <<<"$out"
+ticket_state="$(python3 -c "
+import json
+print(json.load(open('$AP_HOME/queue/ENG-2.json'))['state'])
+")"
+assert "retry: queue ticket transitioned to plan-review on disk" \
+  [ "$ticket_state" = "plan-review" ]
+ticket_history="$(python3 -c "
+import json
+d = json.load(open('$AP_HOME/queue/ENG-2.json'))
+print(d['history'][-1]['event'])
+")"
+assert "retry: history records the manual re-queue" \
+  grep -qi 'manually re-queued' <<<"$ticket_history"
 assert "retry: refuses a non-FAILED target" \
-  bash -c "PATH='$FAKE_BIN:$PATH' python3 '$RUNS_PY' retry ENG-1 2>&1 | grep -qi 'not FAILED'"
+  bash -c "python3 '$RUNS_PY' retry ENG-1 2>&1 | grep -qi 'not FAILED'"
 assert "retry: refuses an unknown target" \
-  bash -c "! PATH='$FAKE_BIN:$PATH' python3 '$RUNS_PY' retry nope-nope 2>/dev/null"
+  bash -c "! python3 '$RUNS_PY' retry nope-nope 2>/dev/null"
+assert "retry: refuses a FAILED target with no queue ticket at all" \
+  bash -c "
+    cat >'$AP_HOME/runs/2026-08-13.jsonl' <<'LEDGER2'
+{\"ts\":\"2026-08-13T01:20:00Z\",\"issue\":\"ENG-9\",\"phase\":\"implement\",\"status\":\"FAILED\",\"cost\":1.0,\"session_id\":\"dddddddd-0000-0000-0000-000000000000\"}
+LEDGER2
+    python3 '$RUNS_PY' retry ENG-9 2>&1 | grep -qi 'no queue entry'
+  "
 
 # --- sessions: non-interactive dashboard invocation must not hang ----------
 out="$(echo | python3 "$RUNS_PY" sessions 2>&1)"
 assert "sessions: non-interactive invocation prints the table and returns" \
   grep -q 'ISSUE' <<<"$out"
-assert "sessions: lists the FAILED implement row" \
-  grep -q 'ENG-2 .*implement .*FAILED' <<<"$out"
+# ENG-2 was just retried above, so its FAILED ledger row is now superseded by
+# a live queue ticket (plan-review) -- the dashboard correctly shows the
+# queue state instead of the stale FAILED outcome (see _dashboard_rows()'s
+# "live wins, then a pending queue state, then the ledger" precedence).
+assert "sessions: retried ENG-2 shows its new queue state, not the stale FAILED ledger row" \
+  grep -q 'ENG-2 .*PLAN-REVIEW' <<<"$out"
+# ENG-9 (seeded above with no queue ticket) has no such supersession, so its
+# FAILED outcome still surfaces normally.
+assert "sessions: lists the FAILED implement row for an act with no queue ticket" \
+  grep -q 'ENG-9 .*implement .*FAILED' <<<"$out"
 
 # --- resolution failure ------------------------------------------------------
 python3 "$RUNS_PY" show ZZZ-404 >/dev/null 2>&1

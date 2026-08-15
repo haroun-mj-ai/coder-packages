@@ -19,7 +19,7 @@ patch it here.
 
 ```
 /test-issue ENG-1135
-/test-issue next     # oldest inbox issue labelled ready-to-test
+/test-issue next     # oldest local queue ticket at state ready-to-test
 /test-issue          # same as next
 ```
 
@@ -27,8 +27,10 @@ patch it here.
 
 ### 1. Read the QA artifact first — do not re-derive what it already computed
 
-If given `next` or no argument, list the inbox (`$AP_INBOX_REPO`, from `ap-env.sh`)
-for open issues labelled `ready-to-test` and take the oldest by creation date.
+If given `next` or no argument, list the local queue (`ap sessions`, or
+`python3 "$QUEUE_PY" --ap-home "$AP_HOME" list --state ready-to-test` — see
+`.claude/skills/autopilot-protocol.md`'s "Local queue contract" for how to
+resolve `$QUEUE_PY`) and take the oldest by `seq`.
 
 `/implement-issue`'s Phase B already wrote a durable QA artifact for this issue at
 `docs/plans/qa/<eng-id>-qa.md` in the root worktree, and `/ship-work` already
@@ -66,7 +68,7 @@ one of the code PRs — it carries the plan doc, runbooks, and any e2e spec, and
 absence of a frontend or backend diff is expected, not a red flag.
 
 If the artifact itself is missing entirely, also read the plan file (its path is
-either the inbox issue's `Plan file: <abs path>` line, or the newest matching
+either the queue ticket's `plan_path` field, or the newest matching
 file in `docs/plans/` in the root worktree) and pull its **Verification** and
 **Interaction surface** sections as the fallback checklist — this is the same
 information the artifact would otherwise have carried forward.
@@ -286,9 +288,10 @@ If step 1 found drift against `dev`/`main` or a conflict in the merge-tree probe
 say so again here and point at `/ship-work` to resolve it (it rebases properly)
 — never propose a manual rebase from this skill.
 
-And remind them explicitly: **after the merge, close the inbox issue.** The
-pipeline does not close it, and it keeps showing up in the daily brief until
-someone does.
+And remind them explicitly: **after the merge, close the ticket**
+(`ap_queue.py set <ENG-ID> --state done --event "merged"`). The pipeline
+does not close it, and it keeps showing up in the daily brief until someone
+does.
 
 **If step 4 seeded anything in the Salesforce sandbox, delete it now** — the
 same query-then-delete from the runbook's seeding section, scoped to that

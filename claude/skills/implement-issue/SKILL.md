@@ -218,6 +218,23 @@ git -C <repo> worktree add --no-track \
   checked out elsewhere, use that worktree, never force.
 - Verify freshness: `git -C <worktree> rev-list --count HEAD..origin/dev`
   must be `0`. Report every path created or reused before exploring.
+- **Root worktree only — re-link personal skills.** `.claude/skills/*` in the
+  main root checkout is a set of symlinks into `~/coder-packages/claude/skills/`
+  (kept live and out of git via `skip-worktree`, so `git worktree add` checks
+  out the stale, git-tracked stub content instead of the symlink — a fresh
+  `wt-eng<id>-root` otherwise runs outdated skills, e.g. an old `/ship-work`
+  that still waits on CI and merges). Immediately after creating a root
+  worktree, recreate every top-level symlink from the main checkout's
+  `.claude/skills/` inside it:
+  ```bash
+  for link in <root-repo>/.claude/skills/*; do
+    [ -L "$link" ] || continue
+    name=$(basename "$link")
+    ln -sfn "$(readlink -f "$link")" "<worktree>/.claude/skills/$name"
+  done
+  ```
+  This is generic over whichever skills are currently symlinked — no
+  hardcoded name list to keep in sync.
 
 **Fan out 2-3 explorers, one message, concurrently.** Current state (trace
 the code path end to end) / prior art (what should be reused, not rewritten)

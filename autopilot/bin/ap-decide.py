@@ -117,6 +117,20 @@ def ap_queue_lock_free(path):
         os.close(fd)
 
 
+def _issue_lock_free(ap_home, eng_id):
+    """Whether lock.issue.<eng_id> is free right now -- see ap_queue_lock_free.
+    Every tier below checks this immediately before claiming a ticket (not
+    just the stale-claim sweep), because the ticket's own state-write can
+    happen several real steps before the wrapper that's still finishing the
+    PRECEDING phase notices completion and releases this exact lock (a plan
+    act's headless "End state" writes plan-review directly, then still has
+    kata/logging/etc. left before it writes status.json) -- claiming inside
+    that window orphans the claim: state flips forward but no act is ever
+    actually dispatched for it, recoverable only by the 3h stale sweep, with
+    no diagnostic beyond "no active run"."""
+    return ap_queue_lock_free(os.path.join(ap_home, "lock.issue.%s" % eng_id))
+
+
 # --- priority tiers -----------------------------------------------------------
 
 def decide(work_repo, ap_home, mode, busy, auto_approve_env):
@@ -152,6 +166,21 @@ def decide(work_repo, ap_home, mode, busy, auto_approve_env):
     if approve:
         for entry in approve:
             eng_id = entry["eng_id"]
+            if not _issue_lock_free(ap_home, eng_id):
+                # The plan act that produced this plan-review can self-write
+                # the state transition (see implement-issue/SKILL.md's
+                # headless "End state") several steps before it finishes and
+                # ap-cycle.sh's wrapper notices status.json and releases
+                # lock.issue.<id> -- claiming here in that window would
+                # orphan the claim: the queue says "building" but no act was
+                # ever actually dispatched for it (the wrapper's own
+                # lock.issue check would refuse to start one), and nothing
+                # recovers it until the 3h stale-claim sweep, with no real
+                # diagnostic beyond "no active run" (this exact sequence hit
+                # ENG-1327 live on 2026-08-16). Skip and let a later cycle,
+                # once the lock is genuinely free, claim it cleanly instead.
+                trace("tier1: %s approved but its issue lock is still held (act mid-shutdown) -- leaving for next cycle" % eng_id)
+                continue
             plan_path = resolve_plan_path(entry, work_repo)
             if plan_path is None:
                 trace("tier1: %s approved but planPath unresolved -> needs-input, continuing scan" % eng_id)
@@ -167,14 +196,18 @@ def decide(work_repo, ap_home, mode, busy, auto_approve_env):
             decision = {"action": "implement", "issue": eng_id, "planPath": plan_path}
             break
 
-    if decision is None and feedback:
-        entry = feedback[0]
-        eng_id = entry["eng_id"]
-        trace("tier2: %s has new feedback -> replan" % eng_id)
-        fb = entry.get("feedback")
-        ap_queue.transition(ap_home, eng_id, mode, state="planning",
-                             feedback=None, event="feedback -> replan")
-        decision = {"action": "replan", "issue": eng_id, "feedback": fb}
+    if decision is None:
+        for entry in feedback:
+            eng_id = entry["eng_id"]
+            if not _issue_lock_free(ap_home, eng_id):
+                trace("tier2: %s has feedback but its issue lock is still held (act mid-shutdown) -- leaving for next cycle" % eng_id)
+                continue
+            trace("tier2: %s has new feedback -> replan" % eng_id)
+            fb = entry.get("feedback")
+            ap_queue.transition(ap_home, eng_id, mode, state="planning",
+                                 feedback=None, event="feedback -> replan")
+            decision = {"action": "replan", "issue": eng_id, "feedback": fb}
+            break
 
     # --- Tier 3: needs-input answers -----------------------------------------
     if decision is None:
@@ -193,6 +226,9 @@ def decide(work_repo, ap_home, mode, busy, auto_approve_env):
                     # would race a second act against the still-live one.
                     continue
                 if not entry.get("feedback"):
+                    continue
+                if not _issue_lock_free(ap_home, eng_id):
+                    trace("tier3: %s answered but its issue lock is still held (act mid-shutdown) -- leaving for next cycle" % eng_id)
                     continue
                 phase = entry.get("phase_at_question") or "plan"
                 if phase == "ship":
@@ -215,6 +251,9 @@ def decide(work_repo, ap_home, mode, busy, auto_approve_env):
             trace("tier4: %d ship-pending ticket(s)" % len(sp_entries))
             for entry in sp_entries:
                 eng_id = entry["eng_id"]
+                if not _issue_lock_free(ap_home, eng_id):
+                    trace("tier4: %s ship-pending but its issue lock is still held (act mid-shutdown) -- leaving for next cycle" % eng_id)
+                    continue
                 plan_path = resolve_plan_path(entry, work_repo)
                 if plan_path is None:
                     trace("tier4: %s planPath unresolved -> needs-input, continuing scan" % eng_id)

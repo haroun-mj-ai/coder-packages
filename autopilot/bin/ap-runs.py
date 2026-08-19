@@ -30,6 +30,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import ap_env
 import ap_queue
 
 AP_HOME = Path(os.environ.get("AP_HOME", Path.home() / ".autopilot"))
@@ -539,7 +540,13 @@ def _queue_note(entry):
     if state == "done":
         return "marked done"
     if state == "failed":
-        return "failed"
+        # The static string "failed" told you nothing beyond the STATUS
+        # column already showing FAILED -- surface the actual reason, which
+        # `history`'s last entry always has (ap-cycle.sh's FAILED branch and
+        # ap-decide.py's stale-claim sweep both log a real event string when
+        # they set this state, not just the bare transition).
+        hist = entry.get("history") or []
+        return hist[-1]["event"][:70] if hist else "failed (no reason recorded)"
     if state == "ready-to-test":
         pr_urls = entry.get("pr_urls") or []
         return "PRs open" + (f": {', '.join(pr_urls)}" if pr_urls else "")
@@ -961,6 +968,12 @@ def _action_info_curses(stdscr, row):
         lines.append(f"note: {rec.get('note') or '-'}")
         if rec.get("question"):
             lines.append(f"question: {rec['question']}")
+        hist = rec.get("history") or []
+        if hist:
+            lines.append("")
+            lines.append("recent history:")
+            for h in hist[-6:]:
+                lines.append(f"  {h.get('ts','')[:16]} [{h.get('actor','?')}] {h.get('event','')}")
     _popup_message(stdscr, "Info", lines)
 
 
@@ -983,6 +996,45 @@ def _action_queue_new_curses(stdscr):
     _popup_message(stdscr, "Queued", f"queued {entry['eng_id']}" + (" [auto-approve]" if auto else ""))
 
 
+def _action_limits_curses(stdscr):
+    """View/edit the autopilot budget+concurrency caps (issues/day,
+    cost/day, cost/week, build/ship slots, usage-limit cooldown) without
+    leaving the dashboard -- the same $AP_HOME/env file `ap limits` edits,
+    via the same shared ap_env.py read-modify-write (not a second copy of
+    that logic). A global action like [n]ew, not tied to the selected row.
+    Loops so you can change several in one sitting; [b]ack/Esc to exit."""
+    env_file = str(AP_HOME / "env")
+
+    def _effective(key):
+        # The file only has what's EXPLICITLY set; ap-env.sh's own fallback
+        # default applies to anything else and is already in os.environ by
+        # the time this process runs `ap sessions` (the `ap` wrapper sources
+        # ap-env.sh first) -- read that so the displayed value is always the
+        # real one in effect, not a blank/placeholder for unset-but-defaulted
+        # knobs like AP_SHIP_SLOTS.
+        return ap_env.read_value(env_file, key) or os.environ.get(key) or ""
+
+    while True:
+        options = [f"{label}: {_effective(key) or '(unset, no default known)'}"
+                   for key, label in ap_env.LIMIT_FIELDS]
+        options.append("Back")
+        choice = _popup_menu(stdscr, "Autopilot limits (Enter to edit, Esc/Back to exit)", options)
+        if choice is None or choice == "Back":
+            return
+        idx = options.index(choice)
+        key, label = ap_env.LIMIT_FIELDS[idx]
+        new_val = _popup_text_input(stdscr, f"Set {label}", initial=_effective(key))
+        if new_val is None or not new_val.strip():
+            continue
+        new_val = new_val.strip()
+        if not re.match(r"^\d+(\.\d+)?$", new_val):
+            _popup_message(stdscr, "Limits", f"not a number: {new_val!r}")
+            continue
+        ap_env.write_value(env_file, key, new_val)
+        _popup_message(stdscr, "Limits",
+                       [f"{key} -> {new_val}", "takes effect on the next cron tick (within a minute)"])
+
+
 # Direct single-key actions on the selected row -- no arrow-driven menu:
 # press the letter, it happens. Listed in the header so the binding never
 # has to be memorized. 'n' (queue new) and 'q' (quit) act independently of
@@ -1002,10 +1054,29 @@ ROW_ACTIONS = {
     ord("K"): ("kill", _action_kill_curses),
     ord("i"): ("info", _action_info_curses),
 }
-ACTION_HDR = "[a]ttach [i]nfo [p]ause [g]o [f]eedback [s]tatus [e]dit-note [K]ill [t]retry [n]ew [q]uit"
+ACTION_HDR = "[a]ttach [i]nfo [p]ause [g]o [f]eedback [s]tatus [e]dit-note [K]ill [t]retry [n]ew [L]imits [v]iew [q]uit"
 
 
 TTL_CURSES_COLOR = {"g": 1, "y": 2, "r": 3}
+
+
+PENDING_STATES = ("plan-review", "needs-input", "ready-to-test", "failed")
+
+
+def _needs_attention(row):
+    """Rows that actually need a human decision right now: a parked live
+    act, a queue ticket in one of the four action-needed states, or a
+    ledger-only row whose last known outcome was FAILED/NEEDS_HUMAN (never
+    migrated into the queue). Backs the [v]iew filter -- everything else
+    (a happily-running live act, a routine DONE row, a plain queued ticket)
+    is noise when you're just checking what needs you."""
+    if row["kind"] == "live":
+        return bool(row["rec"].get("parked"))
+    if row["kind"] == "queue":
+        return row["rec"].get("state") in PENDING_STATES
+    if row["kind"] == "done":
+        return row["status"] in ("FAILED", "NEEDS_HUMAN")
+    return False
 
 
 def _curses_main(stdscr):
@@ -1020,24 +1091,26 @@ def _curses_main(stdscr):
 
     selected = 0
     rows = []
+    all_rows = []
+    pending_only = False
     last_scan = 0.0
     while True:
         now = time.time()
-        if now - last_scan >= 5 or not rows:
-            rows = _dashboard_rows()
+        if now - last_scan >= 5 or not all_rows:
+            all_rows = _dashboard_rows()
             last_scan = now
-            if rows:
-                selected = max(0, min(selected, len(rows) - 1))
-            else:
-                selected = 0
+        rows = [r for r in all_rows if _needs_attention(r)] if pending_only else all_rows
+        selected = max(0, min(selected, len(rows) - 1)) if rows else 0
 
         stdscr.erase()
         h, w = stdscr.getmaxyx()
-        stdscr.addnstr(0, 0, "ap sessions -- central control point  (↑/↓ or j/k select)", w - 1, curses.A_BOLD)
+        view_label = "needs-you only" if pending_only else "everything"
+        stdscr.addnstr(0, 0, f"ap sessions -- central control point  (↑/↓ or j/k select, [v]iew: {view_label})", w - 1, curses.A_BOLD)
         stdscr.addnstr(1, 0, ACTION_HDR, w - 1, curses.A_BOLD | curses.color_pair(1))
         stdscr.addnstr(2, 0, DASHBOARD_HDR, w - 1, curses.A_DIM)
         if not rows:
-            stdscr.addnstr(4, 0, "no live or recent acts", w - 1)
+            msg = "nothing needs you right now" if pending_only else "no live or recent acts"
+            stdscr.addnstr(4, 0, msg, w - 1)
         for i, row in enumerate(rows):
             if i + 3 >= h - 1:
                 break  # more rows than fit -- truncate rather than error
@@ -1088,27 +1161,33 @@ def _curses_main(stdscr):
             return
         elif key == curses.KEY_RESIZE:
             continue
+        elif key == ord("v"):
+            pending_only = not pending_only
+            selected = 0
         elif key == ord("n"):
             _action_queue_new_curses(stdscr)
-            rows = []  # force an immediate re-scan+redraw next loop iteration
+            all_rows = []  # force an immediate re-scan+redraw next loop iteration
+        elif key == ord("L"):
+            _action_limits_curses(stdscr)
+            # no rescan needed -- limits don't change any row's data
         elif key in (10, 13, curses.KEY_ENTER):
             # Enter = the fast path: attach straight into the selected live
             # act. No reply/back menu first -- you can always reply once
             # you're actually in the session.
             if rows:
                 _dispatch_attach(rows[selected])
-                rows = []
+                all_rows = []
         elif key == ord("a"):
             if rows:
                 _dispatch_attach(rows[selected])
-                rows = []
+                all_rows = []
         elif key == ord("s"):
             if rows:
                 _action_status_curses(stdscr, rows[selected])
-                rows = []
+                all_rows = []
         elif rows and key in ROW_ACTIONS:
             ROW_ACTIONS[key][1](stdscr, rows[selected])
-            rows = []
+            all_rows = []
         # any other key (including -1 on timeout): just loop and re-render
 
 
@@ -1139,10 +1218,20 @@ def cmd_sessions(args):
     genuinely-running act from an already-shipped one left open) but you
     want to record its final status separately via [s]. [t]retry a FAILED
     row. [n]ew queues a brand-new ticket (popup text entry) without leaving
-    the dashboard. q quits. Live-refreshes every 5s, same cadence as
-    `cc-top --watch`'s default."""
+    the dashboard. [L]imits views/edits the budget+concurrency caps
+    (issues/day, cost/day, cost/week, build/ship slots, usage-limit
+    cooldown) in $AP_HOME/env -- same file and same shared ap_env.py
+    read-modify-write as the standalone `ap limits` command, so there's
+    only one place that knows how to safely edit it. [v]iew toggles between
+    everything and "needs-you only" (a parked live act, or a queue ticket in
+    plan-review/needs-input/ready-to-test/failed -- see _needs_attention) so
+    a quick glance isn't lost in routine done/live rows. q quits.
+    Live-refreshes every 5s, same cadence as `cc-top --watch`'s default."""
     if not sys.stdin.isatty() or not sys.stdout.isatty():
-        _print_dashboard(_dashboard_rows())
+        rows = _dashboard_rows()
+        if getattr(args, "pending", False):
+            rows = [r for r in rows if _needs_attention(r)]
+        _print_dashboard(rows)
         return 0
     try:
         curses.wrapper(_curses_main)
@@ -1610,6 +1699,8 @@ def main():
     p.set_defaults(fn=cmd_reply)
 
     p = sub.add_parser("sessions", help="interactive dashboard: list, inspect, act")
+    p.add_argument("--pending", action="store_true",
+                    help="non-interactive: print only rows that need a human decision")
     p.set_defaults(fn=cmd_sessions)
 
     a = ap.parse_args()

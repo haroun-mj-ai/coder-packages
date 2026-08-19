@@ -218,12 +218,25 @@ the real test credentials. For each screen you touch, screenshot both sides as
   comparison meaningful; a screenshot of only one side is weak evidence
 - the page body does not scroll horizontally at the widths you check
 
+On both ports, after the flow, check `browser_console_messages` (`level:
+"warning"`, `all: true`) and `browser_network_requests` (`static: false`, no
+`filter`) — same strict-catch discipline as `/browser-verify`: **do not**
+filter by keyword or component name, and do not discard a warning, error, or
+failed request as "unrelated" just because it doesn't look connected to this
+issue. A regression from this change can surface in code the diff never
+touched — a shared provider, a background poller, a context higher in the
+tree. Report every new one, tagged with which port and which scenario
+surfaced it, in step 6. Silence here should mean "checked, found nothing,"
+never "didn't check."
+
 Then walk the QA artifact's **Interaction cases from the blast radius** section
 (or, on the fallback path, the plan's **Interaction surface** list), one item
 at a time, on the changed port: this is exactly the set of neighbouring
 features `/implement-issue`'s Phase B `scout` dispatch already flagged as worth
 checking, not a smoke test of the whole app, and not a list to re-derive from
-the diff yourself.
+the diff yourself. Repeat the same console/network check after each
+interaction case, not just the initial screen — a case further down the list
+is exactly where an unrelated-looking regression tends to hide.
 
 **If a scenario needs CRM data that isn't in the sandbox** (an Opportunity in
 a particular stage, an Account with a particular field), don't skip the
@@ -271,6 +284,12 @@ Short and evidence-led:
   the fallback path, the plan's Verification or Interaction surface section)
   claimed that you found to be false. Lead with this if it exists; it is the
   most important thing you will report.
+- **Unexpected findings** — any console warning/error or failed network
+  request the browser walk surfaced that the QA artifact didn't call out,
+  even if it doesn't look related to this issue. List it here rather than
+  folding it into "Contradicts the artifact" (that's about a claim being
+  false — this is new information) or dropping it because you couldn't
+  immediately explain it.
 
 ### 7. Hand off
 

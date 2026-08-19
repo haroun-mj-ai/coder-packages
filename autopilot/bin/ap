@@ -16,7 +16,7 @@ CRONTAB_RENDERED="$AP_HOME/crontab.rendered"
 TMUX_SESSION="${AP_TMUX_SESSION:-autopilot}"
 
 usage() {
-  echo "Usage: ap {up [--quiet]|down|status|pause|resume|reset-week|runs|run|tail|watch|sweep|sessions|pause-act|resume-act|retry|queue|approve|reply|decide|--print-paths}" >&2
+  echo "Usage: ap {up [--quiet]|down|status|pause|resume|reset-week|limits|runs|run|tail|watch|sweep|sessions|pause-act|resume-act|retry|queue|approve|reply|decide|--print-paths}" >&2
   echo "  queue ENG-<id> [NOTE] [--auto]  New-work intake: queue a ticket for" >&2
   echo "                 the pipeline (replaces opening a GitHub inbox issue)." >&2
   echo "                 --auto also sets this ticket's persistent" >&2
@@ -34,6 +34,12 @@ usage() {
   echo "                 account's real usage -- the pipeline's ledger only sees" >&2
   echo "                 its own spend, not interactive sessions'. SEED applies" >&2
   echo "                 to the first period only. Never edits past ledgers." >&2
+  echo "  limits         Show or change the budget/concurrency caps in" >&2
+  echo "                 \$AP_HOME/env: --day-issues --day-cost --week-cost" >&2
+  echo "                 --build-slots --ship-slots --limit-cooldown-min." >&2
+  echo "                 No args prints current values. Persisted to the env" >&2
+  echo "                 file (not just this shell) and picked up by the next" >&2
+  echo "                 cron tick within a minute -- no restart needed." >&2
   echo "  runs [-n N]    List recent acts; live ones are marked LIVE." >&2
   echo "  run  [TARGET]  One act in detail: main-loop model, tokens, tool mix," >&2
   echo "                 status.json, stderr, final message. --timeline for" >&2
@@ -44,12 +50,13 @@ usage() {
   echo "                 branches. Defaults to --dry-run (report only); pass" >&2
   echo "                 --yes to actually remove. Never --force, never" >&2
   echo "                 'branch -D'." >&2
-  echo "  sessions       Interactive dashboard: live acts + queue tickets" >&2
-  echo "                 awaiting a decision + each other issue's last outcome," >&2
-  echo "                 numbered. Select one to see detail and, if applicable," >&2
-  echo "                 a one-key action: pause/attach a live act, approve or" >&2
-  echo "                 reply to a plan-review/needs-input ticket, or retry a" >&2
-  echo "                 failed one." >&2
+  echo "  sessions [--pending]      Interactive dashboard (central control point):" >&2
+  echo "                 live acts + queue tickets awaiting a decision + each" >&2
+  echo "                 other issue's last outcome, arrow-key select, direct-key" >&2
+  echo "                 actions (attach/pause/approve/reply/status/note/kill/" >&2
+  echo "                 retry/new/info). Press [v] to toggle a filtered view" >&2
+  echo "                 showing only rows that need you; --pending does the same" >&2
+  echo "                 for the non-interactive (piped) one-shot printout." >&2
   echo "  pause-act [TARGET]        Interrupt one live persistent act mid-turn" >&2
   echo "                 (Escape) -- resumable, unlike 'ap pause' which only" >&2
   echo "                 stops NEW dispatches. Note: does NOT free its lane" >&2
@@ -91,7 +98,7 @@ cmd_sweep() { "$SCRIPT_DIR/ap-sweep.sh" "$@"; }
 cmd_pause_act() { python3 "$RUNS_PY" interrupt "${1:-latest}"; }
 cmd_resume_act() { python3 "$RUNS_PY" continue "${1:-latest}" "${2:-continue}"; }
 cmd_retry() { python3 "$RUNS_PY" retry "${1:-latest}"; }
-cmd_sessions() { python3 "$RUNS_PY" sessions; }
+cmd_sessions() { python3 "$RUNS_PY" sessions "$@"; }
 cmd_queue() { python3 "$RUNS_PY" queue "$@"; }
 cmd_approve() { python3 "$RUNS_PY" approve "$@"; }
 cmd_reply() { python3 "$RUNS_PY" reply "$@"; }
@@ -500,6 +507,58 @@ print("  (historical ledger entries were not modified)")
 PYEOF
 }
 
+# Tunable budget/concurrency knobs, all persisted in $AP_HOME/env (never
+# just the current shell) -- ap-cycle.sh sources ap-env.sh fresh every
+# single cron tick, so a change here takes effect within a minute, no
+# restart needed. With no flags, just reports the live values (already in
+# scope, sourced by ap-env.sh at the top of this script).
+cmd_limits() {
+  local env_file="$AP_HOME/env"
+  local sets=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --day-issues)         sets+=("AP_MAX_ISSUES_PER_DAY=${2:?value required}"); shift 2 ;;
+      --day-cost)           sets+=("AP_MAX_DAY_COST_USD=${2:?value required}"); shift 2 ;;
+      --week-cost)          sets+=("AP_MAX_WEEK_COST_USD=${2:?value required}"); shift 2 ;;
+      --build-slots)        sets+=("AP_BUILD_SLOTS=${2:?value required}"); shift 2 ;;
+      --ship-slots)         sets+=("AP_SHIP_SLOTS=${2:?value required}"); shift 2 ;;
+      --limit-cooldown-min) sets+=("AP_LIMIT_COOLDOWN_MIN=${2:?value required}"); shift 2 ;;
+      *) echo "ap limits: unknown argument '$1'" >&2; return 2 ;;
+    esac
+  done
+
+  if [[ ${#sets[@]} -eq 0 ]]; then
+    echo "current limits (from \$AP_HOME/env; ap status shows live spend against these):"
+    printf '  %-28s %s\n' "issues/day:"                  "$AP_MAX_ISSUES_PER_DAY"
+    printf '  %-28s %s\n' "cost/day (\$):"                "$AP_MAX_DAY_COST_USD"
+    printf '  %-28s %s\n' "cost/week (\$, informational):" "$AP_MAX_WEEK_COST_USD"
+    printf '  %-28s %s\n' "build slots (clamped 1-4):"    "$AP_BUILD_SLOTS"
+    printf '  %-28s %s\n' "ship slots (clamped 1-6):"     "$AP_SHIP_SLOTS"
+    printf '  %-28s %s\n' "usage-limit cooldown (min):"   "$AP_LIMIT_COOLDOWN_MIN"
+    echo
+    echo "set with any combination of:"
+    echo "  ap limits --day-issues N --day-cost N --week-cost N \\"
+    echo "            --build-slots N --ship-slots N --limit-cooldown-min N"
+    echo "file: $env_file"
+    return 0
+  fi
+
+  mkdir -p "$AP_HOME"
+  touch "$env_file"
+  local kv key value
+  for kv in "${sets[@]}"; do
+    key="${kv%%=*}"; value="${kv#*=}"
+    if ! [[ "$value" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+      echo "ap limits: $key must be a positive number, got '$value'" >&2
+      return 2
+    fi
+    python3 "$SCRIPT_DIR/ap_env.py" --file "$env_file" set "$key" "$value" >/dev/null
+    echo "set $key=$value"
+  done
+  echo "in: $env_file"
+  echo "takes effect on the next cron tick (within a minute) -- no restart needed"
+}
+
 [[ $# -ge 1 ]] || usage
 sub="$1"; shift
 case "$sub" in
@@ -509,12 +568,13 @@ case "$sub" in
   pause) cmd_pause ;;
   resume) cmd_resume ;;
   reset-week) cmd_reset_week "$@" ;;
+  limits) cmd_limits "$@" ;;
   runs) cmd_runs "$@" ;;
   run) cmd_run "$@" ;;
   tail) cmd_tail "$@" ;;
   watch) cmd_watch "$@" ;;
   sweep) cmd_sweep "$@" ;;
-  sessions) cmd_sessions ;;
+  sessions) cmd_sessions "$@" ;;
   pause-act) cmd_pause_act "${1:-}" ;;
   resume-act) cmd_resume_act "${1:-}" "${2:-}" ;;
   retry) cmd_retry "${1:-}" ;;

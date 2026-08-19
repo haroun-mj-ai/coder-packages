@@ -899,7 +899,15 @@ $transcript_tail}"
       ap-notify.sh "requeued after external failure: ${issue:-$action}" "$failure_body" || true
     else
       if [[ -n "${issue:-}" && "$issue" != "null" ]]; then
-        queue_set "$issue" --state failed --event "run failed"
+        # A bare "run failed" event told you nothing beyond the STATUS
+        # column already showing FAILED -- this is exactly what "I should
+        # be able to see the reason" was missing. Pull the first real line
+        # out of the transcript's own explanation (falls back to stderr),
+        # since that's usually the model's own account of what went wrong,
+        # not just a stack trace.
+        fail_reason="$(printf '%s' "${transcript_tail:-$stderr_tail}" | grep -m1 -v '^[[:space:]]*$' | tr -d '\n' | cut -c1-200)"
+        [[ -z "$fail_reason" ]] && fail_reason="no stderr/transcript captured"
+        queue_set "$issue" --state failed --event "run failed: $fail_reason"
       fi
       ap-notify.sh "autopilot FAILED: ${issue:-$action}" "$failure_body" || true
     fi

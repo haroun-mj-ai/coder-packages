@@ -301,14 +301,22 @@ if awk -v a="$cost_today" -v b="$AP_MAX_DAY_COST_USD" 'BEGIN{exit !(a>=b)}'; the
   over_budget=true
 fi
 
+# Over budget suppresses NEW intake only (tier 5, queued -> plan) -- it does
+# NOT exit the whole cycle. An earlier version exited here outright, which
+# meant an already-approved/answered/ship-pending ticket (tiers 1-4, all
+# continuing work claimed before the cap was hit) sat stuck until midnight
+# alongside genuinely new tickets, for no reason: hit live 2026-08-19,
+# ENG-1373 approved at plan-review, then invisible to every cycle for the
+# rest of the day because this exited before Stage 1 ever ran.
+suppress_new_intake="0"
 if [[ "$over_budget" == true ]]; then
-  log "budget cap reached: issues=$issues_today/$AP_MAX_ISSUES_PER_DAY cost=$cost_today/$AP_MAX_DAY_COST_USD"
+  suppress_new_intake="1"
+  log "budget cap reached: issues=$issues_today/$AP_MAX_ISSUES_PER_DAY cost=$cost_today/$AP_MAX_DAY_COST_USD -- suppressing new intake only"
   marker="$AP_HOME/logs/.budget-notified-$today"
   if [[ ! -e "$marker" ]]; then
     ap-notify.sh "autopilot budget reached" "issues=$issues_today/$AP_MAX_ISSUES_PER_DAY cost=\$$cost_today/\$$AP_MAX_DAY_COST_USD" || true
     touch "$marker"
   fi
-  exit 0
 fi
 
 # --- Stage 0.5: parked-act relay + manual-resume reconcile ------------------
@@ -400,7 +408,9 @@ sweep_manual_resumes
 # --- Stage 1: decide (deterministic, always, always $0) ---------------------
 
 decide_rc=0
-poll_json="$("$SCRIPT_DIR/ap-decide.sh" --claim --busy "$busy_lanes" 2>>"$AP_HOME/logs/cycle.log")" || decide_rc=$?
+decide_flags=(--claim --busy "$busy_lanes")
+[[ "$suppress_new_intake" == "1" ]] && decide_flags+=(--suppress-new-intake)
+poll_json="$("$SCRIPT_DIR/ap-decide.sh" "${decide_flags[@]}" 2>>"$AP_HOME/logs/cycle.log")" || decide_rc=$?
 if [[ $decide_rc -ne 0 || -z "$poll_json" ]]; then
   log "ap-decide.sh invocation failed rc=$decide_rc"
   poll_json='{"action":"none"}'

@@ -17,6 +17,11 @@
 #   --dry-run       decide and print; perform NO queue writes (default).
 #   --claim         decide, perform the claiming state writes, then print.
 #   --busy <lanes>  comma-separated subset of build,ship,plan to skip.
+#   --suppress-new-intake   skip tier 5 (queued -> plan) only -- used when
+#                   the daily issues/cost cap is reached, so an
+#                   already-approved/answered/ship-pending ticket (tiers
+#                   1-4) still gets serviced instead of stalling for the
+#                   rest of the day alongside genuinely new tickets.
 #
 # No Linear write happens here -- see claude/skills/implement-issue/SKILL.md's
 # headless section (--phase plan) for where that claim now lives.
@@ -36,6 +41,7 @@ log() {
 
 mode="dry-run"
 busy=""
+suppress_new_intake="0"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run)
@@ -49,6 +55,10 @@ while [[ $# -gt 0 ]]; do
     --busy)
       busy="${2:-}"
       shift 2 2>/dev/null || shift
+      ;;
+    --suppress-new-intake)
+      suppress_new_intake="1"
+      shift
       ;;
     *)
       shift
@@ -67,6 +77,7 @@ python3 "$SCRIPT_DIR/ap-decide.py" \
   --mode "$mode" --busy "$busy" \
   --ap-home "$AP_HOME" --work-repo "$WORK_REPO" \
   --auto-approve "$AP_AUTO_APPROVE" \
+  --suppress-new-intake "$suppress_new_intake" \
   >"$decide_out" 2>"$decide_err" || rc=$?
 
 # The trace (one line per tier evaluated) always lands in the log, even on

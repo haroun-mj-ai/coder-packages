@@ -417,7 +417,9 @@ assert "case2: locked -> ticket untouched (decide never ran)" \
   [ "$(ticket_field "$CASE_AP_HOME" ENG-2 state)" = "queued" ]
 
 # =============================================================================
-# Case 3: ledger pre-seeded at the issue cap -> stage 2 never runs.
+# Case 3: ledger pre-seeded at the issue cap -> a QUEUED (new-intake) ticket
+# is suppressed, no act dispatched. (Stage 1 still runs -- see case3b -- this
+# only checks that new intake specifically stays gated.)
 # =============================================================================
 setup_case
 seed_ticket "$CASE_AP_HOME" ENG-3 queued
@@ -427,6 +429,34 @@ echo '{"ts":"2026-01-01T00:00:00Z","issue":"ENG-OLD","phase":"implement","status
 rc="$(AP_MAX_ISSUES_PER_DAY=1 run_case)"
 assert "case3: at cap -> exit 0" [ "$rc" -eq 0 ]
 assert "case3: at cap -> claude never called" [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 0 ]
+assert "case3: at cap -> queued ticket left untouched" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-3 state)" = "queued" ]
+
+# =============================================================================
+# Case 3b: same issue cap reached, but an ALREADY-approved plan-review
+# ticket is waiting (tier 1, not new intake) -> it still gets dispatched.
+# Regression test for a real bug hit live 2026-08-19: ap-cycle.sh used to
+# exit 0 outright when over budget, so ENG-1373's approval sat invisible to
+# every cycle for the rest of the day. The fix suppresses tier 5 (new
+# intake) only; tiers 1-4 (continuing work claimed before the cap was hit)
+# must keep flowing.
+# =============================================================================
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-3b plan-review pending_approval=true
+seed_plan_file "$CASE_WORK_REPO" ENG-3b
+mkdir -p "$CASE_AP_HOME/runs"
+seed_ledger="$CASE_AP_HOME/runs/$(date -u +%F).jsonl"
+echo '{"ts":"2026-01-01T00:00:00Z","issue":"ENG-OLD","phase":"implement","status":"DONE","cost":1.0,"session_id":"s1"}' >"$seed_ledger"
+rc="$(AP_MAX_ISSUES_PER_DAY=1 run_case)"
+assert "case3b: at cap but approved -> exit 0" [ "$rc" -eq 0 ]
+# The stub claude always reports DONE-with-PR, so a dispatched implement
+# auto-chains straight into ship (same shape as the "chain(i)" case below) --
+# 2 calls and a final state of "shipping" is proof tier1 actually fired,
+# not that it stalled in "building".
+assert "case3b: at cap but approved -> act WAS dispatched (implement+chained ship)" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 2 ]
+assert "case3b: at cap but approved -> ticket left plan-review behind" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-3b state)" != "plan-review" ]
 
 # =============================================================================
 # Case 4: decide (real, unstubbed) claims a queued ticket -> ONE claude call

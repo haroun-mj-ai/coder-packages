@@ -133,7 +133,7 @@ def _issue_lock_free(ap_home, eng_id):
 
 # --- priority tiers -----------------------------------------------------------
 
-def decide(work_repo, ap_home, mode, busy, auto_approve_env):
+def decide(work_repo, ap_home, mode, busy, auto_approve_env, suppress_new_intake=False):
     sweep_stale(ap_home, mode)
 
     build_busy = "build" in busy
@@ -270,7 +270,16 @@ def decide(work_repo, ap_home, mode, busy, auto_approve_env):
 
     # --- Tier 5: new intake (queued) ------------------------------------------
     if decision is None:
-        if plan_busy:
+        if suppress_new_intake:
+            # Daily issues/cost cap reached. This throttles *new* tickets
+            # entering the pipeline only -- tiers 1-4 above are all
+            # continuing work already claimed earlier (an approval, a
+            # feedback reply, a ship-pending pickup), and blocking those too
+            # just because the cap was hit stalls an already-approved
+            # ticket for the rest of the day for no reason (hit live
+            # 2026-08-19: ENG-1373 approved, then stuck until midnight).
+            trace("tier5: skipped (daily issue/cost budget reached -- new intake suppressed)")
+        elif plan_busy:
             trace("tier5: skipped (plan busy)")
         else:
             candidates = ap_queue.list_queue(ap_home, state="queued")
@@ -299,13 +308,16 @@ def main():
     ap.add_argument("--ap-home", required=True)
     ap.add_argument("--work-repo", required=True)
     ap.add_argument("--auto-approve", default="0")
+    ap.add_argument("--suppress-new-intake", default="0")
     args = ap.parse_args()
 
     busy = {b.strip().lower() for b in args.busy.split(",") if b.strip()}
     auto_approve_env = args.auto_approve == "1"
+    suppress_new_intake = args.suppress_new_intake == "1"
 
     try:
-        decision = decide(args.work_repo, args.ap_home, args.mode, busy, auto_approve_env)
+        decision = decide(args.work_repo, args.ap_home, args.mode, busy, auto_approve_env,
+                           suppress_new_intake=suppress_new_intake)
     except Exception as exc:  # defensive: never crash the cycle over this
         trace("internal error: %r" % (exc,))
         decision = {"action": "none"}

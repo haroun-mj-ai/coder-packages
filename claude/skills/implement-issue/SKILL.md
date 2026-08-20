@@ -333,6 +333,53 @@ this step earns its cost. A `DO NOT IMPLEMENT` verdict means rework and
 re-audit once, or surface it to the human as a blocking question — never
 paper over it.
 
+### 7b. Red-team the plan — ONLY when it touches a guard
+
+**Conditional. Skip it and say so unless the trigger below fires** — an
+unconditional extra critic pass on every ticket is the review-swarm this
+pipeline deliberately avoids, and it is not free.
+
+**Trigger — fires when the plan changes the behaviour of any of:** a verifier
+or postcondition, a validator, a dispatcher/entry gate, a cap or budget check,
+a permission or entitlement check, a dedupe/idempotency key, a retry or
+fallback branch, or a default that decides whether work happens at all.
+Classify from the plan's own Files and Change sections; when genuinely
+uncertain, run it.
+
+**Why this exists and `plan-critic` does not cover it.** `plan-critic` asks
+*"are the plan's claims true?"*. That is a different question from *"what does
+this change now let through?"*, and a plan can pass the first while failing the
+second completely. The case this step was built from: every claim in an
+ENG-1406 plan was independently verified and correct — the prompt really did
+sanction three terminal states, the verifier really did accept two, the failure
+rate really was 55%. The plan was still wrong, because sanctioning the third
+state wholesale would also have turned two *structurally broken* causes green,
+which no answer from a user can unblock. The shipped fix (by someone else, in
+parallel) kept those two fatal. Nothing in a claims-verification rubric would
+have caught that.
+
+Dispatch a **fresh** `Agent` carrying `/red-team`'s rubric — model `fable` or
+`opus`, effort matching tier — given the plan's behaviour delta, the current
+code and tests for the guard being changed, and **not** the plan's argument for
+why the change is right. Require back:
+
+1. **Must-stay-fatal list** — every failure mode the guard currently blocks,
+   and for each, whether this change also lets it through
+2. **Discriminator attack** — an input that takes the new path without doing
+   the work the new path is meant to reward
+3. **Replay** — what the change would have decided for the real historical rows
+   it touches, computed not reasoned. If the plan has no way to obtain those
+   rows, that gap is itself the finding
+4. **Blast radius** — enumerated call sites, not an estimate
+5. **Already-solved check** — does the surface this plan builds for already
+   handle the case once the upstream signal is fixed?
+
+Fold findings into the plan the same way as step 7, and record them in the
+**Design review** section under a `Red-team` heading — including the trigger
+decision when it did not fire, so the skip is auditable. A must-stay-fatal case
+the plan does not preserve is a `DO NOT IMPLEMENT`-equivalent: rework before
+proceeding.
+
 Then commit: `git -C <root-worktree> add docs/plans/<plan>.md && git -C
 <root-worktree> commit -m "ENG-<id>: plan"`. One commit, after the audit —
 not a write-then-amend-then-recommit cycle.

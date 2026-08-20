@@ -47,6 +47,47 @@ Pin down before pulling data:
   vs unpinned memory, action item, draft artifact, deal/rep summary, signal
   brief, prospecting plan — owner + where each lives).
 
+## 1b) Validate the instrument BEFORE you aggregate anything
+
+Every wrong conclusion this skill has produced came from trusting a field that
+was convenient rather than authoritative. Do this before the first aggregate,
+not after someone questions the result. (`/challenge` is the full rubric; this
+is the subset that has actually bitten here.)
+
+**Cost figures — do not use `total_cost_estimate_usd`.** It is written at
+`backend/app/workers/orchestrations/tasks.py:674` as a sum of
+`step_runs[].cost_estimate_usd`, each of which is a **local re-estimate from
+token counts** (`step_handlers/agent.py:596` `_estimate_cost`), not billed cost.
+Measured on production it under-reports by **2.82× overall and non-uniformly** —
+2.52× on a single-call spec, 6.34× on a multi-call one — so no constant
+correction exists (ENG-1422). It is also display-only: cap enforcement reads
+`APIUsage` (`app/services/usage/enforcer.py`), not this field.
+
+> **Real cost = join `step_runs[].session_id` → `APIUsage.cost_usd`, grouped by
+> session.** Never wall-clock deltas — unreliable under concurrency. Note
+> ENG-1418 separately: a share of `APIUsage` rows carry `organization_id: null`,
+> so an org-filtered aggregate alone still understates.
+
+**Window — split on every deploy inside it.** A range that straddles a release
+describes two systems averaged together. Run `git log <remote>/main --since=
+--until= -- app/external/ai_service.py app/orchestrations/ app/services/ai/`
+first, and report the post-change bucket as the answer. A 13-day window here
+once spanned five cost fixes; re-derived post-fix, the headline total fell from
+$77.05 to $26.95 and a "48% of spend" finding became 10.9%.
+
+**Output/waste signals — know what the marker asserts.** `produces:<token>` in
+`step_runs[].output_keys` asserts **a record was created**, not that the user
+got value; a spec running a `repair_empty_*` step is telling you records land
+empty. And do **not** infer "produced nothing" from a
+`source_orchestration_run_id` join — that field is unstamped on
+`ActionItemArtifact` rows written by several specs (ENG-1410), which once
+overstated waste by ~70×. Cross-check any zero-output claim against the agent's
+actual write-tool calls in its session.
+
+**Then state the instrument in the write-up's first line**, the way a good
+analysis does: *"measured by joining X → Y, not from Z"*. It makes the work
+auditable and forces the question onto you before a reviewer gets there.
+
 ## 2) Pull the data (`scripts/dump_runs.py`)
 
 Edit the `SELECTION` block at the top of `dump_runs.py` (set `RUN_IDS` *or*

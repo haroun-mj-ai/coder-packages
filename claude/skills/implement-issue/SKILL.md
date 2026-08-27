@@ -1,6 +1,6 @@
 ---
 name: implement-issue
-description: Take a Linear task ID (or a free-text description, filing the ticket first) from ticket to an open PR in two phases separated by a hard approval gate. Phase plan: fetches every repo into fresh worktrees, classifies risk (Light/Standard/Heavy), drafts acceptance scenarios from the raw ticket in a fresh sub-agent context, drafts the plan via an Opus sub-agent, adversarially audits it with an independent fable-model sub-agent, commits the plan, and stops for approval. Phase implement: reuses that worktree (with a staleness check before touching anything), dispatches model-matched implementer sub-agents per work unit, runs a spec-vs-test audit plus a fresh-context code review with zero plan visibility, runs the real quality gates, derives the change's blast radius, QAs it in the browser, writes the durable QA artifact under docs/plans/qa/, commits, runs roborev, then gates on scope/secrets, rebases onto fresh dev, pushes, and opens the PR(s) — no server or Docker required, this is pure git/GitHub-API reusing gates already run. Ends by recommending /ship-work to confirm the push is rebased and locally gate-clean; never merges, and never waits on CI itself (neither skill does — CI-watching and merging are a human's later, separate call). Headlessly takes --phase plan or --phase implement so autopilot can run the two phases hours apart with a human's approval in between; --phase implement now pushes and opens PRs headlessly too. Supersedes /plan-issue and /implement-plan as the single main path. Use when the user says "implement ENG-123", hands you a Linear id or free-text description to take from ticket to an open PR, or on /implement-issue. Do NOT use to merge — nothing in this chain merges autonomously.
+description: Take a Linear task ID (or a free-text description, filing the ticket first) from ticket to an open PR in two phases separated by a hard approval gate. Phase plan: fetches every repo into fresh worktrees, classifies risk (Light/Standard/Heavy), drafts acceptance scenarios from the raw ticket in a fresh sub-agent context, drafts the plan via an Opus sub-agent, adversarially audits it with an independent fable-model sub-agent, gets an independent second design draft from Codex (via codex-delegate, read-only) on non-Light tickets, commits the plan, and stops for approval. Phase implement: reuses that worktree (with a staleness check before touching anything), dispatches model-matched implementer sub-agents per work unit (routing self-contained ones to Codex via codex-delegate's codex-feature lane), runs a Codex adversarial test pass, a spec-vs-test audit, and a two-model debate-review (Claude proposes, Codex challenges, Claude decides) with zero plan visibility, runs the real quality gates, derives the change's blast radius, QAs it in the browser, writes the durable QA artifact under docs/plans/qa/, commits, runs roborev, then gates on scope/secrets, rebases onto fresh dev, pushes, and opens the PR(s) — no server or Docker required, this is pure git/GitHub-API reusing gates already run. Ends by recommending /ship-work to confirm the push is rebased and locally gate-clean; never merges, and never waits on CI itself (neither skill does — CI-watching and merging are a human's later, separate call). Headlessly takes --phase plan or --phase implement so autopilot can run the two phases hours apart with a human's approval in between; --phase implement now pushes and opens PRs headlessly too. Supersedes /plan-issue and /implement-plan as the single main path. Use when the user says "implement ENG-123", hands you a Linear id or free-text description to take from ticket to an open PR, or on /implement-issue. Do NOT use to merge — nothing in this chain merges autonomously.
 ---
 
 # implement-issue
@@ -51,12 +51,24 @@ the reading and the building. Two rules are not negotiable:
   like. Ordinary work dispatches by `subagent_type`: `explorer` and
   `plan-critic` (sonnet, medium), `scout` (haiku, low), `implementer`
   (sonnet, medium). This skill is the **one deliberate exception** to "never
-  spawn an opus or fable subagent from a skill" — three specific dispatches
-  below (the plan drafter, the plan auditor, the code reviewer) are raw
-  `Agent(model: "opus"|"fable", ...)` calls, on purpose, because the whole
+  spawn an opus or fable subagent from a skill" — the plan drafter (step 5)
+  is a raw `Agent(model: "opus", ...)` call, and the plan auditor (step 7) is
+  `plan-critic` overridden to `model: "fable"`, on purpose, because the whole
   point of each is a different reasoning tier or a genuinely independent
   model family from whatever drafted the thing it's checking. Every other
   unit of work still goes through a pinned `subagent_type`.
+
+  **Codex is the other cross-model layer, via `delegate-skills`/`review-skills`,
+  not the Agent tool.** Three lanes (`~/.config/delegate-skills/config.json`,
+  global): `review-main`/`review-debate` (claude/codex, high effort) drive
+  `debate-review`'s two-model PR/local review (step 6, and `piv-review-pr`'s
+  equivalent); `codex-feature` (codex, medium effort) is a real second
+  implementer for self-contained work units (step 3), not just a review
+  add-on. Codex's own docs note research (arXiv:2607.21656) showing the
+  pairing is asymmetric — Claude reviewing Codex-authored work lifts quality,
+  Codex reviewing Claude-authored work doesn't — so every dispatch here keeps
+  Codex on the generative/challenger side (drafting, or trying to refute a
+  specific claim) and Claude on the judging side, never the reverse.
 
   Agent definitions live in `.claude/agents/` in this repo, loaded at
   session start; if a dispatch fails with "agent type not found" after a
@@ -380,8 +392,46 @@ decision when it did not fire, so the skip is auditable. A must-stay-fatal case
 the plan does not preserve is a `DO NOT IMPLEMENT`-equivalent: rework before
 proceeding.
 
+### 7c. Independent second draft — Codex, skip only for Light tier
+
+**Skip only for Light.** Run it for Standard and Heavy alike — this is Codex's side of the spend, a flat
+subscription rather than metered Claude usage, so there's no cost reason to gate it any tighter than that. The
+point isn't Codex reviewing the opus-drafted plan (`plan-critic`/red-team already cover claims and guard-behavior,
+and cross-model review research — arXiv:2607.21656 — found Codex *reviewing* Claude-drafted work is the direction
+that makes it worse, not better). It's Codex **drafting its own independent approach from the same evidence**,
+blind to what Claude proposed — the generative role the research shows is fine, paired with Claude doing the
+judging, which is the direction that actually lifts quality. Uses `codex-delegate`'s `--read-only` mode (the
+`review-debate` lane — `delegate-setup`'s global fleet config, `~/.config/delegate-skills/config.json`):
+
+```xml
+<task>
+Given this ticket: <ticket text>, and this codebase context: <steps 1-3's findings — NOT the drafted plan>,
+propose your own implementation approach: key design decisions, the files you'd touch, trade-offs, and risks.
+This is a design proposal only — do not write or edit any code.
+</task>
+<grounding_rules>
+Ground every claim in evidence from the codebase context given. Label anything that's an inference rather than
+something you verified.
+</grounding_rules>
+<structured_output_contract>
+Report: (1) your proposed approach, (2) key design decisions and why, (3) trade-offs and risks, (4) files you'd
+touch.
+</structured_output_contract>
+```
+
+```bash
+node "<codex-delegate skill-dir>/scripts/relay.mjs" --brief brief.txt --cd <root-worktree> --lane review-debate --read-only
+```
+
+`--read-only` means nothing to review/land — just read `result.json`'s `finalMessage`. Then **you** (not another
+subagent — this is a judgment call) compare Codex's proposal against the opus-drafted plan: same approach reached
+independently (strong corroboration, note it and move on), a genuinely better idea in Codex's version (graft it
+in, record what and why), or Codex's proposal is weaker/misses something the opus draft already handles (say so,
+don't graft it just because a second model produced it). Record the comparison in the plan's Design review section
+under an `Approach comparison (Codex)` heading — including a skipped step (Light tier), so the skip is auditable.
+
 Then commit: `git -C <root-worktree> add docs/plans/<plan>.md && git -C
-<root-worktree> commit -m "ENG-<id>: plan"`. One commit, after the audit —
+<root-worktree> commit -m "ENG-<id>: plan"`. One commit, after both audits —
 not a write-then-amend-then-recommit cycle.
 
 ### 8. `ExitPlanMode` for explicit approval
@@ -579,6 +629,17 @@ boilerplate work may go to a raw `Agent(model: "haiku")` call. This is a
 layer on top of the pinned-`implementer` default above, not a replacement of
 it — most units stay on `implementer`.
 
+**Route self-contained/mechanical units to `codex-delegate` instead of `implementer`** (the `codex-feature`
+lane) — real implementation work, not just a supplementary check. A unit qualifies when it's bounded and
+clearly gated by its own "done when," and doesn't ride on security, concurrency, migration, or unstated domain
+knowledge the plan didn't spell out (the same bar `codex-delegate`'s own docs use — if unsure, keep it on
+`implementer`). Write the brief per `writing-the-brief.md`'s four-block shape and dispatch:
+```bash
+node "<codex-delegate skill-dir>/scripts/relay.mjs" --brief brief.txt --cd <abs repo path> --lane codex-feature
+```
+Review exactly like any other completed unit — don't skip step 5's gates or step 6's audits because Codex wrote
+it. `touchedFiles` in `result.json` should match the unit's own file list, nothing wider.
+
 ### 4. Escalate rather than letting the cheap model redesign
 
 Trust a passing report — the agent ran the tests and quoted the output; do
@@ -586,13 +647,53 @@ not re-read every changed file to double-check what a passing test already
 covers.
 
 But when a report says the spec is wrong, a hook doesn't exist, or the
-change doesn't fit: **stop that repo's chain and bring it here.** Decide
+change doesn't fit: **stop that repo's chain and bring it here.** Before
+stopping, optionally enrich the diagnosis with an independent read —
+`codex-delegate --read-only` (`review-debate` lane), a brief naming what's
+stuck, what was tried, and what's unclear, same shape as `piv-investigate-issue`'s
+"can't pin the root cause" recipe. This works identically headless (it's a
+shell command and a file read, no live human needed) — fold its finding into
+the question/report either way. Decide
 yourself whether the plan changes, amend the plan file if it does, record
 the change in Design review. This is exactly the kind of stop step 1's kata
 rule covers — signal `work.attention` before doing anything else, so a
 coordinator or the human sees it without reading the transcript. An
 implementer improvising around a bad spec is the exact failure this
 two-phase split exists to prevent.
+
+### 4b. Adversarial test pass — Codex tries to break it
+
+Run this for every ticket regardless of tier — Codex's side of this is a flat subscription, not metered spend, so
+there's no cost reason to gate it. This is where Codex adds genuine value rather than reviewing Claude's homework:
+cross-model review research (arXiv:2607.21656) found Codex *reviewing* Claude-authored code makes it worse, but
+asking Codex to **generate an attack** (a new failing test) is a different, generative task — a test either fails
+or it doesn't, regardless of which model wrote it. Use `codex-delegate` (the `review-debate` lane), not a one-shot
+forwarder — you review and land whatever it produces:
+
+```xml
+<task>
+Try to find a real bug in this implementation by writing a test that breaks it: <point at the diff/changed files>.
+If you find a genuine failing case, add the test at <this project's test dir, mirroring its structure> and report
+what it exercises. If the implementation holds up under everything you tried, report that plainly.
+</task>
+<action_safety>
+Only add a test file. Do NOT modify the implementation itself, and do NOT git add or commit — leave everything in
+the working tree for review. If no real bug exists, don't force one.
+</action_safety>
+<structured_output_contract>
+Report: (1) whether a genuine failing case was found, (2) the test file added if so, (3) what it exercises and
+why it's real, or a plain statement that nothing was found.
+</structured_output_contract>
+```
+
+```bash
+node "<codex-delegate skill-dir>/scripts/relay.mjs" --brief brief.txt --cd <abs repo path> --lane review-debate
+```
+
+Read `result.json`: confirm `touchedFiles` is exactly the one new test file. A genuine failing test means fix the
+implementation to pass it, keep the test — go back to step 3/4 with the specific gap. Nothing found is a valid,
+useful result — note it in step 10's report as one more piece of verification evidence. `status: failed`/
+`codex_unavailable` → note it and move on, this is a bonus check, not a gate.
 
 ### 5. Quality gates, run from this session
 
@@ -639,24 +740,32 @@ the QA artifact's "Needs a human" section, not quietly dropped; behaviors in
 the diff the spec never asked for → surface them, unrequested scope is a
 human's call and `/ship-work` hard-stops on it later anyway.
 
-**Then, the fresh-context adversarial code review**: `Agent(model: "opus",
-effort: "high")` given **only** the raw ticket text, step 4's acceptance
-scenarios, and `git -C <path> diff origin/dev...HEAD` — explicitly *not* the
-plan, not the plan-audit findings, not any rationale from step 3. It has no
-memory of why any line was written, on purpose, so it reviews what the code
-actually does. Have it check: does the diff satisfy each acceptance
-scenario, any correctness/security issue, anything that only shows up once
-code exists (the plan audit couldn't have caught it — no code existed yet).
-Fold real findings back into the implementation.
+**Then, the fresh-context adversarial review: `debate-review --local`**, not a single-model dispatch. This
+replaces what used to be a raw `Agent(model: "opus", effort: "high")` call — same "fresh eyes, no plan context"
+guarantee, but now Claude (`review-main`) proposes findings and Codex (`review-debate`) tries to refute each one
+before Claude makes the final call, instead of one model's opinion standing alone. Run per repo, once each
+(mirrors step 11b's roborev pattern):
 
-Why both, why in this order: the code reviewer's charter is "does this
-satisfy the ticket" and it is never asked, and has no special reason to
-notice, whether a specific test would actually fail without the behavior it
-claims to cover — that's `spec-auditor`'s one job, and it needs the plan's
-behavior list and the test files as explicit inputs, inputs the code
-reviewer is deliberately denied to preserve its zero-plan-context guarantee.
-Merging them into one pass would either dilute that guarantee or drop the
-tautological-test check's rigor.
+```bash
+node "<debate-review skill-dir>/scripts/review-pr.mjs" --local --repo-dir <abs repo path> --base origin/dev
+```
+
+`--local` reviews the working tree (committed, uncommitted, untracked) against `dev` and never touches a forge —
+nothing's posted anywhere, since there's no PR yet at this point in the pipeline. It has no memory of why any line
+was written, no access to the plan, the plan-audit findings, or any rationale from step 3 — the same zero-context
+guarantee the old opus-only dispatch had, on purpose, so it reviews what the code actually does. It's a generic
+tool with no notion of the ticket's acceptance scenarios, so after it returns: cross-check its findings against
+step 4's acceptance scenarios yourself (does the diff satisfy each one — the generic tool won't know to check
+this), and against any documented deviations already recorded, so an intentional call doesn't read as a finding.
+Fold real findings — `agreed` and `contested` alike — back into the implementation; a `contested` finding isn't
+weaker evidence, it's a claim Claude held against a specific refutation.
+
+Why both this and `spec-auditor`, why in this order: the debate-reviewer's charter is "does this code hold up" and
+it is never asked, and has no special reason to notice, whether a specific test would actually fail without the
+behavior it claims to cover — that's `spec-auditor`'s one job, and it needs the plan's behavior list and the test
+files as explicit inputs, inputs the debate review is deliberately denied to preserve its zero-plan-context
+guarantee. Merging them into one pass would either dilute that guarantee or drop the tautological-test check's
+rigor.
 
 ### 7. Derive the blast radius before doing any QA
 
@@ -836,10 +945,13 @@ roborev review --branch --base origin/dev --wait --repo <abs-repo-path>
 ```
 
 `--base origin/main` for `assistants/`. No `--agent`/`--model` flag needed —
-roborev's global config pins reviews to `claude-code`+`sonnet`. Exit 1 means
-a Fail verdict (findings), not a crash — read the output before reporting an
-error. Offer `/roborev-fix`. Cross-repo findings about gitignored siblings
-are usually noise; verify the frontend yourself rather than looping on them.
+roborev's global config (`~/.roborev/config.toml`) pins reviews to `codex`+`luna`
+across every repo (root's own `.roborev.toml` used to override this to
+`claude-code`+`sonnet`; that override is gone as of 2026-08-24, so root now
+reviews on Codex too, consistent with the other repos). Exit 1 means a Fail
+verdict (findings), not a crash — read the output before reporting an error.
+Offer `/roborev-fix`. Cross-repo findings about gitignored siblings are
+usually noise; verify the frontend yourself rather than looping on them.
 
 ### 12. Stop what you started; record how to relaunch it
 
@@ -1138,8 +1250,9 @@ bound.
   ENG-1133 check) — `NEEDS_HUMAN`, naming the files, exactly as interactive.
 
 **Step 4's escalation** — spec-wrong/hook-missing/doesn't-fit reports:
-`NEEDS_HUMAN`, the finding posted verbatim as `question`. The plan is never
-amended headlessly.
+`NEEDS_HUMAN`, the finding posted verbatim as `question` (including step 4's
+optional Codex diagnosis, if it was run — still just a shell dispatch, works
+the same headless). The plan is never amended headlessly.
 
 **Step 13's stop conditions** — no documented default for either, so both
 resolve via the ask→fallback rule's `NEEDS_HUMAN` branch, never a silent

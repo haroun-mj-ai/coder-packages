@@ -67,10 +67,33 @@ Pick whichever the task actually needs; when unclear, ask.
    than winging it turn by turn.
 5. **Check the console** via `read_console_messages` for new
    errors/warnings.
-6. **Screenshot proof of each state.**
+6. **Screenshot proof of each state — with `save_to_disk: true`.** Every
+   screenshot that evidences a scenario verdict must be saved to a file
+   (screenshots you only look at don't count as evidence), named
+   `qa-<ticket>-NN-<what>.png`-style so the artifact step below can embed
+   them. A verdict claimed without an on-disk screenshot behind it is not
+   evidence.
 7. **Report a strict verdict** — PASS only if the golden path and every
    listed scenario actually passed with zero new console errors; otherwise
    FAIL or BLOCKED, naming exactly what failed.
+8. **Publish the evidence artifact — every run, not on request.** Build an
+   HTML page (load the `artifact-design` skill first, then the Artifact
+   tool) containing:
+   - the ticket id and a one-line verdict banner (PASS / FAIL / BLOCKED);
+   - the scenario table: each scenario, its result, and its embedded
+     screenshot (as `data:` URIs — external images are CSP-blocked);
+   - the hard evidence beyond pixels: DB rows queried (e.g. APIUsage /
+     Message documents), exact cost math, console-error summary — a
+     screenshot shows a thing rendered once; the data row proves what the
+     system recorded;
+   - a **"Gaps / not covered" section that is never empty-by-default**:
+     enumerate what was NOT exercised and why (env constraints, missing
+     keys, tunnel limits). A run that claims zero gaps must say how it
+     knows that. This section is what makes the artifact usable as
+     ticket-closure proof rather than a highlight reel.
+   Post the artifact URL in the final report, and when the run verifies a
+   Linear-tracked change, the URL belongs in the ticket's closing comment
+   too.
 
 ## Known flakiness
 

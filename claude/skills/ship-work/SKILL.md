@@ -392,8 +392,10 @@ ever.
 ## Headless mode (--headless)
 
 Shared vocabulary, `status.json` shape, the local queue contract, and the
-ask→fallback rule live in `.claude/skills/autopilot-protocol.md` — read it
-first; this section only states what maps to what for this skill.
+ask→fallback rule live in `.claude/skills/headless-protocol.md` — read that
+first for the mechanics, then `.claude/skills/autopilot-protocol.md` for
+this pipeline's own states and orchestrator guarantees. This section only
+states what maps to what for this skill.
 
 Headless and interactive are now the same shape for this skill, because
 neither one ever waits on CI or merges — there is no `--no-merge` to imply
@@ -459,10 +461,7 @@ Plan archiving (`docs/plans/` → `docs/plans/completed/`) does **not** happen
 here — it's part of the post-merge closeout above, performed only once
 someone has actually merged and asks for it.
 
-**Never end the turn with required local work still in the background.** The
-`-p` harness ends the process when your turn ends: there is no later turn in
-which a background task's result comes back to you. This no longer applies to
-CI (this skill never waits on it), but it still applies to step 3's local
-gates and to anything else you'd be tempted to background inside this run:
-run it in the foreground, or record state in `status.json` before yielding if
-it genuinely cannot finish inside the turn.
+See `headless-protocol.md`'s "## Never end the turn with required local work
+in the background" — this no longer applies to CI (this skill never waits on
+it), but it still applies to step 3's local gates and anything else you'd be
+tempted to background inside this run.

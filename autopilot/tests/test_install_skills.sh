@@ -18,7 +18,7 @@ assert() {
   if "$@"; then pass "$desc"; else fail "$desc"; fi
 }
 
-SKILL_NAMES=(plan-issue implement-plan ship-work daily-brief autopilot-protocol.md)
+SKILL_NAMES=(plan-issue implement-plan implement-issue ship-work daily-brief test-issue autopilot-protocol.md headless-protocol.md piv-investigate-issue piv-implement-issue piv-commit piv-create-pr piv-review-pr babysit-pr debate-review red-team challenge codex-delegate piv-validate worktree-create piv-plan-implementation piv-implement)
 
 skip_worktree_bit() {
   # skip_worktree_bit <repo> <path> -> the ls-files -v status letter

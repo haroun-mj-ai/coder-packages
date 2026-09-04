@@ -28,7 +28,7 @@ with the Read tool). Shape:
   "since": "<ISO ts>",
   "now": "<ISO ts>",
   "ledger": [ {"ts": "...", "issue": "ENG-123 or null", "phase": "poll|plan|replan|implement|ship", "status": "...", "cost": 0.0, "session_id": "..."}, ... ],
-  "queue": [ {"eng_id": "ENG-123", "state": "...", "note": "...", "auto_approve": false, "question": null, "pr_urls": [], "seq": 1}, ... ],
+  "queue": [ {"eng_id": "ENG-123", "state": "...", "kind": "feature|bug", "note": "...", "auto_approve": false, "question": null, "pr_urls": [], "seq": 1}, ... ],
   "budget": {"max_issues": 3, "max_cost": 50, "today_cost": 0.0, "today_issues": 0, "max_week_cost": 310, "week_cost": 0.0},
   "health": {"newest_entry_age_min": 5, "paused": false, "scheduler_alive": true}
 }
@@ -43,6 +43,11 @@ with the Read tool). Shape:
   the subset shown above.
 - `health.newest_entry_age_min` is `null` if there has never been a ledger
   entry at all.
+- Every `queue` entry now carries `kind`: `"feature"` or `"bug"`, defaulting
+  to `"feature"` when absent (back-compat for tickets that predate the
+  field). Prefix every ticket line in every per-state section below with
+  `[bug]` or `[feature]` (read from the entry's `kind`) so the digest
+  distinguishes the two forks at a glance.
 
 If the input file is missing, empty, or fails to parse as JSON, print
 exactly one line and stop:
@@ -61,46 +66,83 @@ plus its `note` when non-empty. **Omit a section entirely if it has no
 items** — except Spend and Health, which are always printed, so a fully
 quiet day still reports something.
 
-- **Queued** — `queue` entries at `state: queued`: one line each, `eng_id` +
-  `note`. These are tickets the owner ran `ap queue` on since the last cycle
-  picked them up; the section clears once the decider claims them into
-  `planning`. (There is no "draft" concept anymore — a ticket only exists
+- **Queued** — `queue` entries at `state: queued`: one line each, `eng_id`
+  (kind-prefixed) + `note`. These are tickets the owner ran `ap queue` on
+  since the last cycle picked them up; the section clears once the decider
+  claims them into `piv-drafting` (or, for a hand-set legacy ticket, into
+  `planning`). (There is no "draft" concept anymore — a ticket only exists
   once `ap queue` has created it, so there is nothing unlabeled to report.)
-- **Awaiting your approval** — `queue` entries at `state: plan-review`: one
-  line each, `eng_id` + `note`. If the entry's `auto_approve` is `true`,
-  append a note that it will auto-approve on the next cycle rather than
-  actually waiting on the owner (e.g. "(auto-approves next cycle)"). The
-  global `AP_AUTO_APPROVE` switch is NOT in this snapshot, so an entry can
-  still auto-approve without its own `auto_approve` set; say so plainly
-  rather than inventing it: end the section with one line noting that some
-  entries may auto-approve via the global flag even without `auto_approve`
-  shown here.
-- **Shipping** — `queue` entries at `state: shipping`: one line each,
-  `eng_id` + `note`. The PR(s) are already open by this point
-  (`/implement-issue`'s Phase B opens them as its own last step) — this state
-  means mid-`ship-work`, waiting on CI. The input has no started-at time
-  (that lives only in the ledger's `ship` rows, which this section does not
-  cross-reference), so just list them.
-- **Ship pending** — `queue` entries at `state: ship-pending`: one line each,
-  `eng_id` + `note`. These implemented, committed, and (normally) already have
-  an open PR, but a ship phase either failed for an external cause and got
+- **Drafting** — `queue` entries at `state: piv-drafting`: one line each,
+  `eng_id` (kind-prefixed) + `note`. The act producing the reviewable
+  artifact is running — `piv-investigate-issue` for `[bug]`,
+  `piv-plan-implementation` for `[feature]`. No artifact exists yet, so just
+  list them.
+- **Awaiting your review** — `queue` entries at `state: piv-draft-review`:
+  one line each naming what is waiting — `[bug] RCA` or `[feature] plan` —
+  plus the entry's `artifact_path` (or "path not recorded" if absent) and
+  `note`. If the entry's `auto_approve` is `true`, append a note that it
+  will auto-approve on the next cycle rather than actually waiting on the
+  owner (e.g. "(auto-approves next cycle)"). The global `AP_AUTO_APPROVE`
+  switch is NOT in this snapshot, so an entry can still auto-approve
+  without its own `auto_approve` set; say so plainly rather than inventing
+  it: end the section with one line noting that some entries may
+  auto-approve via the global flag even without `auto_approve` shown here.
+  Approve with `ap approve <eng-id>`.
+- **Implementing** — `queue` entries at `state: piv-implementing`: one line
+  each, `eng_id` (kind-prefixed) + `note`. The approved artifact is being
+  built — `piv-implement-issue` for `[bug]`, `piv-implement` for
+  `[feature]` — through commit and PR creation. No PR exists yet, so just
+  list them.
+- **Review pending** — `queue` entries at `state: piv-review-pending`: one
+  line each, `eng_id` (kind-prefixed) + `note`, plus the `pr_urls` already
+  present in the entry (join with ", "; say "see `ap sessions` for PR
+  links" only if `pr_urls` is empty). The PR is open; an agentic review
+  round (`piv-review-pr` + `babysit-pr`) is owed but hasn't claimed the
+  review lane yet.
+- **Reviewing** — `queue` entries at `state: piv-reviewing`: one line each,
+  `eng_id` (kind-prefixed) + `note`, plus `pr_urls` as above. A review round
+  is in flight (bot findings being worked toward resolution); the input has
+  no started-at time for this state, so just list them.
+- **Planning** *(legacy, retired — reachable only by a hand-set state via
+  `ap sessions [s]`; should normally be empty)* — `queue` entries at
+  `state: planning`: one line each, `eng_id` + `note`.
+- **Awaiting your approval** *(legacy, retired — should normally be empty)*
+  — `queue` entries at `state: plan-review`: one line each, `eng_id` +
+  `note`. If the entry's `auto_approve` is `true`, append a note that it
+  will auto-approve on the next cycle rather than actually waiting on the
+  owner (e.g. "(auto-approves next cycle)"). The global `AP_AUTO_APPROVE`
+  switch is NOT in this snapshot, so an entry can still auto-approve
+  without its own `auto_approve` set; say so plainly rather than inventing
+  it: end the section with one line noting that some entries may
+  auto-approve via the global flag even without `auto_approve` shown here.
+- **Shipping** *(legacy, retired — should normally be empty)* — `queue`
+  entries at `state: shipping`: one line each, `eng_id` + `note`. The PR(s)
+  are already open by this point (`/implement-issue`'s Phase B opens them
+  as its own last step) — this state means mid-`ship-work`, waiting on CI.
+  The input has no started-at time (that lives only in the ledger's `ship`
+  rows, which this section does not cross-reference), so just list them.
+- **Ship pending** *(legacy, retired — should normally be empty)* —
+  `queue` entries at `state: ship-pending`: one line each, `eng_id` +
+  `note`. These implemented, committed, and (normally) already have an
+  open PR, but a ship phase either failed for an external cause and got
   re-queued here, or a human retried it by hand (`ap retry`) — the next
   cycle retries just the ship (CI-wait/merge), not the whole build.
 - **Ready to test** — `queue` entries at `state: ready-to-test`: one line
-  each, `eng_id` + `note`, plus the `pr_urls` already present in the entry
-  (join with ", "; say "see `ap sessions` for PR links" only if `pr_urls` is
-  empty). Relaunch commands still live only in the QA artifact
-  (`docs/plans/qa/<eng-id>-qa.md`), which this skill cannot read — say so
-  plainly rather than inventing one.
+  each, `eng_id` (kind-prefixed) + `note`, plus the `pr_urls` already
+  present in the entry (join with ", "; say "see `ap sessions` for PR links"
+  only if `pr_urls` is empty). Relaunch commands still live only in the QA
+  artifact (`docs/plans/qa/<eng-id>-qa.md`), which this skill cannot read —
+  say so plainly rather than inventing one.
 - **Needs input** — `queue` entries at `state: needs-input`: one line each,
-  `eng_id` + `note`, plus the entry's own `question` field verbatim (it is
-  in this snapshot, unlike the old inbox-comment version) and
-  `phase_at_question` (which flags a `ship`-phase stop as needing an
-  interactive `/ship-work` rather than a `go`/feedback reply).
-- **Failed** — `queue` entries at `state: failed`: one line each, `eng_id` +
-  `note`. The ledger rows carry no error text (that lives only in the
-  ticket's `history`, which is not in this snapshot) — say so plainly ("see
-  `ap run <eng-id>` for the error") rather than inventing one.
+  `eng_id` (kind-prefixed) + `note`, plus the entry's own `question` field
+  verbatim (it is in this snapshot, unlike the old inbox-comment version)
+  and `phase_at_question` (which flags a `ship`-phase stop, or for the piv
+  fork a `review`-phase stop, as needing an interactive skill run rather
+  than a `go`/feedback reply).
+- **Failed** — `queue` entries at `state: failed`: one line each, `eng_id`
+  (kind-prefixed) + `note`. The ledger rows carry no error text (that lives
+  only in the ticket's `history`, which is not in this snapshot) — say so
+  plainly ("see `ap run <eng-id>` for the error") rather than inventing one.
 - **Spend** — always present: `budget.today_cost` vs `budget.max_cost`, and
   `budget.today_issues` vs `budget.max_issues`. Also report `budget.week_cost`
   vs `budget.max_week_cost` (this pipeline's carved-out share of the account's

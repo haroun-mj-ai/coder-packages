@@ -162,17 +162,36 @@ PYEOF
 
 # --- Stage 0: pause / lock.poll / budget ------------------------------------
 # Locks, not one: lock.poll serializes the decision path (at most one cycle
-# deciding at a time); lock.plan, the AP_BUILD_SLOTS build slots
-# (lock.build.1 .. lock.build.N), and the AP_SHIP_SLOTS ship slots
-# (lock.ship.1 .. lock.ship.N) are held only for the duration of an actual
-# act. Three lanes: plan (plan/replan), build (implement, and the ship half
-# of an implement->ship CHAIN -- that chain keeps the SAME build slot for
-# both halves, see the implement case arm below for why), and ship (a
-# STANDALONE ship-only retry, i.e. action=ship from a ship-pending ticket --
-# never the chained ship above). This lets a plan, a build, and a standalone
-# ship all keep flowing concurrently -- up to AP_BUILD_SLOTS builds, up to
-# AP_SHIP_SLOTS standalone ships, and one plan, plus the one cycle currently
-# deciding. See autopilot/README.md's concurrency section.
+# deciding at a time); the AP_PLAN_SLOTS plan slots (lock.plan, then
+# lock.plan.2 .. lock.plan.N), the AP_BUILD_SLOTS build slots
+# (lock.build.1 .. lock.build.N), the AP_SHIP_SLOTS ship slots
+# (lock.ship.1 .. lock.ship.N), and the AP_REVIEW_SLOTS review slots
+# (lock.review.1 .. lock.review.N) are held only for the duration of an
+# actual act. Four lanes: plan (legacy plan/replan -- dead, ap-decide.py
+# emits neither any more, kept inert for the `ap sessions [s]` manual escape
+# hatch; piv design/redesign for a feature; piv investigate/re-investigate
+# for a bug), build (legacy implement, and the ship half of an
+# implement->ship CHAIN -- that chain keeps the SAME build slot for both
+# halves, see the implement case arm below for why -- also dead/inert for the
+# same reason; piv fix for a bug, piv build for a feature -- neither chains
+# into review, see the fix|build case arm below), ship (a STANDALONE
+# ship-only retry, i.e. action=ship from a ship-pending ticket -- never the
+# chained ship above; also dead/inert -- no decider tier can produce
+# ship-pending any more once both piv forks are live, since neither writes
+# it), and review (piv review -- shared by both piv kinds, a fresh cycle's
+# decided action, never chained into from fix or build). This lets a plan, a
+# build, a standalone ship, and a review all keep flowing concurrently -- up
+# to AP_BUILD_SLOTS builds, up to AP_SHIP_SLOTS standalone ships, up to
+# AP_REVIEW_SLOTS reviews, and up to AP_PLAN_SLOTS plans, plus the one cycle
+# currently deciding. See autopilot/README.md's concurrency section.
+#
+# See docs/plans/2026-09-03-ap-piv-bug-path-pipeline.md and
+# docs/plans/2026-09-03-ap-piv-feature-fork-pipeline.md for the piv
+# fork/design. Legacy plan/replan/implement/ship (and the implement->ship
+# chain) are kept deliberately inert, not deleted: a hand-set legacy state
+# via `ap sessions [s]` still reaches them, which is the manual escape hatch
+# while the piv pipeline is unproven. Removal belongs to a later
+# legacy-cleanup plan.
 
 # A usage-limit failure (a rate/quota trip, not a real bug) auto-pauses the
 # pipeline exactly like a real failure would, and then would otherwise wait
@@ -234,8 +253,11 @@ lane_free() {
 busy_build=false
 busy_plan=false
 busy_ship=false
+busy_review=false
 free_build_slot=""
 free_ship_slot=""
+free_plan_slot=""
+free_review_slot=""
 for ((build_slot_n = 1; build_slot_n <= AP_BUILD_SLOTS; build_slot_n++)); do
   if lane_free "$AP_HOME/lock.build.$build_slot_n"; then
     free_build_slot="$build_slot_n"
@@ -250,11 +272,36 @@ for ((ship_slot_n = 1; ship_slot_n <= AP_SHIP_SLOTS; ship_slot_n++)); do
   fi
 done
 [[ -z "$free_ship_slot" ]] && busy_ship=true
-lane_free "$AP_HOME/lock.plan" || busy_plan=true
+# Review lane = AP_REVIEW_SLOTS independent slots (lock.review.1 ..
+# lock.review.N), same lowest-slot-first probe and same
+# "busy only when EVERY slot is taken" accounting as build and ship above.
+# `piv-review-pr` (debate-review + babysit-pr) for a bug- or feature-path PR
+# -- shared by both piv kinds, a fresh cycle's own decided action, never
+# chained into from fix or build (see the fix|build case arm below for why).
+for ((review_slot_n = 1; review_slot_n <= AP_REVIEW_SLOTS; review_slot_n++)); do
+  if lane_free "$AP_HOME/lock.review.$review_slot_n"; then
+    free_review_slot="$review_slot_n"
+    break
+  fi
+done
+[[ -z "$free_review_slot" ]] && busy_review=true
+# Plan lane = AP_PLAN_SLOTS independent slots (slot 1 is lock.plan, slots
+# 2..N are lock.plan.$n -- see ap-env.sh's plan_lock_file). Same
+# lowest-slot-first probe and same "busy only when EVERY slot is taken"
+# accounting as build and ship above; before AP_PLAN_SLOTS existed this was
+# one hard-coded lane, which serialized all new intake (ap-decide.py tier 5).
+for ((plan_slot_n = 1; plan_slot_n <= AP_PLAN_SLOTS; plan_slot_n++)); do
+  if lane_free "$(plan_lock_file "$plan_slot_n")"; then
+    free_plan_slot="$plan_slot_n"
+    break
+  fi
+done
+[[ -z "$free_plan_slot" ]] && busy_plan=true
 
 busy_lanes=""
 [[ "$busy_build" == true ]] && busy_lanes="build"
 [[ "$busy_ship" == true ]] && busy_lanes="${busy_lanes:+$busy_lanes,}ship"
+[[ "$busy_review" == true ]] && busy_lanes="${busy_lanes:+$busy_lanes,}review"
 if [[ "$busy_plan" == true ]]; then
   busy_lanes="${busy_lanes:+$busy_lanes,}plan"
 fi
@@ -420,6 +467,13 @@ action="$(json_field "$poll_json" ".action")"
 issue="$(json_field "$poll_json" ".issue")"
 plan_path="$(json_field "$poll_json" ".planPath")"
 feedback="$(json_field "$poll_json" ".feedback")"
+# artifact_path/pr_url: the piv fork's decision keys (both kinds). planPath
+# stays as-is, legacy-only -- resolve_plan_path reads plan_path directly, and
+# the piv fork's artifact (a committed RCA for a bug, a committed
+# implementation plan for a feature) is resolved kind-specifically by the
+# decider and handed back as artifactPath instead.
+artifact_path="$(json_field "$poll_json" ".artifactPath")"
+pr_url="$(json_field "$poll_json" ".prUrl")"
 
 append_ledger "$issue" "poll" "${action:-none}" 0 "deterministic" "none"
 
@@ -441,11 +495,34 @@ act_lane=""
 act_lock_file=""
 build_slot=""
 ship_slot=""
+plan_slot=""
+review_slot=""
 fe_port=""
 be_port=""
 case "$action" in
-  plan|replan) act_lane="plan"; act_lock_file="$AP_HOME/lock.plan" ;;
-  implement)
+  # DEAD as of docs/plans/2026-09-03-ap-piv-feature-fork-pipeline.md -- no
+  # decider tier emits `plan`/`replan` any more (see ap-decide.py's tier 5
+  # and the shared draft-review tier). Kept deliberately inert, not deleted:
+  # a hand-set legacy state via `ap sessions [s]` still reaches it, which is
+  # the manual escape hatch while the piv pipeline is unproven. Removal
+  # belongs to the legacy-cleanup plan. `design`/`redesign` (piv feature) and
+  # `investigate`/`re-investigate` (piv bug) join this same arm -- same lane,
+  # same "no port pair" reasoning, they just start no dev servers either.
+  plan|replan|design|redesign|investigate|re-investigate)
+    act_lane="plan"
+    plan_slot="$free_plan_slot"
+    # No port pair, unlike build/ship: a plan act starts no dev servers, so
+    # concurrent plans need nothing but their own per-issue worktrees.
+    [[ -n "$plan_slot" ]] && act_lock_file="$(plan_lock_file "$plan_slot")"
+    ;;
+  # DEAD as of docs/plans/2026-09-03-ap-piv-feature-fork-pipeline.md -- no
+  # decider tier emits `implement` any more, same escape-hatch reasoning as
+  # above; the implement->ship CHAIN below (see the `implement)` dispatch arm
+  # further down) is unreachable along with it. `fix` (piv bug) and `build`
+  # (piv feature) join this same arm for lock/slot/port acquisition only --
+  # they never chain into ship or review the way `implement` chains into
+  # ship; see the `fix|build)` dispatch arm further down for why.
+  implement|fix|build)
     act_lane="build"
     build_slot="$free_build_slot"
     if [[ -n "$build_slot" ]]; then
@@ -456,11 +533,17 @@ case "$action" in
       # This same fe_port/be_port pair is reused below, unchanged, for the
       # trailing `ship` call of an implement->ship CHAIN in this same
       # process -- that chain keeps its build slot for both halves; it never
-      # goes through the standalone `ship)` arm below.
+      # goes through the standalone `ship)` arm below. `fix`/`build` never
+      # chain at all (no second run_claude call), so for them this pair is
+      # simply the slot's own port pair.
       fe_port=$((5173 + build_slot))
       be_port=$((8000 + build_slot))
     fi
     ;;
+  # DEAD as of docs/plans/2026-09-03-ap-piv-feature-fork-pipeline.md -- no
+  # decider tier can produce `ship-pending` any more once both piv forks are
+  # live (neither writes it), so this standalone retry arm is unreachable via
+  # normal decide flow; same escape-hatch reasoning as above.
   ship)
     # STANDALONE ship-only retry ONLY (decide emitted action=ship for a
     # ship-pending ticket -- see ap-decide.py's tier 4). This is the
@@ -488,15 +571,51 @@ case "$action" in
       be_port=$((8010 + ship_slot))
     fi
     ;;
+  review)
+    # piv review (shared by both kinds -- bug's `fix` and feature's `build`
+    # both write piv-review-pending, and a LATER, fresh cycle claims it on
+    # this lane; a bug's `fix` (or a feature's `build`) act never chains into
+    # review the way legacy `implement` chains into `ship` -- see the
+    # `fix|build)` dispatch arm's own comment for why. `review` is therefore
+    # always a fresh cycle's decided action here, never reachable from the
+    # build lane's own case arm above.
+    act_lane="review"
+    review_slot="$free_review_slot"
+    if [[ -n "$review_slot" ]]; then
+      act_lock_file="$AP_HOME/lock.review.$review_slot"
+      # Non-overlapping with build (5174-5177/8001-8004 for AP_BUILD_SLOTS<=4),
+      # ship (5181-5186/8011-8016 for AP_SHIP_SLOTS<=6), and the human's own
+      # 5173/8000 -- 5187/8020 is the next free base. Like ship, `piv-review-pr`
+      # serves no UI, so these ports exist only to isolate its local gates from
+      # a concurrent build; the CORS allowlist is irrelevant for the same
+      # reason. Provisioned for isolation-safety and consistency with every
+      # other lane's own pattern, but likely unused in practice -- nothing in
+      # piv-review-pr's Phase 3 (which runs through piv-validate) or
+      # babysit-pr binds a server.
+      fe_port=$((5187 + review_slot))
+      be_port=$((8020 + review_slot))
+    fi
+    ;;
 esac
 
 if [[ -z "$act_lane" ]]; then
-  log "decide: unknown action '$action'"
+  # ap-decide.py claims a ticket (writes its new state) BEFORE returning the
+  # decision here -- an unrecognized action left unhandled would leave the
+  # ticket claimed but never dispatched, with no diagnostic and no recovery
+  # path (the new state isn't in sweep_stale's tuple either). Fail closed and
+  # loud instead: hand it back to a human rather than stranding it silently.
+  # Mirrors `ap retry`'s own REQUEUE_STATE.get(phase)-miss pattern.
+  log "decide: unrecognized action '$action' from the decider -- routing unknown, needs a human decision"
+  if [[ -n "${issue:-}" && "$issue" != "null" ]]; then
+    queue_set "$issue" --state needs-input \
+      --field "question=$(printf '%s' "unrecognized action '$action' from the decider -- routing unknown, needs a human decision" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')" \
+      --event "unrecognized action '$action' -- routed to needs-input"
+  fi
   flock -u 9
   exit 0
 fi
 
-if [[ ( "$act_lane" == "build" || "$act_lane" == "ship" ) && -z "$act_lock_file" ]]; then
+if [[ -z "$act_lock_file" ]]; then
   log "act: no free $act_lane slot right after a free probe under lock.poll -- not acting this cycle; the decider's own stale-claim sweep will catch it"
   flock -u 9
   exit 0
@@ -548,23 +667,42 @@ final_status=""
 # how plan/implement/ship ran on fable-5 at 2x opus cost until 2026-08-12.
 # Design vs execution: planning is the judgement-heavy half and gets opus;
 # implement/ship execute an already-approved plan and get sonnet, matching the
-# sonnet subagents those skills dispatch.
+# sonnet subagents those skills dispatch. The piv fork extends the same
+# reasoning: investigation (5-Whys synthesis, guard-behaviour reasoning, the
+# adversarial gate) and design (strategic reasoning, the audit, the gate) are
+# both the judgement-heavy half and get opus, exactly as legacy planning does;
+# fix and build both execute an already-settled artifact (an RCA or a plan)
+# and get sonnet, matching the sonnet subagents/implementer they dispatch;
+# review drives delegated debate/triage scripts, where the heavy reasoning
+# happens inside debate-review's own lanes, and gets sonnet. `plan`/`replan`/
+# `implement`/`ship` (legacy) are dead but present for the manual escape
+# hatch -- see the case statement above.
 act_model() {
   case "$1" in
     plan|replan) echo "${AP_PLAN_MODEL:-opus}" ;;
     implement)   echo "${AP_IMPLEMENT_MODEL:-sonnet}" ;;
     ship)        echo "${AP_SHIP_MODEL:-sonnet}" ;;
+    investigate|re-investigate) echo "${AP_INVESTIGATE_MODEL:-opus}" ;;
+    design|redesign)            echo "${AP_DESIGN_MODEL:-opus}" ;;
+    fix)                        echo "${AP_FIX_MODEL:-sonnet}" ;;
+    build)                      echo "${AP_BUILD_MODEL:-sonnet}" ;;
+    review)                     echo "${AP_REVIEW_MODEL:-sonnet}" ;;
     *)           echo "${AP_ACT_MODEL:-sonnet}" ;;
   esac
 }
 
 # window_name_for <phase> -> the tmux window name this act's persistent
 # session runs in, e.g. act_plan_ENG-1234_plan, act_build_1_ENG-1234_implement,
-# act_ship_2_ENG-1234_ship. Reads act_lane/build_slot/ship_slot/issue -- all
-# already-set globals by the time any act runs (the lane-lock acquisition
-# above sets them before dispatching). One window name scheme, so `ap
-# status`/`ap runs` (see ap-runs.py) can parse lane/slot/phase/issue back out
-# of it without a second source of truth.
+# act_ship_2_ENG-1234_ship, act_review_1_ENG-1234_review. Reads
+# act_lane/build_slot/ship_slot/review_slot/issue -- all already-set globals
+# by the time any act runs (the lane-lock acquisition above sets them before
+# dispatching). One window name scheme, so `ap status`/`ap runs` (see
+# ap-runs.py) can parse lane/slot/phase/issue back out of it without a second
+# source of truth. `design`/`redesign` (plan lane) and `fix`/`build` (build
+# lane) need no new arm here -- they run on the existing plan/build lanes,
+# whose arms already exist, and none of their phase names contain an
+# underscore (ap-runs.py's `_ACT_WINDOW_RE` phase group is `[^_]+`), so e.g.
+# `act_plan_ENG-1400_design` and `act_build_2_ENG-1400_build` both parse.
 #
 # Underscore-separated, NOT dot-separated: tmux's own target syntax is
 # session:window.pane, so a window name containing dots gets misparsed by
@@ -575,10 +713,11 @@ act_model() {
 window_name_for() {
   local phase="$1"
   case "$act_lane" in
-    plan)  printf 'act_plan_%s_%s' "${issue:-unknown}" "$phase" ;;
-    build) printf 'act_build_%s_%s_%s' "${build_slot:-0}" "${issue:-unknown}" "$phase" ;;
-    ship)  printf 'act_ship_%s_%s_%s' "${ship_slot:-0}" "${issue:-unknown}" "$phase" ;;
-    *)     printf 'act_unknown_%s_%s' "${issue:-unknown}" "$phase" ;;
+    plan)   printf 'act_plan_%s_%s' "${issue:-unknown}" "$phase" ;;
+    build)  printf 'act_build_%s_%s_%s' "${build_slot:-0}" "${issue:-unknown}" "$phase" ;;
+    ship)   printf 'act_ship_%s_%s_%s' "${ship_slot:-0}" "${issue:-unknown}" "$phase" ;;
+    review) printf 'act_review_%s_%s_%s' "${review_slot:-0}" "${issue:-unknown}" "$phase" ;;
+    *)      printf 'act_unknown_%s_%s' "${issue:-unknown}" "$phase" ;;
   esac
 }
 
@@ -781,6 +920,16 @@ run_claude() {
 pushd "$WORK_REPO" >/dev/null 2>&1 || cd "$WORK_REPO" || exit 1
 
 case "$action" in
+  # DEAD as of docs/plans/2026-09-03-ap-piv-feature-fork-pipeline.md -- no
+  # decider tier emits `plan`/`replan`/`implement`/`ship` any more (see
+  # ap-decide.py's tier 5 and the shared draft-review tier). Kept
+  # deliberately inert, not deleted: a hand-set legacy state via
+  # `ap sessions [s]` still reaches these arms, which is the manual escape
+  # hatch while the piv pipeline is unproven, and the pre-existing
+  # test_cycle.sh cases assert on this exact prompt text -- proof the legacy
+  # path was not modified. Removal belongs to the legacy-cleanup plan. Same
+  # marker applies to the implement->ship chain inside the `implement)` arm
+  # below, which is unreachable along with it.
   plan)
     run_claude "plan" "/implement-issue --phase plan $issue --headless"
     ;;
@@ -789,6 +938,22 @@ case "$action" in
     # an apostrophe doesn't break out of the single-quoted --feedback value.
     feedback_escaped="${feedback//\'/\'\\\'\'}"
     run_claude "replan" "/implement-issue --phase plan $issue --headless --feedback '$feedback_escaped'"
+    ;;
+  design)
+    run_claude "design" "/piv-plan-implementation $issue --headless"
+    ;;
+  redesign)
+    # Same apostrophe-escaping as `replan)` above.
+    feedback_escaped="${feedback//\'/\'\\\'\'}"
+    run_claude "redesign" "/piv-plan-implementation $issue --headless --feedback '$feedback_escaped'"
+    ;;
+  investigate)
+    run_claude "investigate" "/piv-investigate-issue $issue --headless"
+    ;;
+  re-investigate)
+    # Same apostrophe-escaping as `replan)` above.
+    feedback_escaped="${feedback//\'/\'\\\'\'}"
+    run_claude "re-investigate" "/piv-investigate-issue $issue --headless --feedback '$feedback_escaped'"
     ;;
   implement)
     # --ports is literal prompt text, same mechanism as --run-dir (the
@@ -812,6 +977,41 @@ case "$action" in
       run_claude "ship" "/ship-work $plan_path --headless --ports fe=$fe_port,be=$be_port"
     fi
     ;;
+  fix|build)
+    # piv bug's `fix` and piv feature's `build` share this arm: both execute
+    # an already-approved artifact (an RCA or a plan) and, on DONE, both
+    # write the SAME next state -- one shared block, not two arms kept in
+    # sync by hand (exactly the drift generator ap-resume.sh's own DONE
+    # branch warns about, since it is a second, independent reconciliation
+    # implementation from this file's own).
+    #
+    # There is deliberately NO chained review dispatch here, unlike
+    # implement's chained ship above: review is 20-60 minutes of mostly
+    # waiting on bot rounds, and pinning a build slot for that whole time is
+    # exactly what the separate review lane exists to avoid. The review act
+    # is claimed later, by an ordinary fresh cycle, on its own lane/slot/
+    # ports (see the `review)` arm below and the `review)` lane arm above).
+    case "$action" in
+      fix)
+        run_claude "fix" "/piv-implement-issue $issue --headless --rca $artifact_path --ports fe=$fe_port,be=$be_port"
+        ;;
+      build)
+        run_claude "build" "/piv-implement --headless --plan $artifact_path --issue $issue --ports fe=$fe_port,be=$be_port"
+        ;;
+    esac
+    if [[ "$final_status" == "DONE" ]]; then
+      # Wrapper-side, not skill-side, for the same reason building->shipping
+      # is above: it must hold even if the fix/build session dies immediately
+      # after its last tool call. Per each headless section, neither `fix`
+      # nor `build` writes ticket state itself.
+      if [[ -n "${issue:-}" && "$issue" != "null" ]]; then
+        queue_set "$issue" --state piv-review-pending --event "$final_phase done, PR open -> review pending"
+        ap-notify.sh "review pending: ${issue:-$action}" "$final_phase committed, PR open, agentic review queued" || true
+      fi
+    fi
+    ;;
+  # DEAD as of docs/plans/2026-09-03-ap-piv-feature-fork-pipeline.md -- see
+  # the marker above the `plan)` arm.
   ship)
     # A ship-only retry: implement already committed, pushed, and opened the
     # PR(s), ship still owed -- either a prior ship phase failed externally
@@ -821,6 +1021,14 @@ case "$action" in
     # do here (unlike the implement->ship chain above, which writes shipping
     # itself).
     run_claude "ship" "/ship-work $plan_path --headless --ports fe=$fe_port,be=$be_port"
+    ;;
+  review)
+    # Shared by both piv kinds -- a bug's `fix` and a feature's `build` both
+    # land here via a fresh cycle claiming `piv-review-pending` (never
+    # chained, see the `fix|build)` arm above). $pr_url comes from the
+    # decider's resolved PR URL (ap-decide.py tier 4), not a worktree/branch
+    # path.
+    run_claude "review" "/piv-review-pr $pr_url --headless --issue $issue --ports fe=$fe_port,be=$be_port"
     ;;
   *)
     log "decide: unknown action '$action'"
@@ -838,6 +1046,11 @@ log "act: phase=$final_phase status=$final_status issue=${issue:-}"
 status_json=""
 [[ -f "$status_file" ]] && status_json="$(cat "$status_file")"
 
+# The outer FAILED/NEEDS_HUMAN/DONE dispatch on $final_status is already
+# phase-agnostic -- only the requeue map inside FAILED and the ready/RCA
+# ping inside DONE branch on $final_phase (both extended above for the piv
+# fork). Confirmed by reading, per both piv plans' instruction not to add a
+# redundant top-level branch here.
 case "$final_status" in
   FAILED)
     stdout_tail="$(printf '%s' "${LAST_ACT_OUTPUT:-}" | tail -c 4000)"
@@ -896,15 +1109,40 @@ $transcript_tail}"
       # Restore the state this phase started from, so the SAME work is
       # picked up again once the cooldown/pause clears -- never `failed`,
       # which is a dead end no wake signal ever fires on.
+      #
+      # This map MUST stay identical to ap-runs.py's REQUEUE_STATE (same
+      # table, two files, per this repo's duplicate-small-helpers
+      # convention) -- including any phase either fork adds later. Legacy
+      # rows (plan/replan/implement/ship) are dead but kept, per the case
+      # statement above's inert-marker comments.
       requeue_state=""
+      requeue_unrecognized=false
       case "$final_phase" in
         plan|replan) requeue_state="queued" ;;
         implement)   requeue_state="plan-review" ;;
         ship)        requeue_state="ship-pending" ;;
+        investigate|re-investigate) requeue_state="queued" ;;
+        fix)                        requeue_state="piv-draft-review" ;;
+        design|redesign)            requeue_state="queued" ;;
+        build)                      requeue_state="piv-draft-review" ;;
+        review)                     requeue_state="piv-review-pending" ;;
+        *)                          requeue_unrecognized=true ;;
       esac
       if [[ -n "${issue:-}" && "$issue" != "null" && -n "$requeue_state" ]]; then
         queue_set "$issue" --state "$requeue_state" \
           --event "external failure, re-queued (matched: $external_failure_line)"
+      elif [[ "$requeue_unrecognized" == true ]]; then
+        # An unmatched $final_phase must never silently skip the queue
+        # write -- fail closed and loud instead, mirroring `ap retry`'s own
+        # REQUEUE_STATE.get(phase)-miss pattern, rather than leaving the
+        # ticket with no state change and no diagnostic beyond whatever the
+        # FAILED path above already recorded.
+        log "reconcile: unrecognized phase '$final_phase' in the external-failure requeue map for issue ${issue:-unknown} -- routing unknown, needs a human decision"
+        if [[ -n "${issue:-}" && "$issue" != "null" ]]; then
+          queue_set "$issue" --state needs-input \
+            --field "question=$(printf '%s' "unrecognized phase '$final_phase' in the external-failure requeue map -- routing unknown, needs a human decision" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')" \
+            --event "external failure, unrecognized phase '$final_phase' -- routed to needs-input"
+        fi
       fi
       ap-notify.sh "requeued after external failure: ${issue:-$action}" "$failure_body" || true
     else
@@ -961,6 +1199,10 @@ $transcript_tail}"
     fi
     ;;
 
+  # NEEDS_HUMAN below is already phase-agnostic -- it reads ${final_phase:-}
+  # generically (park_registry_write records it as-is) with no phase branch,
+  # so it needs no piv-specific change. Confirmed by reading, per both piv
+  # plans' own instruction not to add a redundant branch here.
   NEEDS_HUMAN)
     question="$(json_field "$status_json" ".question")"
     if [[ -n "${issue:-}" && "$issue" != "null" ]]; then
@@ -982,17 +1224,21 @@ $transcript_tail}"
 
   DONE)
     echo 0 >"$AP_HOME/fail_count"
-    if [[ "$final_phase" == "ship" ]]; then
+    if [[ "$final_phase" == "ship" || "$final_phase" == "review" ]]; then
+      # `review` (piv, both kinds) lands here alongside legacy `ship` --
+      # both are the "PR(s) ready to test" terminal DONE.
       pr_urls="$(json_join "$status_json" ".pr_urls")"
       ap-notify.sh "ready to test: ${issue:-$action}" "${pr_urls:-see ap sessions}" || true
-    elif [[ "$final_phase" == "plan" || "$final_phase" == "replan" ]]; then
-      # The approval gate is the whole point: the owner must know a plan is
-      # waiting for review the moment it lands -- UNLESS auto-approve already
-      # applies to this ticket (global flag, or its own per-ticket
-      # auto_approve field, set via `ap queue --auto`/`ap approve --auto`),
-      # in which case it's about to build without an `ap approve`, and the
-      # ping should say so instead of asking for one -- the owner must be
-      # able to tell the two apart at a glance.
+    elif [[ "$final_phase" == "plan" || "$final_phase" == "replan" \
+         || "$final_phase" == "design" || "$final_phase" == "redesign" \
+         || "$final_phase" == "investigate" || "$final_phase" == "re-investigate" ]]; then
+      # The approval gate is the whole point: the owner must know an artifact
+      # (a plan, or an RCA) is waiting for review the moment it lands --
+      # UNLESS auto-approve already applies to this ticket (global flag, or
+      # its own per-ticket auto_approve field, set via `ap queue --auto`/
+      # `ap approve --auto`), in which case it's about to build/fix without
+      # an `ap approve`, and the ping should say so instead of asking for
+      # one -- the owner must be able to tell the two apart at a glance.
       auto_will_build=false
       if [[ "$AP_AUTO_APPROVE" == "1" ]]; then
         auto_will_build=true
@@ -1000,10 +1246,23 @@ $transcript_tail}"
         ticket_auto="$(json_field "$(queue_get "$issue")" ".auto_approve")"
         [[ "$ticket_auto" == "True" || "$ticket_auto" == "true" ]] && auto_will_build=true
       fi
-      if [[ "$auto_will_build" == true ]]; then
-        ap-notify.sh "plan auto-approved, building: ${issue:-$action}" "no 'ap approve' needed -- auto-approve is on for this ticket; \`ap reply\` to override with feedback before it starts" || true
+      # investigate/re-investigate produce an RCA, not a plan -- swap the
+      # wording so the ping names the right artifact and the right next
+      # verb (`fix`, not `build`). design/redesign still produce a plan, so
+      # they share the legacy plan/replan wording verbatim.
+      if [[ "$final_phase" == "investigate" || "$final_phase" == "re-investigate" ]]; then
+        artifact_label="RCA"
+        approve_verb="fix"
+        building_word="piv-implementing"
       else
-        ap-notify.sh "plan ready for review: ${issue:-$action}" "\`ap approve $issue\` to build, \`ap reply $issue \"...\"\` = feedback" || true
+        artifact_label="plan"
+        approve_verb="build"
+        building_word="building"
+      fi
+      if [[ "$auto_will_build" == true ]]; then
+        ap-notify.sh "$artifact_label auto-approved, $building_word: ${issue:-$action}" "no 'ap approve' needed -- auto-approve is on for this ticket; \`ap reply\` to override with feedback before it starts" || true
+      else
+        ap-notify.sh "$artifact_label ready for review: ${issue:-$action}" "\`ap approve $issue\` to $approve_verb, \`ap reply $issue \"...\"\` = feedback" || true
       fi
     fi
     ;;

@@ -91,6 +91,68 @@ elif [[ "$AP_SHIP_SLOTS" -gt 6 ]]; then
 fi
 export AP_SHIP_SLOTS
 
+# Plan lane concurrency: N planning acts at once instead of the single
+# hard-coded lane this used to be. Planning is the cheapest and most
+# parallelizable phase -- it runs no dev servers, binds no ports, and works
+# in per-issue worktrees (wt-eng<id>-*), so two plans can never collide the
+# way two builds on one port pair would. It was nonetheless serialized while
+# AP_BUILD_SLOTS builds and AP_SHIP_SLOTS ships ran wide, which made the plan
+# lane the pipeline's tightest artificial bottleneck: every new queued
+# ticket enters ONLY through it (ap-decide.py's tier 5), so one long plan
+# act stalled all intake no matter how idle build and ship were (hit live
+# 2026-08-20: ENG-1407 sat queued behind ENG-1406's plan with 2/2 build and
+# 3/3 ship slots free). Clamped to 1..4 -- a plan act still fans out
+# explorers/plan-critic sub-agents, so this workspace's memory budget, not
+# port space, is what caps it.
+#
+# Slot 1 deliberately keeps the ORIGINAL lock path ($AP_HOME/lock.plan)
+# rather than becoming lock.plan.1, so an act already in flight when this
+# rolled out still occupies a slot the new probe can see -- renumbering it
+# would have let the next cycle dispatch a second plan concurrently with a
+# live one it had gone blind to. Slots 2..N use lock.plan.$n.
+export AP_PLAN_SLOTS="${AP_PLAN_SLOTS:-1}"
+if ! [[ "$AP_PLAN_SLOTS" =~ ^[0-9]+$ ]]; then
+  AP_PLAN_SLOTS=1
+elif [[ "$AP_PLAN_SLOTS" -lt 1 ]]; then
+  AP_PLAN_SLOTS=1
+elif [[ "$AP_PLAN_SLOTS" -gt 4 ]]; then
+  AP_PLAN_SLOTS=4
+fi
+export AP_PLAN_SLOTS
+
+# plan_lock_file <n> -> the lock path for plan slot n. Slot 1 is $AP_HOME/
+# lock.plan (the pre-AP_PLAN_SLOTS path, kept for the in-flight-act reason
+# in the comment above); every higher slot is lock.plan.$n. Defined here, in
+# the one file all four entrypoints source, so ap/ap-cycle.sh/ap-resume.sh
+# can never drift on which file is slot 1.
+plan_lock_file() {
+  local n="$1"
+  if [[ "$n" -le 1 ]]; then
+    printf '%s/lock.plan' "$AP_HOME"
+  else
+    printf '%s/lock.plan.%s' "$AP_HOME" "$n"
+  fi
+}
+
+# Review lane concurrency: N `piv-review-pr` -> debate-review -> babysit-pr
+# rounds can run at once for the bug path. Capped HIGHER than plan's 1
+# because a review act runs the repo's REAL validation suite in
+# piv-review-pr's Phase 3 and again per babysit-pr repair push -- CPU-heavy
+# like a build -- but capped no higher than build's 4 (and NOT as high as
+# ship's 6) because unlike ship it also spends long stretches purely waiting
+# on bot rounds (babysit-pr/SKILL.md:100-105: bots post 5-10 min after a
+# push, 8-15 for Codex), so it earns more than plan and no more than build.
+# Clamped to 1..4, default 2 (matching build).
+export AP_REVIEW_SLOTS="${AP_REVIEW_SLOTS:-2}"
+if ! [[ "$AP_REVIEW_SLOTS" =~ ^[0-9]+$ ]]; then
+  AP_REVIEW_SLOTS=2
+elif [[ "$AP_REVIEW_SLOTS" -lt 1 ]]; then
+  AP_REVIEW_SLOTS=1
+elif [[ "$AP_REVIEW_SLOTS" -gt 4 ]]; then
+  AP_REVIEW_SLOTS=4
+fi
+export AP_REVIEW_SLOTS
+
 # Minutes the pipeline stays auto-paused after a usage-limit failure before
 # clearing itself (see ap-cycle.sh's pause-reason handling). A real-bug pause
 # (reason "failures") or a manual pause (reason "manual") never auto-clears,

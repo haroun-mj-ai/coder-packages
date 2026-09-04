@@ -87,6 +87,25 @@ append_ledger_row() {
     "$ts" "$eng_id" >>"$ap_home/runs/fixture.jsonl"
 }
 
+# seed_rca_file <work-repo> <eng-id> -- writes the exact-match RCA basename
+# resolve_rca_path prefers (issue-<eng-id-lower>.md) under docs/issues/.
+seed_rca_file() {
+  local work_repo="$1" eng_id="$2"
+  mkdir -p "$work_repo/docs/issues"
+  local lower
+  lower="$(echo "$eng_id" | tr '[:upper:]' '[:lower:]')"
+  touch "$work_repo/docs/issues/issue-${lower}.md"
+}
+
+# seed_piv_plan_file <work-repo> <eng-id> <slug> -- writes the
+# docs/plans/<ENG-ID>-<slug>.md shape resolve_piv_plan_path anchors on
+# (basename == <eng-lower>.md or starts with <eng-lower>-).
+seed_piv_plan_file() {
+  local work_repo="$1" eng_id="$2" slug="$3"
+  mkdir -p "$work_repo/docs/plans"
+  touch "$work_repo/docs/plans/${eng_id}-${slug}.md"
+}
+
 # --- fixture ------------------------------------------------------------------
 
 setup_case() {
@@ -312,17 +331,32 @@ assert "tier4: action=ship" [ "$(json_field "$out" action)" = "ship" ]
 assert "tier4: planPath resolved via filesystem fallback" bash -c "echo '$out' | grep -q 'eng-301-thing.md'"
 
 # =============================================================================
-# Tier 5: happy path -- a queued ticket claims plan and carries its note
-# through as feedback (drop-in for the old "title note" carry-through).
+# Tier 5: happy path -- a queued ticket (kind defaults to feature) claims
+# design and carries its note through as feedback (drop-in for the old
+# "title note" carry-through). REWRITTEN, not preserved: per the piv
+# feature-fork plan's own audit, `queued` never produces `action: plan`
+# again once intake is cut over to the shared piv states -- a feature-kind
+# ticket now claims piv-drafting via `design`, not legacy `planning` via
+# `plan`.
 # =============================================================================
 setup_case
 seed_ticket "$CASE_AP_HOME" ENG-400 queued note='"add the widget"'
 out="$(run_decide --claim)"
-assert "tier5: action=plan" [ "$(json_field "$out" action)" = "plan" ]
+assert "tier5: action=design (feature kind, default)" [ "$(json_field "$out" action)" = "design" ]
 assert "tier5: issue=ENG-400" [ "$(json_field "$out" issue)" = "ENG-400" ]
 assert "tier5: feedback carries the ticket's note" [ "$(json_field "$out" feedback)" = "add the widget" ]
-assert "tier5(claim): ticket state -> planning" \
-  [ "$(ticket_field "$CASE_AP_HOME" ENG-400 state)" = "planning" ]
+assert "tier5(claim): ticket state -> piv-drafting" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-400 state)" = "piv-drafting" ]
+
+# =============================================================================
+# Tier 5: kind=bug at intake claims investigate/piv-drafting instead.
+# =============================================================================
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-401 queued kind='"bug"'
+out="$(run_decide --claim)"
+assert "tier5: action=investigate (bug kind)" [ "$(json_field "$out" action)" = "investigate" ]
+assert "tier5(claim): ticket state -> piv-drafting (bug)" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-401 state)" = "piv-drafting" ]
 
 # =============================================================================
 # ap_queue itself rejects a bad ENG id at intake time (via its own `new`
@@ -441,6 +475,351 @@ assert "precedence: approve after reply after approve -> pending_approval true" 
   [ "$(ticket_field "$CASE_AP_HOME" ENG-702 pending_approval)" = "True" ]
 assert "precedence: approve after reply after approve -> feedback cleared" \
   [ -z "$(ticket_field "$CASE_AP_HOME" ENG-702 feedback)" ]
+
+# =============================================================================
+# piv-draft-review (bug kind): approved + a resolvable RCA fixture -> fix,
+# artifactPath set, state -> piv-implementing.
+# =============================================================================
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-800 piv-draft-review pending_approval=true kind='"bug"'
+seed_rca_file "$CASE_WORK_REPO" ENG-800
+out="$(run_decide --claim)"
+assert "piv-draft-review(bug): action=fix" [ "$(json_field "$out" action)" = "fix" ]
+assert "piv-draft-review(bug): artifactPath set" \
+  bash -c "echo '$out' | grep -q 'issue-eng-800.md'"
+assert "piv-draft-review(bug)(claim): ticket state -> piv-implementing" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-800 state)" = "piv-implementing" ]
+
+# =============================================================================
+# piv-draft-review (bug kind): feedback -> re-investigate, feedback relayed,
+# state -> piv-drafting, feedback cleared.
+# =============================================================================
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-801 piv-draft-review kind='"bug"' \
+  feedback='"the repro is flaky, check the retry path too"'
+out="$(run_decide --claim)"
+assert "piv-draft-review(bug): feedback -> action=re-investigate" \
+  [ "$(json_field "$out" action)" = "re-investigate" ]
+assert "piv-draft-review(bug): feedback relayed" \
+  [ "$(json_field "$out" feedback)" = "the repro is flaky, check the retry path too" ]
+assert "piv-draft-review(bug)(claim): ticket state -> piv-drafting" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-801 state)" = "piv-drafting" ]
+assert "piv-draft-review(bug)(claim): feedback cleared" \
+  [ -z "$(ticket_field "$CASE_AP_HOME" ENG-801 feedback)" ]
+
+# =============================================================================
+# piv-draft-review (bug kind): feedback + pending_approval -> feedback wins
+# (mirrors the legacy plan-review precedence case).
+# =============================================================================
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-802 piv-draft-review kind='"bug"' \
+  pending_approval=true feedback='"wrong root cause, look again"'
+out="$(run_decide --claim)"
+assert "piv-draft-review(bug): feedback beats approval -> action=re-investigate" \
+  [ "$(json_field "$out" action)" = "re-investigate" ]
+assert "piv-draft-review(bug)(claim): ticket state -> piv-drafting" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-802 state)" = "piv-drafting" ]
+
+# =============================================================================
+# piv-draft-review (bug kind): approved, RCA unresolvable -> needs-input,
+# phase_at_question=investigate, scan continues (never crashes/wedges).
+# =============================================================================
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-803 piv-draft-review pending_approval=true kind='"bug"'
+out="$(run_decide --claim)"
+assert "piv-draft-review(bug): unresolvable RCA -> action=none" [ "$(json_field "$out" action)" = "none" ]
+assert "piv-draft-review(bug): unresolvable RCA -> ticket moved to needs-input" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-803 state)" = "needs-input" ]
+assert "piv-draft-review(bug): unresolvable RCA -> phase_at_question=investigate" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-803 phase_at_question)" = "investigate" ]
+
+# =============================================================================
+# piv-review-pending: pr_urls non-empty + review lane free -> review,
+# prUrl set, state -> piv-reviewing.
+# =============================================================================
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-804 piv-review-pending pr_urls='["https://github.com/x/y/pull/1"]'
+out="$(run_decide --claim)"
+assert "piv-review-pending: action=review" [ "$(json_field "$out" action)" = "review" ]
+assert "piv-review-pending: prUrl set" \
+  [ "$(json_field "$out" prUrl)" = "https://github.com/x/y/pull/1" ]
+assert "piv-review-pending(claim): ticket state -> piv-reviewing" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-804 state)" = "piv-reviewing" ]
+
+# =============================================================================
+# piv-review-pending: empty pr_urls -> needs-input, phase_at_question=review.
+# =============================================================================
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-805 piv-review-pending pr_urls='[]'
+out="$(run_decide --claim)"
+assert "piv-review-pending: empty pr_urls -> action=none" [ "$(json_field "$out" action)" = "none" ]
+assert "piv-review-pending: empty pr_urls -> ticket moved to needs-input" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-805 state)" = "needs-input" ]
+assert "piv-review-pending: empty pr_urls -> phase_at_question=review" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-805 phase_at_question)" = "review" ]
+
+# =============================================================================
+# --busy review: a piv-review-pending ticket and a ship-pending ticket ->
+# the ship is claimed, the review is not (per-entry lane check at tier4,
+# no cross-lane starvation between ship and review).
+# =============================================================================
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-806 piv-review-pending pr_urls='["https://github.com/x/y/pull/2"]'
+seed_ticket "$CASE_AP_HOME" ENG-807 ship-pending
+mkdir -p "$CASE_WORK_REPO/docs/plans"
+touch "$CASE_WORK_REPO/docs/plans/eng-807-thing.md"
+out="$(run_decide --claim --busy review)"
+assert "tier4 per-entry lane: busy review -> ship-pending still claimed" \
+  [ "$(json_field "$out" action)" = "ship" ]
+assert "tier4 per-entry lane: busy review -> issue=ENG-807 (ship)" \
+  [ "$(json_field "$out" issue)" = "ENG-807" ]
+assert "tier4 per-entry lane: busy review -> piv-review-pending ticket left untouched" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-806 state)" = "piv-review-pending" ]
+
+# =============================================================================
+# Cross-fork FIFO fairness at the shared draft-review gate: a plan-review
+# (legacy) ticket and an older-seq piv-draft-review (bug) ticket both
+# approved, build lane free -> the older seq wins, regardless of which
+# fork it belongs to.
+# =============================================================================
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-808 piv-draft-review pending_approval=true kind='"bug"'
+seed_rca_file "$CASE_WORK_REPO" ENG-808
+seed_ticket "$CASE_AP_HOME" ENG-809 plan-review pending_approval=true
+mkdir -p "$CASE_WORK_REPO/docs/plans"
+touch "$CASE_WORK_REPO/docs/plans/eng-809-thing.md"
+out="$(run_decide --dry-run)"
+assert "cross-fork FIFO: older seq (piv-draft-review, seeded first) wins" \
+  [ "$(json_field "$out" issue)" = "ENG-808" ]
+assert "cross-fork FIFO: older seq's own fork action (fix) is used" \
+  [ "$(json_field "$out" action)" = "fix" ]
+
+# =============================================================================
+# Tier 3: phase routing for the bug fork's own phase names.
+# =============================================================================
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-810 needs-input \
+  feedback='"the retry path"' phase_at_question='"fix"' \
+  question='"why did the retry loop not fire?"'
+out="$(run_decide --claim)"
+assert "tier3: phase_at_question=fix -> action=re-investigate" \
+  [ "$(json_field "$out" action)" = "re-investigate" ]
+assert "tier3(claim): ticket state -> piv-drafting" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-810 state)" = "piv-drafting" ]
+
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-811 needs-input \
+  feedback='"just retry it"' phase_at_question='"review"' \
+  question='"the bot review is red, what should I do?"'
+out="$(run_decide --claim)"
+assert "tier3: phase_at_question=review -> action=none" [ "$(json_field "$out" action)" = "none" ]
+assert "tier3: phase_at_question=review -> ticket left in needs-input" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-811 state)" = "needs-input" ]
+
+# =============================================================================
+# Shared stale-sweep: the three shared piv "running" states -- piv-drafting,
+# piv-implementing, piv-reviewing -- with no ledger row in 3h and no lock
+# held, are swept to failed exactly like the legacy running states.
+# =============================================================================
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-812 piv-drafting kind='"bug"'
+seed_ticket "$CASE_AP_HOME" ENG-813 piv-implementing kind='"bug"'
+seed_ticket "$CASE_AP_HOME" ENG-814 piv-reviewing kind='"bug"'
+out="$(run_decide --claim)"
+assert "stale-sweep(shared): piv-drafting swept to failed" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-812 state)" = "failed" ]
+assert "stale-sweep(shared): piv-implementing swept to failed" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-813 state)" = "failed" ]
+assert "stale-sweep(shared): piv-reviewing swept to failed" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-814 state)" = "failed" ]
+
+# =============================================================================
+# piv-draft-review (feature kind): approved + a resolvable plan fixture ->
+# build, artifactPath set, state -> piv-implementing.
+# =============================================================================
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-900 piv-draft-review pending_approval=true kind='"feature"'
+seed_piv_plan_file "$CASE_WORK_REPO" ENG-900 "widget"
+out="$(run_decide --claim)"
+assert "piv-draft-review(feature): action=build" [ "$(json_field "$out" action)" = "build" ]
+assert "piv-draft-review(feature): artifactPath set" \
+  bash -c "echo '$out' | grep -q 'ENG-900-widget.md'"
+assert "piv-draft-review(feature)(claim): ticket state -> piv-implementing" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-900 state)" = "piv-implementing" ]
+
+# =============================================================================
+# piv-draft-review (feature kind): feedback -> redesign, feedback relayed,
+# state -> piv-drafting, feedback cleared.
+# =============================================================================
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-901 piv-draft-review kind='"feature"' \
+  feedback='"actually make the widget configurable"'
+out="$(run_decide --claim)"
+assert "piv-draft-review(feature): feedback -> action=redesign" \
+  [ "$(json_field "$out" action)" = "redesign" ]
+assert "piv-draft-review(feature): feedback relayed" \
+  [ "$(json_field "$out" feedback)" = "actually make the widget configurable" ]
+assert "piv-draft-review(feature)(claim): ticket state -> piv-drafting" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-901 state)" = "piv-drafting" ]
+assert "piv-draft-review(feature)(claim): feedback cleared" \
+  [ -z "$(ticket_field "$CASE_AP_HOME" ENG-901 feedback)" ]
+
+# =============================================================================
+# piv-draft-review (feature kind): feedback + pending_approval -> feedback
+# wins.
+# =============================================================================
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-902 piv-draft-review kind='"feature"' \
+  pending_approval=true feedback='"wrong approach, redo it"'
+out="$(run_decide --claim)"
+assert "piv-draft-review(feature): feedback beats approval -> action=redesign" \
+  [ "$(json_field "$out" action)" = "redesign" ]
+assert "piv-draft-review(feature)(claim): ticket state -> piv-drafting" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-902 state)" = "piv-drafting" ]
+
+# =============================================================================
+# piv-draft-review (feature kind): approved, plan unresolvable ->
+# needs-input, phase_at_question=design, scan continues.
+# =============================================================================
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-903 piv-draft-review pending_approval=true kind='"feature"'
+out="$(run_decide --claim)"
+assert "piv-draft-review(feature): unresolvable plan -> action=none" [ "$(json_field "$out" action)" = "none" ]
+assert "piv-draft-review(feature): unresolvable plan -> ticket moved to needs-input" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-903 state)" = "needs-input" ]
+assert "piv-draft-review(feature): unresolvable plan -> phase_at_question=design" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-903 phase_at_question)" = "design" ]
+
+# =============================================================================
+# Cross-kind fairness at the shared draft-review gate: a bug ticket and an
+# older-seq feature ticket, both at piv-draft-review, both approved, build
+# lane free -> the older seq (feature) wins and gets action=build. Neither
+# kind starves the other at the one state they share.
+# =============================================================================
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-904 piv-draft-review pending_approval=true kind='"feature"'
+seed_piv_plan_file "$CASE_WORK_REPO" ENG-904 "older-feature"
+seed_ticket "$CASE_AP_HOME" ENG-905 piv-draft-review pending_approval=true kind='"bug"'
+seed_rca_file "$CASE_WORK_REPO" ENG-905
+out="$(run_decide --dry-run)"
+assert "cross-kind fairness: older seq (feature, seeded first) wins" \
+  [ "$(json_field "$out" issue)" = "ENG-904" ]
+assert "cross-kind fairness: older seq's own fork action (build) is used" \
+  [ "$(json_field "$out" action)" = "build" ]
+
+# =============================================================================
+# Tier 3: phase routing for the feature fork's own phase names, including
+# second-round re-entry names (redesign/re-investigate), which a wrapper
+# writes when a ticket is parked a second time -- these must not fall
+# through to the legacy `replan` default.
+# =============================================================================
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-906 needs-input \
+  feedback='"use a modal instead"' phase_at_question='"build"' \
+  question='"inline panel or modal?"'
+out="$(run_decide --claim)"
+assert "tier3: phase_at_question=build -> action=redesign" \
+  [ "$(json_field "$out" action)" = "redesign" ]
+assert "tier3(claim): ticket state -> piv-drafting" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-906 state)" = "piv-drafting" ]
+
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-907 needs-input \
+  feedback='"the users table"' phase_at_question='"design"' \
+  question='"which table?"'
+out="$(run_decide --claim)"
+assert "tier3: phase_at_question=design -> action=redesign" \
+  [ "$(json_field "$out" action)" = "redesign" ]
+
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-908 needs-input \
+  feedback='"still the users table"' phase_at_question='"redesign"' \
+  question='"which table, take 2?"'
+out="$(run_decide --claim)"
+assert "tier3(re-entry): phase_at_question=redesign -> action=redesign (not legacy replan)" \
+  [ "$(json_field "$out" action)" = "redesign" ]
+
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-909 needs-input \
+  feedback='"check the retry path again"' phase_at_question='"re-investigate"' \
+  question='"still flaky?"'
+out="$(run_decide --claim)"
+assert "tier3(re-entry): phase_at_question=re-investigate -> action=re-investigate" \
+  [ "$(json_field "$out" action)" = "re-investigate" ]
+
+# =============================================================================
+# Resolver anchoring regression: resolve_piv_plan_path must anchor on
+# `<eng-id>-` (a trailing hyphen), never a bare substring match --
+# ENG-123 must not resolve ENG-1234-other.md.
+# =============================================================================
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-123 piv-draft-review pending_approval=true kind='"feature"'
+seed_piv_plan_file "$CASE_WORK_REPO" ENG-1234 "other"
+seed_piv_plan_file "$CASE_WORK_REPO" ENG-123 "mine"
+out="$(run_decide --dry-run)"
+assert "resolver anchoring: action=build (a real plan was found)" [ "$(json_field "$out" action)" = "build" ]
+assert "resolver anchoring: resolves ENG-123-mine.md, not ENG-1234-other.md" \
+  bash -c "echo '$out' | grep -q 'ENG-123-mine.md' && ! echo '$out' | grep -q 'ENG-1234-other.md'"
+
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-124 piv-draft-review pending_approval=true kind='"feature"'
+seed_piv_plan_file "$CASE_WORK_REPO" ENG-1245 "other"
+out="$(run_decide --dry-run)"
+assert "resolver anchoring: ENG-1245-other.md must not satisfy ENG-124 -> needs-input" \
+  [ "$(json_field "$out" action)" = "none" ]
+
+# =============================================================================
+# Legacy inertness: a `queued` ticket (either kind) never produces
+# action=plan any more; the plan-review/ship-pending hand-set escape
+# hatches still work unmodified.
+# =============================================================================
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-910 queued
+out="$(run_decide --dry-run)"
+assert "legacy inertness: queued never produces action=plan" \
+  [ "$(json_field "$out" action)" != "plan" ]
+assert "legacy inertness: queued (default kind) produces action=design instead" \
+  [ "$(json_field "$out" action)" = "design" ]
+
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-911 plan-review pending_approval=true
+mkdir -p "$CASE_WORK_REPO/docs/plans"
+touch "$CASE_WORK_REPO/docs/plans/eng-911-thing.md"
+out="$(run_decide --dry-run)"
+assert "legacy inertness: hand-set plan-review still produces action=implement" \
+  [ "$(json_field "$out" action)" = "implement" ]
+assert "legacy inertness: hand-set plan-review still resolves planPath" \
+  bash -c "echo '$out' | grep -q 'eng-911-thing.md'"
+
+# =============================================================================
+# kind validation at intake: a present-but-invalid kind value ("Bug", wrong
+# case) resolves to the safe feature default, never bug -- regression test
+# for ticket_kind()'s truthiness gap.
+# =============================================================================
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-912 queued kind='"Bug"'
+out="$(run_decide --claim)"
+assert "kind validation: kind=\"Bug\" (wrong case) resolves to feature -> action=design" \
+  [ "$(json_field "$out" action)" = "design" ]
+assert "kind validation: kind=\"Bug\" (wrong case) never dispatches as bug" \
+  [ "$(json_field "$out" action)" != "investigate" ]
+
+# =============================================================================
+# Fail-closed fallback: an unrecognized phase_at_question value must never
+# silently dispatch the legacy `replan` action against a ticket that may be
+# mid-piv-pipeline with an open PR and uncommitted worktree state already.
+# =============================================================================
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-913 needs-input \
+  feedback='"an answer"' phase_at_question='"some-future-phase-nothing-defines"' \
+  question='"a stale question"'
+out="$(run_decide --claim)"
+assert "fail-closed: unrecognized phase_at_question -> action=none (not replan)" \
+  [ "$(json_field "$out" action)" = "none" ]
+assert "fail-closed: unrecognized phase_at_question -> ticket moved to needs-input" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-913 state)" = "needs-input" ]
+assert "fail-closed: unrecognized phase_at_question -> question names the unrecognized value" \
+  bash -c 'echo "$(ticket_field "$1" ENG-913 question)" | grep -q "some-future-phase-nothing-defines"' _ "$CASE_AP_HOME"
 
 # =============================================================================
 

@@ -59,13 +59,19 @@ the reading and the building. Two rules are not negotiable:
   unit of work still goes through a pinned `subagent_type`.
 
   **Codex is the other cross-model layer, via `delegate-skills`/`review-skills`,
-  not the Agent tool.** Three lanes (`~/.config/delegate-skills/config.json`,
-  global): `review-main`/`review-debate` (claude/codex, high effort) drive
-  `debate-review`'s two-model PR/local review (step 6, and `piv-review-pr`'s
-  equivalent); `codex-feature` (codex, medium effort) is a real second
-  implementer for self-contained work units (step 3), not just a review
-  add-on. Codex's own docs note research (arXiv:2607.21656) showing the
-  pairing is asymmetric — Claude reviewing Codex-authored work lifts quality,
+  not the Agent tool.** Four lanes (`~/.config/delegate-skills/config.json`,
+  global): `review-main` is `claude`, high effort; every Codex lane —
+  `review-debate`, `codex-feature`, `plan-debate` — is pinned to `gpt-5.6-sol`
+  at effort `max`, this project's default "best model, max reasoning" for
+  every Codex dispatch. `review-main`/`review-debate` drive `debate-review`'s
+  two-model PR/local review (step 6, and `piv-review-pr`'s equivalent);
+  `codex-feature` is a real second implementer for self-contained work units
+  (step 3), not just a review add-on; `plan-debate` is reserved specifically
+  for challenging a drafted plan (step 7c). Same model across all three —
+  the lane names separate the *jobs* (code debate, real implementation, plan
+  debate), not the model tier. Codex's own docs note research
+  (arXiv:2607.21656) showing the pairing is asymmetric — Claude reviewing
+  Codex-authored work lifts quality,
   Codex reviewing Claude-authored work doesn't — so every dispatch here keeps
   Codex on the generative/challenger side (drafting, or trying to refute a
   specific claim) and Claude on the judging side, never the reverse.
@@ -400,8 +406,10 @@ point isn't Codex reviewing the opus-drafted plan (`plan-critic`/red-team alread
 and cross-model review research — arXiv:2607.21656 — found Codex *reviewing* Claude-drafted work is the direction
 that makes it worse, not better). It's Codex **drafting its own independent approach from the same evidence**,
 blind to what Claude proposed — the generative role the research shows is fine, paired with Claude doing the
-judging, which is the direction that actually lifts quality. Uses `codex-delegate`'s `--read-only` mode (the
-`review-debate` lane — `delegate-setup`'s global fleet config, `~/.config/delegate-skills/config.json`):
+judging, which is the direction that actually lifts quality. Uses `codex-delegate`'s `--read-only` mode, the
+`plan-debate` lane (`gpt-5.6-sol`, effort `max` — this project's default for every Codex lane; `plan-debate` names
+the *job*, challenging a drafted plan, separately from `review-debate`'s code-review job, even though they
+currently run the same model — `delegate-setup`'s global fleet config, `~/.config/delegate-skills/config.json`):
 
 ```xml
 <task>
@@ -420,7 +428,7 @@ touch.
 ```
 
 ```bash
-node "<codex-delegate skill-dir>/scripts/relay.mjs" --brief brief.txt --cd <root-worktree> --lane review-debate --read-only
+node "<codex-delegate skill-dir>/scripts/relay.mjs" --brief brief.txt --cd <root-worktree> --lane plan-debate --read-only
 ```
 
 `--read-only` means nothing to review/land — just read `result.json`'s `finalMessage`. Then **you** (not another
@@ -1128,17 +1136,14 @@ These cost real runs real money to rediscover; do not re-derive them.
 
 ## Headless mode (`--headless`)
 
-Read `.claude/skills/autopilot-protocol.md` first — the `status.json` shape,
-the local queue contract, the ask→fallback rule, the Linear footprint are
-defined once there. This section states only what this skill's own ask
-points map to.
+Read `.claude/skills/headless-protocol.md` first for the mechanics —
+`status.json`, the local queue contract, the ask→fallback rule, the Linear
+footprint — then `.claude/skills/autopilot-protocol.md` for this pipeline's
+own states and orchestrator guarantees. This section states only what this
+skill's own ask points map to.
 
-**Resolve `$QUEUE_PY` once, before any `ap_queue.py` write below** (it isn't
-on `PATH` the way `ap` is — see autopilot-protocol.md's local queue
-contract):
-```bash
-QUEUE_PY="$(dirname "$(readlink -f "$(command -v ap)")")/ap_queue.py"
-```
+**Resolve `$QUEUE_PY` once, before any `ap_queue.py` write below**, per
+`headless-protocol.md`'s local queue contract.
 
 **The interactive/headless fork, stated plainly:** with no `--phase` flag,
 this skill behaves exactly as described above — `ExitPlanMode`'s approval
@@ -1298,13 +1303,6 @@ exactly as interactive, no different gate. Merging is never autonomous:
 "never merge, never move Linear status beyond the claim" applies identically
 headlessly, and stays entirely `/ship-work`'s job.
 
-**Never end the turn with work still in the background.** The headless `-p`
-harness kills the session outright once its background-wait ceiling passes —
-no final message, no `status.json`, and the wrapper reconciles a healthy run
-as a crash. Run the quality gates and CI-adjacent waits as **blocking
-foreground commands**, never parked as background tasks you "wait on," and
-treat writing `status.json` as the last thing that must complete before
-anything else is allowed to still be running. If a long suite genuinely
-can't finish inside the turn, write an interim `status.json` (`FAILED`,
-detail "gates still running at turn end") first and let the retry recover —
-never leave the file unwritten while waiting.
+See `headless-protocol.md`'s "## Never end the turn with required local work
+in the background" — run the quality gates and CI-adjacent waits as blocking
+foreground commands, never parked as background tasks.

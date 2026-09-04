@@ -78,7 +78,7 @@ def issue_of(s):
 # session:window.pane, so a dotted window name gets misparsed by tmux
 # itself the moment anything targets it by name.
 _ACT_WINDOW_RE = re.compile(
-    r"^act_(?:plan|build_\d+|ship_\d+)_(?P<issue>[^_]+)_(?P<phase>[^_]+)$"
+    r"^act_(?:plan|build_\d+|ship_\d+|review_\d+)_(?P<issue>[^_]+)_(?P<phase>[^_]+)$"
 )
 
 
@@ -424,7 +424,8 @@ def age_str(ts_str):
     return f"{secs // 86400}d"
 
 
-QUEUE_DASHBOARD_STATES = ("queued", "plan-review", "needs-input", "ship-pending")
+QUEUE_DASHBOARD_STATES = ("queued", "plan-review", "needs-input", "ship-pending",
+                           "piv-draft-review", "piv-review-pending")
 
 
 def _cc_top_stats():
@@ -537,6 +538,14 @@ def _queue_note(entry):
         return "awaiting `ap approve`"
     if state == "ship-pending":
         return "will ship automatically next cycle"
+    if state == "piv-draft-review":
+        if entry.get("auto_approve"):
+            return "auto-approve on"
+        if entry.get("pending_approval"):
+            return "approved -- next phase will run automatically"
+        return "awaiting `ap approve`"
+    if state == "piv-review-pending":
+        return "PR open, review still owed -- will review automatically next cycle"
     if state == "done":
         return "marked done"
     if state == "failed":
@@ -550,7 +559,8 @@ def _queue_note(entry):
     if state == "ready-to-test":
         pr_urls = entry.get("pr_urls") or []
         return "PRs open" + (f": {', '.join(pr_urls)}" if pr_urls else "")
-    if state in ("building", "planning", "shipping"):
+    if state in ("building", "planning", "shipping",
+                 "piv-drafting", "piv-implementing", "piv-reviewing"):
         return "no live session for this state -- possibly stale, check `ap decide`"
     return state or "-"
 
@@ -888,17 +898,20 @@ def _action_pause_curses(stdscr, row):
 
 
 def _action_approve_curses(stdscr, row):
-    if row["kind"] != "queue" or row["rec"].get("state") != "plan-review":
-        _popup_message(stdscr, "Approve", "not applicable: only a plan-review ticket can be approved")
+    if row["kind"] != "queue" or row["rec"].get("state") not in ("plan-review", "piv-draft-review"):
+        _popup_message(stdscr, "Approve",
+                        "not applicable: only a plan-review or piv-draft-review ticket can be approved")
         return
     entry = ap_queue.approve_ticket(str(AP_HOME), row["issue"])
     _popup_message(stdscr, "Approved", f"approved {entry['eng_id']}" if entry else "no such ticket")
 
 
 def _action_feedback_curses(stdscr, row):
-    if row["kind"] != "queue" or row["rec"].get("state") not in ("plan-review", "needs-input"):
+    if row["kind"] != "queue" or row["rec"].get("state") not in (
+            "plan-review", "piv-draft-review", "needs-input"):
         _popup_message(stdscr, "Feedback",
-                        "not applicable: only a plan-review or needs-input ticket takes feedback here")
+                        "not applicable: only a plan-review, piv-draft-review, or "
+                        "needs-input ticket takes feedback here")
         return
     if row["rec"].get("state") == "needs-input":
         _popup_message(stdscr, "Blocking question", row["rec"].get("question") or "(none recorded)")
@@ -977,6 +990,31 @@ def _action_info_curses(stdscr, row):
     _popup_message(stdscr, "Info", lines)
 
 
+def _popup_kind_prompt(stdscr):
+    """Single-key [f]eature/[b]ug popup for the [n]ew-ticket flow -- a
+    free-text popup for a two-value field is worse than a keypress here.
+    Enter (or any other key) defaults to feature."""
+    title = "Kind: [f]eature / [b]ug (Enter = feature)"
+    _repaint_base(stdscr)
+    h, w = stdscr.getmaxyx()
+    box_w = min(max(len(title) + 4, 20), max(20, w - 4))
+    box_h = 3
+    y0 = max(0, (h - box_h) // 2)
+    x0 = max(0, (w - box_w) // 2)
+    win = curses.newwin(box_h, box_w, y0, x0)
+    win.keypad(True)
+    win.border()
+    win.addnstr(1, 2, title, max(1, box_w - 4), curses.A_BOLD)
+    win.refresh()
+    try:
+        key = win.getch()
+    except curses.error:
+        key = -1
+    if key in (ord("b"), ord("B")):
+        return "bug"
+    return "feature"
+
+
 def _action_queue_new_curses(stdscr):
     """Queue a brand-new ticket without leaving the dashboard -- the CLI-only
     replacement for opening a GitHub inbox issue, reachable right from `ap
@@ -991,9 +1029,11 @@ def _action_queue_new_curses(stdscr):
         _popup_message(stdscr, "Queue", f"{eng_id} is already queued")
         return
     note = _popup_text_input(stdscr, "Note (optional)") or ""
+    kind = _popup_kind_prompt(stdscr)
     auto = _popup_confirm(stdscr, "Auto-approve this ticket?")
-    entry = ap_queue.new_ticket(str(AP_HOME), eng_id, note, auto)
-    _popup_message(stdscr, "Queued", f"queued {entry['eng_id']}" + (" [auto-approve]" if auto else ""))
+    entry = ap_queue.new_ticket(str(AP_HOME), eng_id, note, auto, kind=kind)
+    _popup_message(stdscr, "Queued",
+                    f"queued {entry['eng_id']} [{entry['kind']}]" + (" [auto-approve]" if auto else ""))
 
 
 def _action_limits_curses(stdscr):
@@ -1060,7 +1100,25 @@ ACTION_HDR = "[a]ttach [i]nfo [p]ause [g]o [f]eedback [s]tatus [e]dit-note [K]il
 TTL_CURSES_COLOR = {"g": 1, "y": 2, "r": 3}
 
 
-PENDING_STATES = ("plan-review", "needs-input", "ready-to-test", "failed")
+PENDING_STATES = ("plan-review", "needs-input", "ready-to-test", "failed",
+                   "piv-draft-review")
+
+
+def _is_done(row):
+    """Rows whose work is finished and needs nothing from anyone: a queue
+    ticket in state `done`, or a ledger-only row whose last outcome was
+    DONE. Backs the [v]iew filter -- on a pipeline that has been running a
+    while these accumulate until they crowd out everything still in motion
+    (20 of 20 queue files were `done` on 2026-08-20), and unlike the older
+    "needs-you only" filter, hiding them still leaves live acts, queued
+    tickets, and in-progress states on screen rather than collapsing the
+    board to just the four action-needed states.
+
+    Deliberately status-based, so it catches both row kinds at once: a
+    queue row's status is its state upper-cased (`done` -> DONE) and a
+    ledger row's is the act's final outcome. FAILED/NEEDS_HUMAN are not
+    done and never hidden."""
+    return row.get("status") == "DONE"
 
 
 def _needs_attention(row):
@@ -1092,24 +1150,24 @@ def _curses_main(stdscr):
     selected = 0
     rows = []
     all_rows = []
-    pending_only = False
+    hide_done = False
     last_scan = 0.0
     while True:
         now = time.time()
         if now - last_scan >= 5 or not all_rows:
             all_rows = _dashboard_rows()
             last_scan = now
-        rows = [r for r in all_rows if _needs_attention(r)] if pending_only else all_rows
+        rows = [r for r in all_rows if not _is_done(r)] if hide_done else all_rows
         selected = max(0, min(selected, len(rows) - 1)) if rows else 0
 
         stdscr.erase()
         h, w = stdscr.getmaxyx()
-        view_label = "needs-you only" if pending_only else "everything"
+        view_label = "hiding done" if hide_done else "everything"
         stdscr.addnstr(0, 0, f"ap sessions -- central control point  (↑/↓ or j/k select, [v]iew: {view_label})", w - 1, curses.A_BOLD)
         stdscr.addnstr(1, 0, ACTION_HDR, w - 1, curses.A_BOLD | curses.color_pair(1))
         stdscr.addnstr(2, 0, DASHBOARD_HDR, w - 1, curses.A_DIM)
         if not rows:
-            msg = "nothing needs you right now" if pending_only else "no live or recent acts"
+            msg = "everything here is done" if hide_done else "no live or recent acts"
             stdscr.addnstr(4, 0, msg, w - 1)
         for i, row in enumerate(rows):
             if i + 3 >= h - 1:
@@ -1162,7 +1220,7 @@ def _curses_main(stdscr):
         elif key == curses.KEY_RESIZE:
             continue
         elif key == ord("v"):
-            pending_only = not pending_only
+            hide_done = not hide_done
             selected = 0
         elif key == ord("n"):
             _action_queue_new_curses(stdscr)
@@ -1223,9 +1281,11 @@ def cmd_sessions(args):
     cooldown) in $AP_HOME/env -- same file and same shared ap_env.py
     read-modify-write as the standalone `ap limits` command, so there's
     only one place that knows how to safely edit it. [v]iew toggles between
-    everything and "needs-you only" (a parked live act, or a queue ticket in
-    plan-review/needs-input/ready-to-test/failed -- see _needs_attention) so
-    a quick glance isn't lost in routine done/live rows. q quits.
+    everything and "hiding done" (every row whose status is DONE -- a queue
+    ticket in state `done` or a ledger row whose last outcome was DONE; see
+    _is_done) so finished work stops crowding out what is still moving.
+    FAILED/NEEDS_HUMAN rows are not done and stay visible in both views.
+    q quits.
     Live-refreshes every 5s, same cadence as `cc-top --watch`'s default."""
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         rows = _dashboard_rows()
@@ -1357,10 +1417,21 @@ def cmd_continue(args):
 
 
 REQUEUE_STATE = {
+    # legacy feature path -- untouched
     "plan": "queued",
     "replan": "queued",
     "implement": "plan-review",
     "ship": "ship-pending",
+    # piv -- bug fork
+    "investigate": "queued",
+    "re-investigate": "queued",
+    "fix": "piv-draft-review",
+    "review": "piv-review-pending",
+    # piv -- feature fork
+    "design": "queued",
+    "redesign": "queued",
+    "build": "piv-draft-review",
+    # must match ap-cycle.sh's own external-failure requeue map exactly.
 }
 
 
@@ -1412,8 +1483,10 @@ def cmd_queue(args):
     if ap_queue.read_ticket(str(AP_HOME), args.eng_id) is not None:
         print(f"{args.eng_id} is already queued (see `ap sessions`)", file=sys.stderr)
         return 1
-    entry = ap_queue.new_ticket(str(AP_HOME), args.eng_id, args.note or "", args.auto)
-    print(f"queued {entry['eng_id']} (seq {entry['seq']}){' [auto-approve]' if args.auto else ''}")
+    entry = ap_queue.new_ticket(str(AP_HOME), args.eng_id, args.note or "", args.auto,
+                                 kind=args.kind)
+    print(f"queued {entry['eng_id']} (seq {entry['seq']}) [{entry['kind']}]"
+          f"{' [auto-approve]' if args.auto else ''}")
     return 0
 
 
@@ -1686,6 +1759,8 @@ def main():
     p.add_argument("eng_id")
     p.add_argument("note", nargs="?", default="")
     p.add_argument("--auto", action="store_true", help="also set this ticket's auto-approve switch")
+    p.add_argument("--kind", choices=["feature", "bug"], default="feature",
+                    help="which fork this ticket runs through (default: feature)")
     p.set_defaults(fn=cmd_queue)
 
     p = sub.add_parser("approve", help="approve a plan-review ticket (\"go\")")

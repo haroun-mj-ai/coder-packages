@@ -216,6 +216,41 @@ assert "tail: exits on a finished act (does not hang)" [ "$rc" -eq 0 ]
 assert "tail: replays the tool call" grep -q 'Bash(command=git status)' <<<"$out"
 assert "tail: replays assistant text" grep -q 'Plan committed.' <<<"$out"
 
+# --- [v]iew filter: hides DONE rows, keeps everything still in motion --------
+# The dashboard's [v]iew key used to toggle "needs-you only" (_needs_attention),
+# which hid live acts -- it now toggles "hiding done" (_is_done). Asserted on
+# the predicate rather than by driving curses, which has no headless harness.
+out="$(python3 - "$RUNS_PY" <<'PYEOF'
+import importlib.util, os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(sys.argv[1])))  # ap_env, ap_queue
+spec = importlib.util.spec_from_file_location("ap_runs", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+cases = [
+    ("queue-done",      {"kind": "queue", "status": "DONE"},        True),
+    ("ledger-done",     {"kind": "done",  "status": "DONE"},        True),
+    ("live",            {"kind": "live",  "status": "LIVE"},        False),
+    ("queued",          {"kind": "queue", "status": "QUEUED"},      False),
+    ("plan-review",     {"kind": "queue", "status": "PLAN-REVIEW"}, False),
+    ("failed",          {"kind": "done",  "status": "FAILED"},      False),
+    ("needs-human",     {"kind": "done",  "status": "NEEDS_HUMAN"}, False),
+]
+for name, row, want in cases:
+    got = m._is_done(row)
+    print("%s %s" % ("OK" if got == want else "BAD", name))
+PYEOF
+)"
+assert "view filter: a done queue ticket is hidden"   grep -q '^OK queue-done$'  <<<"$out"
+assert "view filter: a done ledger row is hidden"     grep -q '^OK ledger-done$' <<<"$out"
+assert "view filter: a LIVE act is NOT hidden"        grep -q '^OK live$'        <<<"$out"
+assert "view filter: a queued ticket is NOT hidden"   grep -q '^OK queued$'      <<<"$out"
+assert "view filter: plan-review is NOT hidden"       grep -q '^OK plan-review$' <<<"$out"
+assert "view filter: FAILED is NOT hidden"            grep -q '^OK failed$'      <<<"$out"
+assert "view filter: NEEDS_HUMAN is NOT hidden"       grep -q '^OK needs-human$' <<<"$out"
+assert "view filter: no case misclassified" bash -c "! grep -q '^BAD ' <<<\"\$1\"" _ "$out"
+assert "view filter: every case actually ran (7 verdicts)" \
+  [ "$(grep -c '^OK ' <<<"$out")" -eq 7 ]
+
 # --- watch with nothing live -------------------------------------------------
 python3 "$RUNS_PY" watch >/dev/null 2>&1
 assert "watch: exits non-zero when no act is live" [ "$?" -ne 0 ]

@@ -107,3 +107,40 @@ human approves."** This is the handoff point: the agent's loop ends at an open P
   review your own diff before moving on.
 - Sets up parallel work: one branch per ticket → one PR per ticket is exactly what makes worktree parallelism
   (running independent tickets at once) clean.
+
+## Headless mode (--headless)
+
+Read `.claude/skills/headless-protocol.md` first — the `status.json` shape, the local queue contract, the ask→fallback rule, the Linear footprint are defined once there. This section states only what this skill's own ask points map to.
+
+**Never its own act.** This skill runs inside the `fix` act (bug) or the `build` act (feature, once that fork ships) — same inheritance and no-`status.json` rule as `piv-commit`.
+
+**Precondition mapping** (Phase 1 table above) — all five are deterministic fail-fast checks, not human-judgment asks, so **none** becomes `NEEDS_HUMAN`:
+
+| precondition | headless resolution |
+|---|---|
+| On `{base}` | `FAILED`, `detail: "on base branch; the fix act's worktree mandate was not honoured"` |
+| Uncommitted changes | `FAILED`, `detail` = the `git status --short` output |
+| No commits ahead of `{base}` | `FAILED`, `detail: "nothing to PR"` |
+| Existing PR already open for this branch | **`DONE`-idempotent**: print and return the URL as a success, not a failure — this is the normal state on a retried `fix` act |
+| Clean, ahead, no PR | proceed |
+
+**Push with the explicit branch name.** `git push -u origin HEAD` as written in Phase 3 above would actually pass under the current profile via the pre-existing `Bash(git -C *)` allowance (e.g. `git -C <worktree> push -u origin HEAD` matches). It is still the wrong thing to do, on its own terms: pushing `HEAD` rather than the explicit branch name loses the branch-naming discipline every other worktree in this repo follows, makes retries harder to reason about (which branch did a prior attempt actually push?), and produces a remote branch name a human reading `git branch -a` can't correlate to the ticket at a glance. Push the **explicit branch name the act's worktree is already on**: `haroun/eng-<id>-fix-<slug>` for a bug, `haroun/eng-<id>-<slug>` for a feature (once that fork ships). So: `git -C <worktree> push -u origin haroun/eng-<id>-fix-<slug>` for this fork — enforced by convention in this skill's prose, not by the permission profile.
+
+**Opening the PR.** `gh pr create` genuinely **is not** on the allow list today, and unlike `git` there is no `Bash(gh -C *)`-style escape hatch already granted for `gh`. Either use the already-allowed `mcp__github__create_pull_request`, or rely on the permission profile eventually adding `Bash(gh pr create *)`. State the preference: prefer the **MCP tool**, per the protocol's own "prefer the allowed GitHub MCP tools over `gh` when one fits" rule, which also sidesteps the heredoc-in-a-compound-command shape in Phase 3 above that the no-pipes/no-compound rule makes fragile.
+
+**Body content**: unchanged from Phase 2/3 above, plus a **kind-branched implementation-report lookup** — this is what the "Implementation report (if `piv-implement-issue` wrote one — `.claude/reports/<…>-report.md`)" lookup becomes once a feature fork exists alongside this one:
+
+| ticket kind | report path folded into the PR body | approved artifact linked under `## Linked` |
+|---|---|---|
+| bug | `docs/issues/reports/<ENG-ID>-fix-report.md` | the RCA, `docs/issues/issue-<ENG-ID>.md` |
+| feature | `docs/plans/reports/<ENG-ID>-<slug>-report.md` | the plan, `docs/plans/<ENG-ID>-<slug>.md` |
+
+Both are resolvable the same deterministic way — anchored on the ENG id at a fixed relative path — and **both are committed by `/piv-commit` inside the same act**, so the lookup never races an unwritten file. `<slug>` is the plan file's own slug, so the report name is derivable from the plan path with a suffix, not from a second convention. Keep `Part of ENG-<id>`, never `Fixes`/`Closes`/`Resolves`, for both.
+
+**Multi-repo** (above): unchanged headlessly — one PR per touched repo, cross-linked, merge order stated. Every URL goes into the act's `pr_urls`.
+
+**Output**: return PR number + URL + base←head to the caller. Do **not** print the interactive "run `piv-review-pr`" handoff as an instruction — the orchestrator dispatches that as its own act from the `piv-review-pending` state.
+
+`docs/plans/` **is tracked** in the work repo, so it exists in any fresh worktree — unlike `docs/issues/`, which needs creation for the bug path. `docs/plans/reports/` is new and does not exist in HEAD, for whichever fork writes to it first: create it before writing, same as `docs/issues/`.
+
+Never `main`, never a direct push to `dev` itself, never a merge call — nothing here loosens those limits.

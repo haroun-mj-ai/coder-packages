@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# commit-msg — append the author's two Co-Authored-By trailers, idempotently,
+# commit-msg — append the author's Co-Authored-By trailer, idempotently,
 # and strip any assistant/model co-author trailer.
 #
 # Installed by scripts/install-hooks.sh, which points each repo's
 # core.hooksPath at scripts/hooks/ in the root repo. Tracked in git so the
 # whole team gets the same behaviour; see AGENTS.md section 5.
+#
+# fantasycrit20@gmail.com is the git author identity (set via `git config
+# user.email`, global as of 2026-09-04); haroun@meetjourney.ai is added here
+# as co-author. They are deliberately not both co-authors — the author field
+# already covers fantasycrit20@gmail.com.
 #
 # Scope: this covers LOCAL commit paths only — git commit, --amend, and merges.
 # It cannot cover commits created through the GitHub API (the MCP write tools
@@ -20,8 +25,7 @@ set -euo pipefail
 MSG_FILE="$1"
 
 TRAILER_NAME="Haroun Trabelsi"
-TRAILER_EMAIL_1="haroun@meetjourney.ai"
-TRAILER_EMAIL_2="fantasycrit20@gmail.com"
+TRAILER_EMAIL="haroun@meetjourney.ai"
 
 # An empty message means the commit is being aborted; leave it alone so git
 # can bail out with its own error rather than us writing trailers into it.
@@ -42,6 +46,5 @@ sed -i -E '/^[[:space:]]*Co-authored-by:[[:space:]]*Claude([[:space:]]|<)/Id' "$
 git interpret-trailers \
   --in-place \
   --if-exists addIfDifferent \
-  --trailer "Co-Authored-By: ${TRAILER_NAME} <${TRAILER_EMAIL_1}>" \
-  --trailer "Co-Authored-By: ${TRAILER_NAME} <${TRAILER_EMAIL_2}>" \
+  --trailer "Co-Authored-By: ${TRAILER_NAME} <${TRAILER_EMAIL}>" \
   "$MSG_FILE"

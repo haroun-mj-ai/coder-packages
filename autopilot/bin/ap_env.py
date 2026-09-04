@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """ap_env.py -- read/write $AP_HOME/env's KEY=value lines (the autopilot
 budget/concurrency knobs: AP_MAX_ISSUES_PER_DAY, AP_MAX_DAY_COST_USD,
-AP_MAX_WEEK_COST_USD, AP_BUILD_SLOTS, AP_SHIP_SLOTS, AP_LIMIT_COOLDOWN_MIN).
+AP_MAX_WEEK_COST_USD, AP_PLAN_SLOTS, AP_BUILD_SLOTS, AP_SHIP_SLOTS,
+AP_LIMIT_COOLDOWN_MIN).
 
 The ONE shared implementation of that read-modify-write -- `ap limits`
 (bash) shells out to this, `ap sessions`'s [L]imits action imports it
@@ -17,6 +18,7 @@ LIMIT_FIELDS = [
     ("AP_MAX_ISSUES_PER_DAY", "issues/day"),
     ("AP_MAX_DAY_COST_USD", "cost/day ($)"),
     ("AP_MAX_WEEK_COST_USD", "cost/week ($, informational)"),
+    ("AP_PLAN_SLOTS", "plan slots (clamped 1-4)"),
     ("AP_BUILD_SLOTS", "build slots (clamped 1-4)"),
     ("AP_SHIP_SLOTS", "ship slots (clamped 1-6)"),
     ("AP_LIMIT_COOLDOWN_MIN", "usage-limit cooldown (min)"),

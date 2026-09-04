@@ -28,7 +28,11 @@
 # pre-act state there instead of dead-ending at `failed`). A resumed act
 # that FAILs for an external cause here dead-ends at `failed` like any
 # other failure; `ap retry` is the fallback, same as this pipeline's
-# behavior before that logic existed.
+# behavior before that logic existed. This known gap now also covers the
+# piv bug phases (investigate/re-investigate/fix/review) and the piv
+# feature phases (design/redesign/build) sharing this same DONE branch --
+# widening those phases into this script does not close the gap, it just
+# means more phases inherit it.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
@@ -288,6 +292,37 @@ if [[ -z "$window" ]] || ! window_alive "$window"; then
   exit 0
 fi
 
+# Superseded-parked-entry check -- BEFORE acquiring any lane or per-issue
+# lock, and before touching the window at all beyond the alive-check above.
+# A parked registry entry's only valid live meaning is "this ticket is
+# sitting at needs-input, waiting on exactly this question." If the ticket
+# has since moved to any other state -- because a human answered via `ap
+# reply` and the resumed act already ran to completion, because a manual
+# tmux-attach reply already got the act moving, or because the act finished
+# on its own -- this window and its registry entry are stale leftovers, not
+# something to resume. Cleaning that up is pure housekeeping (kill a window,
+# delete a JSON file): it touches no worktree and conflicts with nothing a
+# live act for the same issue is doing, so it must NOT wait on
+# lock.issue.$eng_id -- that lock is what a genuinely live act legitimately
+# holds for however long its own phase takes, and requiring it here is
+# exactly the bug that let a superseded park sit for 45+ minutes while a
+# real implement (and then ship) act ran, and then made THIS script itself
+# hang forever once the lock finally freed: with no reply text to inject and
+# a status.json that will never again change, the resume-and-poll loop
+# below has no way to ever observe a "new" status and no reason for the
+# window to die on its own, so it polls in an unbounded loop, holding the
+# lane slot hostage until something external kills the window. Caught live
+# on ENG-1549 on 2026-09-04: the plan lane was pinned for 10+ minutes with
+# no way out short of manually killing the stale window.
+ticket_json="$(python3 "$QUEUE_PY" --ap-home "$AP_HOME" get "$eng_id" 2>/dev/null)"
+ticket_state="$(json_field "$ticket_json" ".state")"
+if [[ -z "$ticket_json" || "$ticket_json" == "null" || "$ticket_state" != "needs-input" ]]; then
+  log "parked entry for $eng_id is superseded (ticket state is '${ticket_state:-gone}', not needs-input) -- tearing down $window and clearing the registry without touching any lane/issue lock"
+  tmux kill-window -t "$AP_TMUX_SESSION:$window" 2>/dev/null || true
+  rm -f "$registry_file"
+  exit 0
+fi
+
 # Same session throughout every park/resume cycle -- resolved once here (not
 # trusted from the registry, which historically hardcoded this to null) and
 # reused for both re-parking (so session_id survives a re-park) and this
@@ -301,7 +336,12 @@ model="$(model_for_session "$session_id")"
 acquired_lock_file=""
 case "$lane" in
   plan)
-    lane_free "$AP_HOME/lock.plan" && acquired_lock_file="$AP_HOME/lock.plan"
+    for ((n = 1; n <= AP_PLAN_SLOTS; n++)); do
+      if lane_free "$(plan_lock_file "$n")"; then
+        acquired_lock_file="$(plan_lock_file "$n")"
+        break
+      fi
+    done
     ;;
   build)
     for ((n = 1; n <= AP_BUILD_SLOTS; n++)); do
@@ -315,6 +355,14 @@ case "$lane" in
     for ((n = 1; n <= AP_SHIP_SLOTS; n++)); do
       if lane_free "$AP_HOME/lock.ship.$n"; then
         acquired_lock_file="$AP_HOME/lock.ship.$n"
+        break
+      fi
+    done
+    ;;
+  review)
+    for ((n = 1; n <= AP_REVIEW_SLOTS; n++)); do
+      if lane_free "$AP_HOME/lock.review.$n"; then
+        acquired_lock_file="$AP_HOME/lock.review.$n"
         break
       fi
     done
@@ -416,17 +464,68 @@ teardown_window() {
 case "$final_status" in
   DONE)
     rm -f "$registry_file"
-    if [[ "$phase" == "ship" ]]; then
+    if [[ "$phase" == "ship" || "$phase" == "review" ]]; then
       teardown_window "$window"
       pr_urls="$(json_join "$status_json" ".pr_urls")"
       ap-notify.sh "ready to test: $eng_id" "${pr_urls:-see ap sessions}" || true
-    elif [[ "$phase" == "plan" || "$phase" == "replan" ]]; then
+    elif [[ "$phase" == "plan" || "$phase" == "replan" || "$phase" == "investigate" || "$phase" == "re-investigate" || "$phase" == "design" || "$phase" == "redesign" ]]; then
       teardown_window "$window"
-      ap-notify.sh "plan ready for review: $eng_id" "\`ap approve $eng_id\` to build, \`ap reply $eng_id \"...\"\` = feedback" || true
+      # Same "artifact ready for review" notify shape for every drafting
+      # phase across both the legacy pipeline (plan/replan), the piv bug
+      # pipeline (investigate/re-investigate -> an RCA), and the piv feature
+      # pipeline (design/redesign -> a design doc) -- generalized to
+      # whichever artifact this phase actually produced and to whichever
+      # verb `ap approve` triggers next for that kind.
+      case "$phase" in
+        investigate | re-investigate)
+          artifact_label="RCA"
+          next_verb="fix"
+          ;;
+        design | redesign)
+          artifact_label="design"
+          next_verb="build"
+          ;;
+        *)
+          artifact_label="plan"
+          next_verb="build"
+          ;;
+      esac
+      ap-notify.sh "$artifact_label ready for review: $eng_id" "\`ap approve $eng_id\` to $next_verb, \`ap reply $eng_id \"...\"\` = feedback" || true
+    elif [[ "$phase" == "fix" || "$phase" == "build" ]]; then
+      # Mirrors ap-cycle.sh's own fix|build DONE arm -- required, not
+      # unreachable. At park time (ap-cycle.sh's NEEDS_HUMAN branch) the
+      # ticket's state was set to needs-input, not piv-implementing; neither
+      # the fix skill nor the build skill ever writes its own terminal
+      # ticket state (that write is wrapper-owned); and a *resumed* fix/build
+      # act's DONE is reconciled here, in ap-resume.sh, and nowhere else.
+      # Without this arm the ticket strands at needs-input permanently: no
+      # decider tier claims needs-input without a feedback field, and
+      # needs-input is not in sweep_stale's tuple, so there is no backstop
+      # either. The gap this closes for fix applies identically to build, by
+      # exactly the same reasoning, which is why the arm is widened to
+      # fix|build now rather than left fix-only for a later fork to discover
+      # missing a second time.
+      queue_set --state piv-review-pending --event "$phase done (resumed), PR open -> review pending"
+      teardown_window "$window"
+      ap-notify.sh "review pending: $eng_id" "PR open; will review automatically next cycle" || true
     elif [[ "$phase" == "implement" ]]; then
       # Same chain ap-cycle.sh's own implement arm runs: swap building ->
       # shipping, ping, then dispatch the ship phase in a NEW window on the
       # SAME slot -- this act's own window is done, ship gets its own.
+      #
+      # INERT as of the piv bug/feature forks: legacy `plan`/`implement`/
+      # `ship` tickets are the only ones that ever reach this arm, and the
+      # piv pipelines (bug and feature alike) never dispatch an `implement`
+      # phase at all -- their build-phase skills (`fix`/`build`) open their
+      # own PR and hand off to a standalone `review` phase claimed by an
+      # ordinary cycle, not chained from here. This is arguably the most
+      # intricate code in this file (a nested launch-and-wait with its own
+      # ledger row, its own park/teardown, and the fragile
+      # `act_build_${acquired_lock_file##*.}_...` window-name derivation
+      # below) and its growing unreachability is itself the strongest
+      # argument for a future cleanup plan to delete it outright. Left
+      # exactly as-is, not generalized, not deleted, per both piv plans'
+      # explicit instruction.
       queue_set --state shipping --event "implement done, PR open -> shipping"
       ap-notify.sh "shipping: $eng_id" "implement done, PR open, waiting on CI" || true
       teardown_window "$window"
@@ -461,10 +560,31 @@ case "$final_status" in
             ;;
         esac
       fi
+    else
+      # Catch-all: an unrecognized phase on a *resumed* act's DONE must not
+      # silently no-op (no state write, no notify, no window teardown) --
+      # the same gap ap-cycle.sh's own reconcile task closes for its DONE
+      # branch's unmatched-$final_phase case. Fail closed and loud, mirroring
+      # `ap retry`'s existing REQUEUE_STATE-miss pattern, rather than leaving
+      # the ticket in whatever state it was already in with no trace this
+      # ever ran.
+      teardown_window "$window"
+      unrecognized_question="unrecognized phase '${phase:-unknown}' in ap-resume.sh's DONE branch -- routing unknown, needs a human decision"
+      queue_set --state needs-input \
+        --field "question=$(printf '%s' "$unrecognized_question" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')" \
+        --field "phase_at_question=\"${phase:-unknown}\"" \
+        --event "needs input (unrecognized DONE phase '${phase:-unknown}')"
+      ap-notify.sh "autopilot needs input: $eng_id" "$unrecognized_question" || true
     fi
     ;;
 
   NEEDS_HUMAN)
+    # Already phase-agnostic -- verified: this branch derives everything from
+    # $phase generically (the `phase_at_question` field and the re-park call
+    # below) rather than branching on specific phase names, so it needs no
+    # change for the piv bug (investigate/re-investigate/fix/review) or piv
+    # feature (design/redesign/build) phases sharing this reconcile. Confirmed
+    # by reading, so nobody adds a redundant branch here.
     question="$(json_field "$status_json" ".question")"
     queue_set --state needs-input \
       --field "question=$(printf '%s' "$question" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')" \
@@ -480,7 +600,10 @@ case "$final_status" in
     # FAILED (including "window disappeared mid-resume", which defaults
     # here since final_status was seeded FAILED when status_file is
     # missing). See this file's header for what's deliberately NOT
-    # replicated (external-failure requeue classification).
+    # replicated (external-failure requeue classification). Already
+    # phase-agnostic -- verified: no branch here depends on $phase, so it
+    # needs no change for the piv bug or piv feature phases either.
+    # Confirmed by reading, so nobody adds a redundant branch here.
     rm -f "$registry_file"
     teardown_window "$window"
     stdout_tail="transcript output isn't captured for a resumed persistent act; see $window's transcript via ap tail if it still exists"

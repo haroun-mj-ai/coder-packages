@@ -504,6 +504,17 @@ Execute every command to ensure zero regressions and 100% feature correctness.
 
 <No fixed shape. Reason freely here: alternatives you weighed and rejected and why, a tradeoff matrix, a sequencing or rollout risk, a data-flow sketch, open threads, links — whatever serves the plan. The sections above template the plan's *shape* so the trifecta and the implementation agent can consume it; this section keeps your *reasoning* unconstrained. Prose, lists, tables, code blocks all welcome.>
 
+## ADVERSARIAL REVIEW — red-team, guard-touching plans only
+
+<Filled by Phase 5d. **Trigger**: fired / did not fire — <which guard class this plan changes, or
+why none applies>. A did-not-fire record is mandatory: a missing section is indistinguishable from a
+skipped step.
+
+If fired: verdict (`ship` / `ship with the named additions` / `do not ship as specified`) ·
+must-stay-fatal list with how each is preserved · discriminator attack · replay result (or "rows
+unobtainable — recorded as a finding") · blast radius, enumerated call sites · already-solved check ·
+what changed in the tasks above as a result.>
+
 ## PLAN AUDIT — independent model, before this plan is considered done
 
 <Filled by Phase 5b below, run right after this plan is first drafted. Verdict: SOUND / SOUND WITH FIXES / DO NOT
@@ -558,8 +569,10 @@ direction); it's Codex **drafting its own independent approach from the same evi
 proposed — the generative role the research shows is fine, paired with Claude doing the judging, which is the
 direction that actually lifts quality:
 
-Use `codex-delegate`'s `--read-only` mode (the `review-debate` lane already configured) — its own docs describe
-exactly this recipe: a clean second opinion with no write risk.
+Use `codex-delegate`'s `--read-only` mode, the `plan-debate` lane (`gpt-5.6-sol`, effort `max` — this project's
+default for every Codex lane; `plan-debate` names the *job*, challenging a drafted plan, separately from
+`review-debate`'s code-review job, even though they currently run the same model) — its own docs describe exactly
+this recipe: a clean second opinion with no write risk.
 
 ```xml
 <task>
@@ -578,7 +591,7 @@ touch.
 ```
 
 ```bash
-node "<codex-delegate skill-dir>/scripts/relay.mjs" --brief brief.txt --cd <repo path> --lane review-debate --read-only
+node "<codex-delegate skill-dir>/scripts/relay.mjs" --brief brief.txt --cd <repo path> --lane plan-debate --read-only
 ```
 
 `--read-only` means nothing to review/land — just read `result.json`'s `finalMessage`. Then **you** (not another
@@ -588,6 +601,43 @@ a genuinely better idea in Codex's version (graft it into the plan, record what 
 weaker/misses something the opus draft already handles (say so, don't graft it just because a second model
 produced it). Record the comparison in the plan's new **APPROACH COMPARISON** section below — including a
 skipped Phase 5c (Low-complexity), so the skip itself is auditable.
+
+### Phase 5d: Red-team the plan — ONLY when it touches a guard
+
+**Conditional. Skip it and say so unless the trigger below fires** — an unconditional extra critic pass on
+every ticket is the review-swarm this pipeline deliberately avoids, and it is not free.
+
+**Trigger — fires when the plan changes the behaviour of any of** (verbatim from
+`implement-issue/SKILL.md:360-365`): a verifier or postcondition, a validator, a dispatcher/entry gate, a cap
+or budget check, a permission or entitlement check, a dedupe/idempotency key, a retry or fallback branch, or a
+default that decides whether work happens at all. Classify from the plan's own `New Files to Create` /
+`STEP-BY-STEP TASKS` file list and its `IMPLEMENTATION PLAN` phases; **when genuinely uncertain, run it.**
+
+**Why this exists and Phase 5b does not cover it.** `plan-critic` asks *"are the plan's claims true?"*. That is
+a different question from *"what does this change now let through?"*, and a plan can pass the first while
+failing the second completely — the ENG-1406 case recorded at `implement-issue/SKILL.md:370-377`, where every
+claim was independently verified and correct and the plan was still wrong. Phase 5c (Codex's second draft)
+does not cover it either: Codex proposes an *alternative approach*, it does not attack the chosen one's blast
+radius.
+
+Dispatch a **fresh** `Agent` carrying `/red-team`'s rubric (model `fable` or `opus`, effort matching Phase 1's
+Estimated Complexity), given: the change stated as a behaviour delta (`/red-team` §0: *"after this change, X
+will happen where Y happened before"*), the guard's current code and tests, and **explicitly not the plan's
+own argument for why the change is right**. Require back the same five items `implement-issue`'s step 7b
+requires: must-stay-fatal list, discriminator attack, replay, blast radius (enumerated call sites, not an
+estimate), already-solved check.
+
+Fold findings into the plan's new `## Adversarial review` section (next task), **including a recorded
+non-firing trigger, so every skip is auditable**. Verdict routing: `do not ship as specified` → a
+`DO NOT IMPLEMENT`-equivalent, rework before handing the plan off (headless mapping in the headless section).
+`ship with the named additions` → fold the additions into the affected tasks and proceed.
+
+**No `/challenge` step here, and state why in one sentence in the skill**: `/challenge` attacks the provenance
+of a measurement an existing conclusion rests on — an instrument, a window, a population, a proxy. A
+forward-looking implementation plan has no root-cause evidence chain of that shape; its factual claims are
+`file:line` assertions about current code, which Phase 5b's `plan-critic` already re-derives against the real
+repo, and its forward claims are exactly what `/red-team` attacks. Phase 1's bug fork has a `/challenge` step
+because an RCA's 5-Whys chain genuinely can rest on a dashboard figure; a plan's cannot.
 
 ## Output Format
 
@@ -651,6 +701,149 @@ After creating the Plan, provide:
 - Estimated confidence score for one-pass success
 - Phase 5b's audit verdict (`SOUND` / `SOUND WITH FIXES` / `DO NOT IMPLEMENT`) and what it found
 - Phase 5c's outcome if it ran (Medium/High complexity) — corroborated, or what got grafted from Codex's approach
+- Phase 5d's outcome — whether the red-team trigger fired, and if so the verdict (`ship` / `ship with the named
+  additions` / `do not ship as specified`) and what it found; if it did not fire, say so
 - If a Linear ticket was resolved: the kata ref from the mirror step above, and update it now that the plan path
   is known — `kata comment <ref> --message "plan: <path>" --agent` (or fold the path into the ticket body if the
   ref was just created and has no comment yet).
+
+## Headless mode (--headless)
+
+Read `.claude/skills/headless-protocol.md` first — the `status.json` shape, the local queue contract, the
+ask→fallback rule, the Linear footprint are defined once there. This section states only what this skill's own
+ask points map to.
+
+**Phase**: `design` (or `redesign` when `--feedback` is present). `phase_at_question: "design"` on every
+`NEEDS_HUMAN`. Invoked as `/piv-plan-implementation ENG-<id> --headless [--feedback '<text>'] --run-dir <d>`.
+
+**Input is always an existing Linear issue id.** The free-form-description branch of `## Resolve the input
+first` is interactive-only. A headless invocation whose argument does not match `ENG-\d+`, or whose Linear
+fetch returns nothing, is `FAILED` with `detail` naming what was passed — never a plan drafted from a bare id.
+
+**The worktree + branch sections are mandatory, not optional.** `## Multi-repo worktree setup` (`:27-45`) and
+`## Kata mirror` (`:47-64`) each end with a "skip entirely for a free-form/no-ticket plan" escape; **that
+escape never applies headlessly**, because headless input is always a Linear id. Run both unconditionally,
+`--feedback` re-runs included (both are harmless no-ops when repeated). This section is materially lighter
+than Phase 1's equivalent for `piv-investigate-issue` for one reason worth stating: that skill had **no**
+branch discipline at all and the mandate had to be invented; this one already has the right one —
+`wt-eng<id>-<suffix>` worktrees off the right base per repo (`dev` for root/`backend/`/`frontend/`, `main` for
+`assistants/`/`observability/`, confirmed per repo, never assumed), plan written *inside* the root worktree,
+and `work.branch haroun/eng-<id>-<slug>` recorded at `:57`. Headless only removes the opt-out and adds the
+branch cut: create/checkout **`haroun/eng-<id>-<slug>`** in the root worktree before writing anything, so the
+plan commit is on the branch the build act will reuse and rides into that branch's PR — the skill's own
+`piv-implement:22-24` warning ("a plan committed on the base branch won't be in this branch's PR") is the
+reason.
+
+**Never work in the main checkout**, for Phase 1's three verified reasons, unchanged: it is permanently dirty
+and on an unrelated branch, so every downstream dirty-tree and branch heuristic misfires; `AP_BUILD_SLOTS > 1`
+means two acts must never share a checkout; and the `dontAsk` profile only permits
+`git push -u origin haroun/*`.
+
+**Linear claim + kata mirror, first thing**: claim (`assignee: me`, `state: In Progress`) via
+`mcp__linear-server__save_issue`, then `:47-64`'s `kata search "ENG-<id>" --agent` / create with
+`--idempotency-key`, `kata meta set <ref> work.attention ok`, and `work.branch haroun/eng-<id>-<slug>` once the
+branch is cut. This is the only place a feature ticket's Linear claim can happen — `ap-decide.py` has no
+Linear credential. Mirrors Phase 1's `piv-investigate-issue` pattern exactly, including which kata calls
+happen where.
+
+**Ask-point mapping table:**
+
+| ask point | headless resolution | recorded as |
+|---|---|---|
+| **Phase 2's clarifying GATE** (`:152-178`) — "post the questions, then stop. End the turn and wait" | **The skill already has a documented headless-safe fallback and it is used verbatim** (`:176-178`): nobody answers, which is the `If they decline` branch — honour it, and **name every guess**. Each unanswered item becomes an `Assumed — <the assumption>, confirm before execution` line in the plan's `OPEN QUESTIONS / ASSUMPTIONS`, and each affected task carries a `**GOTCHA**` naming it. Never guess silently, and never ask-and-answer in the same breath as if a human had replied. **Not a `NEEDS_HUMAN`** — see the note below the table. **Also override the skill's own interactive kata rule for this specific gate**: `:58-60` sets `kata meta set <ref> work.attention needs-human` for a blocking Phase-2 question, but headless never parks here — keep `work.attention ok` throughout, since the assumptions proceed straight into the plan rather than stopping the act. Applying the interactive kata rule unmodified would leave the ticket's kata signal falsely stuck at `needs-human` while the act itself carries on normally to `piv-draft-review`. | the plan's own `OPEN QUESTIONS / ASSUMPTIONS` section, which becomes the review agenda at `piv-draft-review` |
+| Thin/vague answer handling (`:173-174`) | unreachable headlessly (no answers arrive at all) — the decline branch above covers the whole gate | n/a |
+| Ticket, epic and architecture genuinely settle everything (`:169-171`) | already headless-shaped: say so in one line in the plan and proceed | the plan's one-line statement |
+| Phase 3 external research (`:183-206`) unavailable — `WebSearch` denied or a fetch fails | documented default: **note the gap in the plan and continue**, never stall. Same shape as Phase 1's Codex-denial rule. `WebSearch` is added to the allow list by this plan's permissions task; treat a denial as evidence the profile drifted, not as a failure | `detail` + a line in the plan's `Relevant Documentation` |
+| **Phase 5b `plan-critic` returns `DO NOT IMPLEMENT`** (`:537-539`) | the skill's own default: **rework once and re-audit**. If the second audit is still `DO NOT IMPLEMENT` → **`NEEDS_HUMAN`**. Never paper over it, never proceed anyway | `question` = the verdict plus the single most load-bearing finding; the full audit lives in the plan's `PLAN AUDIT`; kata `work.attention needs-human` |
+| Phase 5c Codex second draft fails / `codex_unavailable` / denied (`:550-592`) | documented default: note it in `APPROACH COMPARISON` ("second draft unavailable — <reason>") and proceed. A bonus check, not a gate — same as Phase 1's treatment of the investigate act's Codex corroboration | `APPROACH COMPARISON` + `detail` |
+| **Phase 5d red-team `do not ship as specified`** | **`NEEDS_HUMAN`** — never a silent override, exactly as Phase 1 maps `piv-investigate-issue`'s step-7 verdicts | `question` = the verdict plus the must-stay-fatal case the plan does not preserve; findings live in `ADVERSARIAL REVIEW`; kata `needs-human` |
+| `/worktree-create` fails, or the base branch cannot be confirmed for a repo | `FAILED`, `detail` = the failing command and its stderr. The remedy is git work at a terminal, which the `ap reply` channel cannot express | `detail` |
+| Linear ticket has an empty body **and** no comments **and** no parent epic | `FAILED`, `detail: "nothing to plan from"`. This is the one line between "proceed with `Assumed —` lines" and "draft a guess pyramid": *some* information → proceed; *zero* → fail fast | `detail` |
+
+**Does a `piv-plan-implementation` run ever legitimately reach `NEEDS_HUMAN`? Yes — but never from the
+clarifying gate.** State this explicitly, because it is the question a reader will arrive with. Exactly two
+park points exist: a twice-`DO NOT IMPLEMENT` audit, and a `do not ship as specified` red-team verdict. Both
+are *a critic on a different model lineage saying this plan should not be built*, which is precisely the class
+of judgment a human owns.
+
+The clarifying gate is **not** one of them, and the reason is structural rather than a preference: the
+questions the skill would have asked interactively do not disappear — they become `Assumed —` lines in the
+plan's own `OPEN QUESTIONS / ASSUMPTIONS` section, and that plan then goes to `piv-draft-review`, where a human
+reads it and can `ap approve` or `ap reply '<answers>'` before **a single line of code is written**. The
+approval gate *is* the clarifying interview, deferred by one hop and made asynchronous. Parking at the gate
+instead would spend a `needs-input` park to ask the same questions the approval gate is about to surface
+anyway, and would cost a whole re-dispatch to resume. State the one condition this rests on: **it is safe only
+because the `piv-draft-review` gate exists.** If a future change ever auto-approves plans by default, this
+mapping must be revisited.
+
+**Phase 5b and 5c run headlessly, unchanged.** Both are read-only sub-agent dispatches with no human ask point
+of their own — 5b is an `Agent(subagent_type: "plan-critic", model: "fable")` call; 5c is
+`node "<codex-delegate skill-dir>/scripts/relay.mjs" --brief brief.txt --cd <repo> --lane plan-debate
+--read-only`, which writes nothing. Keep the `fable` model override on 5b (running the audit on the family
+that drafted the plan defeats it) and keep 5c's read-only mode. Two headless-specific rules: **(a)** run 5c as
+a **blocking foreground** command despite `codex-delegate`'s usual background advice — backgrounding across a
+turn boundary is fatal under the protocol's never-background rule, and 5c at `effort: max` can run 10-20
+minutes; **(b)** `Bash(node *)` is required and is added by Phase 1's permissions task — a denial means
+"second draft unavailable", not a failure.
+
+**Plan output path — headless overrides `## Output Format`.** `.claude/plans/{kebab-case-name}.md`
+(`:594-601`) is interactive-only. Headless writes **`docs/plans/<ENG-ID>-<slug>.md`** in the root worktree,
+e.g. `docs/plans/ENG-1400-insights-date-filter.md`. Four reasons, all verifiable, and worth stating in the
+skill because each is a trap:
+
+- **`.claude/plans/` is untracked in the work repo** (verified: `git status --porcelain .claude` prints
+  `?? .claude/plans/`). Writing there creates exactly the dirty-tree condition `piv-create-pr`'s "Uncommitted
+  changes → STOP" precondition fires on, two phases later. This is the same trap Phase 1 found for
+  `.claude/reports/` and solved the same way.
+- **The plan must be committed anyway.** The build act is a different session, potentially hours later, in a
+  different process; it reads the plan from disk. An uncommitted plan is unreadable to it and leaves the
+  design act's worktree dirty.
+- **`docs/plans/` is this repo's real convention and is tracked** (verified: ~60 committed files, and it is
+  where both this plan and Phase 1 live). It therefore exists in every fresh worktree, needing no `mkdir`.
+- **ENG-id-anchored-at-position-zero makes it deterministically resolvable**, which is what `ap-decide.py`'s
+  new resolver needs and what keeps it out of `resolve_plan_path`'s substring hazard.
+
+Note the deliberate divergence: the directory's existing files are date-prefixed (`YYYY-MM-DD-<slug>.md`).
+Headless plans are **not**, so that (a) a resolver can anchor on `^<ENG-ID>-` with a trailing hyphen — which is
+what makes `ENG-123` not match `ENG-1234-foo.md` — and (b) a piv plan is distinguishable from a legacy
+`implement-issue` plan for the same ticket by filename shape alone, which matters during the coexistence
+window. Interactive runs keep `.claude/plans/`; nothing about the interactive contract changes.
+
+**Commit the plan before the queue write**, on the ticket's branch in the root worktree. Same discipline the
+legacy plan phase already has (`implement-issue/SKILL.md:1202-1204`) and Phase 1's investigate act mirrors.
+
+**End state**: after the commit, one write —
+
+```bash
+python3 "$QUEUE_PY" --ap-home "$AP_HOME" set <ENG-ID> --state piv-draft-review \
+  --field artifact_path=/absolute/path/to/docs/plans/<ENG-ID>-<slug>.md \
+  --event "plan ready for review"
+```
+
+then `status.json` with `status: DONE`, `phase: "design"`, `artifact_path` = the plan path, `detail` = the
+Phase 5b verdict + whether 5c ran + whether 5d fired + the confidence score. Carry Phase 1's emphatic warning
+verbatim in shape: **without this write the ticket never leaves `piv-drafting` and the pipeline stalls after
+every plan** — do not skip it, and do not reorder it before the commit lands.
+
+**`--feedback '<text>'`**: treat as the human's answers to the plan's `OPEN QUESTIONS / ASSUMPTIONS` and/or a
+change of direction — not a mechanical correction. Revise the plan **in place** (same file, same branch, a new
+commit), convert every now-answered `Assumed —` line into a settled decision, and **re-run Phase 5d's trigger
+against the revision** — a revised approach can newly touch a guard. Re-run 5b if the revision changed any
+task's file list. Then re-record `artifact_path` and write `DONE` as above. Phase is `redesign`.
+
+- **PATTERN**: `implement-issue/SKILL.md:1160-1231` (`--phase plan`) — structurally a template: input rule,
+  claim + kata, ask table, artifact commit, end-state write, `--feedback` handling. And Phase 1's
+  `piv-investigate-issue` headless section for how that template was already adapted into a `piv-*` skill.
+- **GOTCHA**: `$ARGUMENTS` under a slash invocation is the **whole** argument string
+  (`ENG-1400 --headless --run-dir /x`), not just the ticket id. The `## Resolve the input first` section must
+  extract the `ENG-\d+` token rather than treating `$ARGUMENTS` as one opaque input. Same hazard
+  `piv-implement`'s `--plan` has.
+- **GOTCHA**: Phase 4 dispatches `Agent(subagent_type: "Plan", model: "opus", effort: "high")` and the act's
+  own pinned model is `opus` — the sub-agent dispatch is unaffected by the act's model pin and stays as
+  written.
+- **GOTCHA**: The act runs on the **plan lane with no ports**. This skill starts no dev servers and must not;
+  if a future revision adds one, it needs the `--ports` treatment `piv-implement` gets, and the plan lane has
+  no port pair to give it.
+- **GOTCHA**: `mcp__linear-server__save_comment` is not on the allow list — this skill's `## Report` step
+  suggests a kata comment, which is fine (`Bash(kata *)` is allowed), but **never** a Linear comment. Phase 1's
+  Linear-footprint rule applies unchanged.

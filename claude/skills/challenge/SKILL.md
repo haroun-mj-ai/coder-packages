@@ -167,3 +167,39 @@ a reviewer is not.
 
 **Before any number becomes a decision: where did it come from, what shipped
 during it, and does it mean what I think it means?**
+
+---
+
+## Headless mode (`--headless`)
+
+Read `.claude/skills/headless-protocol.md` first — the `status.json` shape,
+the local queue contract, the ask→fallback rule, the Linear footprint are
+defined once there. This section states only what applies when this skill
+runs as a sub-agent under a headless caller.
+
+**You are never dispatched as a headless act.** You run as a sub-agent inside
+one (today: `piv-investigate-issue`'s step 7, and `implement-issue`'s step 7b
+for red-team). You write **no** `status.json` and **no** queue entry — you
+return your report to the caller, which owns both.
+
+**Never ask.** There is nobody to ask. Where the rubric would ask for data,
+take the documented default: **report the gap as a finding**.
+
+**Data access is usually restricted.** The `dontAsk` profile is path-scoped
+and allows no database read tools and no piped commands. So: §1's ledger
+spot-check and §4's positive control will frequently be unobtainable. When
+they are, say **"could not obtain the rows"** and treat that as the finding —
+never reason around the missing replay and never present an un-run replay as
+a passed one. This is the same rule `implement-issue/SKILL.md:388-390`
+already applies to red-team's replay.
+
+**Never write to the repo, never push, never post to Linear or a PR.** Your
+output is prose returned to the caller; the caller decides where it lands
+(for the bug path: the RCA's `## Adversarial review` section).
+
+**Verdict wording is load-bearing** — the caller branches on it mechanically.
+Use exactly §8's own vocabulary: `stands` / `stands with caveats` / `does not
+survive`. A near-miss phrasing is unroutable.
+
+**A critic finding nothing is a real result** — §7 already says this. Record
+what was checked. Do not manufacture a finding to look useful.

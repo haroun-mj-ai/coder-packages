@@ -278,7 +278,7 @@ ensure_managed_block "$BASHRC" "$BLOCK_START" "$BLOCK_END" "$BLOCK_BODY" \
 AP_WORK_REPO="${AP_WORK_REPO:-/home/coder/root-for-local}"
 SKILLS_SRC_DIR="$ROOT_DIR/claude/skills"
 SKILLS_DEST_DIR="$AP_WORK_REPO/.claude/skills"
-SKILL_NAMES=(plan-issue implement-plan implement-issue ship-work daily-brief test-issue autopilot-protocol.md)
+SKILL_NAMES=(plan-issue implement-plan implement-issue ship-work daily-brief test-issue autopilot-protocol.md headless-protocol.md piv-investigate-issue piv-implement-issue piv-commit piv-create-pr piv-review-pr babysit-pr debate-review red-team challenge codex-delegate piv-validate worktree-create piv-plan-implementation piv-implement)
 
 if [[ ! -d "$AP_WORK_REPO/.git" ]]; then
   report MISSING "$AP_WORK_REPO is not a git checkout (skipping autopilot skills wiring)"
@@ -331,7 +331,24 @@ else
 .claude/skills/implement-issue
 .claude/skills/ship-work
 .claude/skills/daily-brief
-.claude/skills/autopilot-protocol.md"
+.claude/skills/test-issue
+.claude/skills/autopilot-poll
+.claude/skills/autopilot-protocol.md
+.claude/skills/headless-protocol.md
+.claude/skills/piv-investigate-issue
+.claude/skills/piv-implement-issue
+.claude/skills/piv-commit
+.claude/skills/piv-create-pr
+.claude/skills/piv-review-pr
+.claude/skills/babysit-pr
+.claude/skills/debate-review
+.claude/skills/red-team
+.claude/skills/challenge
+.claude/skills/codex-delegate
+.claude/skills/piv-validate
+.claude/skills/worktree-create
+.claude/skills/piv-plan-implementation
+.claude/skills/piv-implement"
 
   ensure_managed_block "$EXCLUDE_FILE" "$EXCLUDE_START" "$EXCLUDE_END" "$EXCLUDE_BODY" \
     "$EXCLUDE_FILE autopilot skills block"

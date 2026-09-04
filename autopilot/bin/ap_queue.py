@@ -24,10 +24,18 @@ import sys
 import time
 
 STATES = {
-    "queued", "planning", "plan-review", "needs-input", "building",
-    "shipping", "ship-pending", "ready-to-test", "failed", "done",
+    # shared across both kinds / both pipelines
+    "queued", "needs-input", "ready-to-test", "failed", "done",
+    # legacy feature path (plan/build/ship) -- disjoint from the piv set
+    "planning", "plan-review", "building", "shipping", "ship-pending",
+    # piv (bug and, later, feature-fork) path -- disjoint from the legacy set
+    "piv-drafting", "piv-draft-review", "piv-implementing",
+    "piv-review-pending", "piv-reviewing",
 }
 ENG_ID_RE = re.compile(r"^ENG-\d+$", re.IGNORECASE)
+
+KINDS = {"feature", "bug"}
+DEFAULT_KIND = "feature"
 
 
 def valid_eng_id(s):
@@ -93,7 +101,14 @@ def write_ticket(ap_home, eng_id, entry):
 def list_queue(ap_home, state=None):
     """Every ticket, optionally filtered by state, oldest-first by seq --
     drop-in replacement for list_issues(repo, label=...)'s oldest-first-by-
-    issue-number ordering."""
+    issue-number ordering.
+
+    `state` may be a single state string (existing behavior, unchanged) or
+    an iterable of state strings, to let a caller scan both forks' states
+    in one fair, seq-ordered pass."""
+    states = None
+    if state is not None:
+        states = {state} if isinstance(state, str) else set(state)
     out = []
     for p in glob.glob(os.path.join(_queue_dir(ap_home), "*.json")):
         try:
@@ -101,7 +116,7 @@ def list_queue(ap_home, state=None):
                 entry = json.load(f)
         except (OSError, json.JSONDecodeError):
             continue
-        if state and entry.get("state") != state:
+        if states and entry.get("state") not in states:
             continue
         out.append(entry)
     out.sort(key=lambda e: e.get("seq", 0))
@@ -113,7 +128,22 @@ def append_history(entry, event, actor="autopilot"):
         {"ts": _now(), "event": event, "actor": actor})
 
 
-def new_ticket(ap_home, eng_id, note="", auto_approve=False, actor="human"):
+def ticket_kind(entry):
+    """A ticket file written before `kind` existed reads as `feature`,
+    which is the intended back-compat -- every ticket on disk before this
+    field existed ran the feature path. A *present but invalid* value
+    ("Bug", "BUG", a stray `true`/`1` from a hand-edit or a future bug in
+    `ap queue`'s own parsing) is validated against KINDS rather than just
+    checked for truthiness -- it is truthy today and would otherwise pass
+    through as itself, silently failing every `== "bug"` check and running
+    a bug ticket through the feature-plan path, which has no root-cause
+    diagnosis step."""
+    value = entry.get("kind")
+    return value if value in KINDS else DEFAULT_KIND
+
+
+def new_ticket(ap_home, eng_id, note="", auto_approve=False, kind="feature",
+               actor="human"):
     entry = {
         "eng_id": eng_id,
         "state": "queued",
@@ -122,16 +152,21 @@ def new_ticket(ap_home, eng_id, note="", auto_approve=False, actor="human"):
         "updated_at": _now(),
         "note": note or "",
         "auto_approve": bool(auto_approve),
+        # the piv fork's artifact -- a committed RCA for a bug, a committed
+        # implementation plan for a feature -- resolved kind-specifically
+        # by the decider; `plan_path` stays for the inert legacy path only.
+        "kind": kind if kind in KINDS else DEFAULT_KIND,
         "pending_approval": False,
         "feedback": None,
         "phase_at_question": None,
         "question": None,
         "plan_path": None,
+        "artifact_path": None,
         "pr_urls": [],
         "feedback_seq": 0,
         "history": [],
     }
-    append_history(entry, "queued", actor)
+    append_history(entry, f"queued ({entry['kind']})", actor)
     write_ticket(ap_home, eng_id, entry)
     return entry
 
@@ -141,7 +176,11 @@ def force_state(ap_home, eng_id, state, event=None, actor="human"):
     if it doesn't already exist -- backs `ap sessions`' direct status-change
     action, including marking a stale ledger-only row (one with no queue
     file at all, e.g. an old NEEDS_HUMAN/FAILED outcome the human already
-    resolved by hand outside the pipeline) as done/resolved."""
+    resolved by hand outside the pipeline) as done/resolved.
+
+    Does not guess a `kind` for the created ticket -- the `new_ticket`
+    default (`feature`) is correct here, since a ledger-only row predates
+    classification. Do not later "fix" this into an inference."""
     entry = read_ticket(ap_home, eng_id)
     if entry is None:
         entry = new_ticket(ap_home, eng_id, actor=actor)
@@ -163,7 +202,9 @@ def set_note(ap_home, eng_id, note, actor="human", initial_state=None):
     otherwise-default `queued` -- callers that already know a ledger-only
     row's real historical outcome (done/failed/needs-input) should pass it,
     or editing a note on it would silently flip its displayed status to
-    "queued" as a side effect, which is not what setting a note means."""
+    "queued" as a side effect, which is not what setting a note means.
+
+    Does not guess a `kind` either, for the same reason as force_state."""
     entry = read_ticket(ap_home, eng_id)
     if entry is None:
         entry = new_ticket(ap_home, eng_id, actor=actor)
@@ -178,7 +219,20 @@ def set_note(ap_home, eng_id, note, actor="human", initial_state=None):
 def transition(ap_home, eng_id, mode, event=None, actor="autopilot", **fields):
     """Read-merge-write: apply `fields` (may include `state`), log `event`
     to history. mode='dry-run' returns the would-be entry without writing
-    (mirrors gh_edit/gh_comment's dry-run-vs-claim convention)."""
+    (mirrors gh_edit/gh_comment's dry-run-vs-claim convention).
+
+    `state`, specifically, is validated against STATES before being
+    written: it's a closed, enumerable value space with real downstream
+    consumers (`ap sessions`' status picker, every decider tier,
+    `sweep_stale`) that already assume closure, so a stale or mistyped
+    state name (a typo, a future rename missed in one file) must be loud,
+    not a silent write of a state no tier will ever claim. No other field
+    is validated here -- `**fields` is still applied blindly for
+    everything else, by design."""
+    if "state" in fields and fields["state"] not in STATES:
+        raise ValueError(
+            f"transition({eng_id!r}): refusing to write unknown state "
+            f"{fields['state']!r}; must be one of {sorted(STATES)}")
     entry = read_ticket(ap_home, eng_id)
     if entry is None:
         return None
@@ -235,6 +289,7 @@ def main():
     p.add_argument("eng_id")
     p.add_argument("note", nargs="?", default="")
     p.add_argument("--auto", action="store_true")
+    p.add_argument("--kind", choices=["feature", "bug"], default="feature")
 
     p = sub.add_parser("get")
     p.add_argument("eng_id")
@@ -268,7 +323,8 @@ def main():
         if read_ticket(args.ap_home, args.eng_id) is not None:
             print("%s is already queued" % args.eng_id, file=sys.stderr)
             return 1
-        _print(new_ticket(args.ap_home, args.eng_id, args.note, args.auto))
+        _print(new_ticket(args.ap_home, args.eng_id, args.note, args.auto,
+                          args.kind))
     elif args.cmd == "get":
         entry = read_ticket(args.ap_home, args.eng_id)
         _print(entry)

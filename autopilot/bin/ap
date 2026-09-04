@@ -36,7 +36,8 @@ usage() {
   echo "                 to the first period only. Never edits past ledgers." >&2
   echo "  limits         Show or change the budget/concurrency caps in" >&2
   echo "                 \$AP_HOME/env: --day-issues --day-cost --week-cost" >&2
-  echo "                 --build-slots --ship-slots --limit-cooldown-min." >&2
+  echo "                 --build-slots --ship-slots --review-slots" >&2
+  echo "                 --limit-cooldown-min." >&2
   echo "                 No args prints current values. Persisted to the env" >&2
   echo "                 file (not just this shell) and picked up by the next" >&2
   echo "                 cron tick within a minute -- no restart needed." >&2
@@ -201,6 +202,19 @@ lane_free() {
   return 1
 }
 
+# fmt_age <seconds> -> "34m" / "2h07m" / "?" when unknown. Used for act ages
+# in `ap status`; the queued-ticket ages next to them are formatted the same
+# way by the inline python below, which reads ISO timestamps instead.
+fmt_age() {
+  local secs="${1:-}"
+  [[ "$secs" =~ ^[0-9]+$ ]] || { printf '?'; return 0; }
+  if [[ "$secs" -lt 3600 ]]; then
+    printf '%dm' "$((secs / 60))"
+  else
+    printf '%dh%02dm' "$((secs / 3600))" "$(((secs % 3600) / 60))"
+  fi
+}
+
 cmd_down() {
   local force=false
   [[ "${1:-}" == "--force" ]] && force=true
@@ -222,7 +236,16 @@ cmd_down() {
       lane_free "$AP_HOME/lock.ship.$n" || ship_busy="${ship_busy:+$ship_busy,}ship.$n"
     done
     [[ -n "$ship_busy" ]] && busy="${busy:+$busy,}$ship_busy"
-    lane_free "$AP_HOME/lock.plan" || busy="${busy:+$busy,}plan"
+    local review_busy=""
+    for ((n = 1; n <= AP_REVIEW_SLOTS; n++)); do
+      lane_free "$AP_HOME/lock.review.$n" || review_busy="${review_busy:+$review_busy,}review.$n"
+    done
+    [[ -n "$review_busy" ]] && busy="${busy:+$busy,}$review_busy"
+    local plan_busy=""
+    for ((n = 1; n <= AP_PLAN_SLOTS; n++)); do
+      lane_free "$(plan_lock_file "$n")" || plan_busy="${plan_busy:+$plan_busy,}plan.$n"
+    done
+    [[ -n "$plan_busy" ]] && busy="${busy:+$busy,}$plan_busy"
     if [[ -n "$busy" ]]; then
       echo "refusing: lane(s) busy ($busy) -- an act is running and would be killed." >&2
       echo "use 'ap pause' to stop new work, or 'ap down --force' to kill anyway." >&2
@@ -281,36 +304,131 @@ cmd_status() {
     echo "pause:    running"
   fi
 
-  local busy_slots=0 slot_detail=""
-  for ((n = 1; n <= AP_BUILD_SLOTS; n++)); do
-    if lane_free "$AP_HOME/lock.build.$n"; then
-      slot_detail="${slot_detail:+$slot_detail }slot$n=free"
-    else
-      slot_detail="${slot_detail:+$slot_detail }slot$n=busy"
-      busy_slots=$((busy_slots + 1))
-    fi
-  done
-  echo "build slots: $busy_slots/$AP_BUILD_SLOTS busy ($slot_detail)"
+  # Per-lane slot occupancy. Counting only -- WHICH issue is holding a busy
+  # slot is reported separately, in the "in flight" section below, because a
+  # plan act's tmux window name carries no slot number to join on (see
+  # ap-cycle.sh's window_name_for) and inventing that mapping here would be
+  # a second, drift-prone source of truth.
+  lane_slot_line() {
+    local label="$1" pad="$2" count="$3" lockfn="$4"
+    local n busy=0 detail=""
+    for ((n = 1; n <= count; n++)); do
+      if lane_free "$("$lockfn" "$n")"; then
+        detail="${detail:+$detail }slot$n=free"
+      else
+        detail="${detail:+$detail }slot$n=busy"
+        busy=$((busy + 1))
+      fi
+    done
+    printf "%-${pad}s %s/%s busy (%s)\n" "$label" "$busy" "$count" "$detail"
+    return "$busy"
+  }
+  build_lock_file() { printf '%s/lock.build.%s' "$AP_HOME" "$1"; }
+  ship_lock_file()  { printf '%s/lock.ship.%s'  "$AP_HOME" "$1"; }
+  review_lock_file() { printf '%s/lock.review.%s' "$AP_HOME" "$1"; }
 
+  lane_slot_line "plan slots:"  12 "$AP_PLAN_SLOTS"  plan_lock_file
+  local plan_busy_slots=$?
   # Ship lane's own slot pool (see ap-env.sh's AP_SHIP_SLOTS comment) --
   # capped higher than build because a standalone ship act is almost pure
   # CI-wait, not a build.
-  local ship_busy_slots=0 ship_slot_detail=""
-  for ((n = 1; n <= AP_SHIP_SLOTS; n++)); do
-    if lane_free "$AP_HOME/lock.ship.$n"; then
-      ship_slot_detail="${ship_slot_detail:+$ship_slot_detail }slot$n=free"
-    else
-      ship_slot_detail="${ship_slot_detail:+$ship_slot_detail }slot$n=busy"
-      ship_busy_slots=$((ship_busy_slots + 1))
-    fi
-  done
-  echo "ship slots:  $ship_busy_slots/$AP_SHIP_SLOTS busy ($ship_slot_detail)"
+  lane_slot_line "build slots:" 12 "$AP_BUILD_SLOTS" build_lock_file
+  lane_slot_line "ship slots:"  12 "$AP_SHIP_SLOTS"  ship_lock_file
+  lane_slot_line "review slots:" 12 "$AP_REVIEW_SLOTS" review_lock_file
 
-  if lane_free "$AP_HOME/lock.plan"; then
-    echo "plan lane:   free"
-  else
-    echo "plan lane:   busy"
+  # Who is actually holding those slots. Parsed straight out of the act tmux
+  # window names (window_name_for's one scheme, so there's no second source
+  # of truth), with each act's age taken from its pane process rather than
+  # its lane lock's mtime -- lane_free's own probe opens the lock with `>`,
+  # which truncates and restamps mtime every single cycle, so the lock file
+  # says nothing about how long the act has been running.
+  local win winline in_flight=""
+  while IFS= read -r win; do
+    [[ "$win" == act_* ]] || continue
+    local wlane="" wslot="" wissue="" wphase=""
+    if [[ "$win" =~ ^act_plan_(.+)_([^_]+)$ ]]; then
+      wlane="plan"; wissue="${BASH_REMATCH[1]}"; wphase="${BASH_REMATCH[2]}"
+    elif [[ "$win" =~ ^act_(build|ship|review)_([0-9]+)_(.+)_([^_]+)$ ]]; then
+      wlane="${BASH_REMATCH[1]}"; wslot="${BASH_REMATCH[2]}"
+      wissue="${BASH_REMATCH[3]}"; wphase="${BASH_REMATCH[4]}"
+    else
+      continue
+    fi
+    # Parked acts hold no lane lock and already get their own section below --
+    # but match by the registry entry's OWN recorded window, not just "a
+    # parked file exists for this issue": a superseded parked entry (the
+    # act it describes already finished, but its window/registry weren't
+    # cleaned up yet -- see ap-resume.sh's superseded-entry check) can
+    # coexist with a genuinely different, live window for the SAME issue
+    # (e.g. a fresh implement act dispatched after the stale plan-phase
+    # window was left behind). Skipping by issue alone hid that live act
+    # from this list entirely -- caught live on ENG-1549 on 2026-09-04.
+    local pf="$AP_HOME/parked/$wissue.json" pf_window=""
+    if [[ -e "$pf" ]]; then
+      pf_window="$(python3 -c "import json,sys; print(json.load(open('$pf')).get('window') or '')" 2>/dev/null)"
+      [[ "$pf_window" == "$win" ]] && continue
+    fi
+    local ppid age_secs=""
+    ppid="$(tmux list-panes -t "$TMUX_SESSION:$win" -F '#{pane_pid}' 2>/dev/null | head -n1)"
+    [[ -n "$ppid" ]] && age_secs="$(ps -o etimes= -p "$ppid" 2>/dev/null | tr -d ' ')"
+    winline="$(printf '  %-5s %-6s %-10s %-10s %s' \
+      "$wlane" "${wslot:+slot$wslot}" "$wissue" "$wphase" "$(fmt_age "${age_secs:-}")")"
+    in_flight="${in_flight}${winline}"$'\n'
+  done < <(tmux list-windows -t "$TMUX_SESSION" -F '#{window_name}' 2>/dev/null)
+  if [[ -n "$in_flight" ]]; then
+    echo "in flight:"
+    printf '%s' "$in_flight"
   fi
+
+  # Queued tickets and, when the plan pool is full, the fact that THAT is
+  # what they are waiting on. New tickets enter the pipeline only through
+  # the plan lane (ap-decide.py's tier 5), so free build/ship slots say
+  # nothing about whether intake can move -- reporting the counts alone is
+  # what made a full plan lane read as "the lane is free".
+  local queued_report
+  queued_report="$(AP_HOME="$AP_HOME" AP_PLAN_SLOTS="$AP_PLAN_SLOTS" \
+    PLAN_BUSY_SLOTS="$plan_busy_slots" python3 - <<'PYEOF'
+import datetime, glob, json, os
+
+ap_home = os.environ["AP_HOME"]
+plan_slots = int(os.environ["AP_PLAN_SLOTS"])
+plan_busy = int(os.environ["PLAN_BUSY_SLOTS"])
+
+def age(ts):
+    try:
+        dt = datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return "?"
+    secs = int((datetime.datetime.now(datetime.timezone.utc) - dt).total_seconds())
+    if secs < 3600:
+        return "%dm" % (secs // 60)
+    return "%dh%02dm" % (secs // 3600, (secs % 3600) // 60)
+
+rows = []
+for path in sorted(glob.glob(os.path.join(ap_home, "queue", "*.json"))):
+    try:
+        with open(path) as fh:
+            e = json.load(fh)
+    except (OSError, ValueError):
+        continue
+    if e.get("state") == "queued":
+        rows.append((e.get("seq", 0), e.get("eng_id", "?"),
+                     age(e.get("created_at"))))
+if not rows:
+    raise SystemExit(0)
+
+blocked = plan_busy >= plan_slots
+print("queued (%d):%s" % (
+    len(rows),
+    "  -- BLOCKED: all %d plan slot(s) busy, intake is the plan lane only"
+    % plan_slots if blocked else ""))
+for _, eng_id, waited in sorted(rows):
+    print("  %-10s waiting %s%s" % (
+        eng_id, waited, "  (blocked on plan lane)" if blocked else ""))
+PYEOF
+  )"
+  [[ -n "$queued_report" ]] && printf '%s\n' "$queued_report"
 
   # Parked acts (AP_ACT_LAUNCH_MODE=persistent only): waiting on a reply,
   # holding no lane lock -- see ap-cycle.sh's park_registry_write. Cross-
@@ -520,8 +638,10 @@ cmd_limits() {
       --day-issues)         sets+=("AP_MAX_ISSUES_PER_DAY=${2:?value required}"); shift 2 ;;
       --day-cost)           sets+=("AP_MAX_DAY_COST_USD=${2:?value required}"); shift 2 ;;
       --week-cost)          sets+=("AP_MAX_WEEK_COST_USD=${2:?value required}"); shift 2 ;;
+      --plan-slots)         sets+=("AP_PLAN_SLOTS=${2:?value required}"); shift 2 ;;
       --build-slots)        sets+=("AP_BUILD_SLOTS=${2:?value required}"); shift 2 ;;
       --ship-slots)         sets+=("AP_SHIP_SLOTS=${2:?value required}"); shift 2 ;;
+      --review-slots)       sets+=("AP_REVIEW_SLOTS=${2:?value required}"); shift 2 ;;
       --limit-cooldown-min) sets+=("AP_LIMIT_COOLDOWN_MIN=${2:?value required}"); shift 2 ;;
       *) echo "ap limits: unknown argument '$1'" >&2; return 2 ;;
     esac
@@ -532,13 +652,16 @@ cmd_limits() {
     printf '  %-28s %s\n' "issues/day:"                  "$AP_MAX_ISSUES_PER_DAY"
     printf '  %-28s %s\n' "cost/day (\$):"                "$AP_MAX_DAY_COST_USD"
     printf '  %-28s %s\n' "cost/week (\$, informational):" "$AP_MAX_WEEK_COST_USD"
+    printf '  %-28s %s\n' "plan slots (clamped 1-4):"     "$AP_PLAN_SLOTS"
     printf '  %-28s %s\n' "build slots (clamped 1-4):"    "$AP_BUILD_SLOTS"
     printf '  %-28s %s\n' "ship slots (clamped 1-6):"     "$AP_SHIP_SLOTS"
+    printf '  %-28s %s\n' "review slots (clamped 1-4):"   "$AP_REVIEW_SLOTS"
     printf '  %-28s %s\n' "usage-limit cooldown (min):"   "$AP_LIMIT_COOLDOWN_MIN"
     echo
     echo "set with any combination of:"
     echo "  ap limits --day-issues N --day-cost N --week-cost N \\"
-    echo "            --build-slots N --ship-slots N --limit-cooldown-min N"
+    echo "            --plan-slots N --build-slots N --ship-slots N \\"
+    echo "            --review-slots N --limit-cooldown-min N"
     echo "file: $env_file"
     return 0
   fi

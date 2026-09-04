@@ -90,6 +90,19 @@ seed_plan_file() {
   touch "$work_repo/docs/plans/${slug}-thing.md"
 }
 
+# seed_artifact_file <work-repo> <subdir> <filename> -> creates the file and
+# echoes its absolute path. Used for the piv fork's artifact_path field
+# directly (a real file on disk), rather than relying on
+# resolve_rca_path/resolve_piv_plan_path's own fallback glob search --
+# setting artifact_path straight to an existing file is sufficient per both
+# resolvers' first line (`entry["artifact_path"]` if it still exists on disk).
+seed_artifact_file() {
+  local work_repo="$1" subdir="$2" filename="$3"
+  mkdir -p "$work_repo/$subdir"
+  touch "$work_repo/$subdir/$filename"
+  echo "$work_repo/$subdir/$filename"
+}
+
 # --- stub bin dir --------------------------------------------------------------
 # Written once; behavior is driven per-test by env vars read at call time.
 # No `gh` stub anymore: ap-cycle.sh/ap-decide.py/ap-resume.sh make no gh calls
@@ -111,14 +124,45 @@ printf '%s\n' "$@" >"$calls_dir/$n.args"
 # skills and fails open with action:none.
 pwd >"$calls_dir/$n.pwd"
 
-prompt="$2"
+# The prompt's ARGV POSITION differs by launch mode -- oneshot invokes
+# `claude -p PROMPT --model M --settings S ...` (prompt at $2), persistent
+# invokes `claude --settings S --model M PROMPT` (prompt LAST) -- so a
+# position-based `prompt="$2"` silently reads the wrong argv element in
+# persistent mode (the settings path, not the prompt) and every phase-based
+# knob below (including the pre-existing AP_TEST_IMPLEMENT_STATUS/
+# AP_TEST_SHIP_STATUS) would silently no-op for any persistent-mode case
+# that needs phase-specific behavior. Matching against the whole joined argv
+# is robust to either argument order.
+prompt="$*"
 phase="unknown"
+# Order matters: the `-issue` variants must be checked before their
+# shorter, unsuffixed siblings, since `*piv-implement*` also matches
+# `piv-implement-issue` -- matching the FULL token (`piv-implement --headless`
+# vs `piv-implement-issue`) with the `-issue` case listed first avoids a
+# bug-fork case silently asserting against the feature-fork phase (and vice
+# versa).
 case "$prompt" in
   *"--phase plan"*) phase="plan" ;;
   *"--phase implement"*) phase="implement" ;;
   *ship-work*) phase="ship" ;;
+  *piv-investigate-issue*) phase="investigate" ;;
+  *piv-implement-issue*) phase="fix" ;;
+  *"piv-implement --headless"*) phase="build" ;;
+  *piv-plan-implementation*) phase="design" ;;
+  *piv-review-pr*) phase="review" ;;
 esac
-[[ "$prompt" == *--feedback* ]] && phase="replan"
+# Pre-existing blanket override for a --feedback prompt, now fork-aware: it
+# runs AFTER the case statement above and unconditionally wins, so it must
+# route to the right re-entry phase per fork rather than always clobbering
+# back to the legacy `replan` -- getting this ordering wrong makes every
+# feedback-based bug/feature case silently assert the wrong phase.
+if [[ "$prompt" == *--feedback* ]]; then
+  case "$prompt" in
+    *piv-plan-implementation*) phase="redesign" ;;
+    *piv-investigate-issue*) phase="re-investigate" ;;
+    *) phase="replan" ;;
+  esac
+fi
 
 status="${AP_TEST_ACT_STATUS:-DONE}"
 if [[ "$phase" == "implement" && -n "${AP_TEST_IMPLEMENT_STATUS:-}" ]]; then
@@ -127,12 +171,31 @@ fi
 if [[ "$phase" == "ship" && -n "${AP_TEST_SHIP_STATUS:-}" ]]; then
   status="$AP_TEST_SHIP_STATUS"
 fi
+if [[ "$phase" == "investigate" && -n "${AP_TEST_INVESTIGATE_STATUS:-}" ]]; then
+  status="$AP_TEST_INVESTIGATE_STATUS"
+fi
+if [[ "$phase" == "fix" && -n "${AP_TEST_FIX_STATUS:-}" ]]; then
+  status="$AP_TEST_FIX_STATUS"
+fi
+if [[ "$phase" == "review" && -n "${AP_TEST_REVIEW_STATUS:-}" ]]; then
+  status="$AP_TEST_REVIEW_STATUS"
+fi
+if [[ "$phase" == "design" && -n "${AP_TEST_DESIGN_STATUS:-}" ]]; then
+  status="$AP_TEST_DESIGN_STATUS"
+fi
+if [[ "$phase" == "build" && -n "${AP_TEST_BUILD_STATUS:-}" ]]; then
+  status="$AP_TEST_BUILD_STATUS"
+fi
 
 if [[ -n "${AP_TEST_ACT_STDERR:-}" ]]; then
   printf '%s\n' "$AP_TEST_ACT_STDERR" >&2
 fi
 
-phase_upper="$(printf '%s' "$phase" | tr '[:lower:]' '[:upper:]')"
+# tr '-' '_' matters: a phase name like "re-investigate" upper-cased still
+# has a hyphen, and "AP_TEST_SKIP_STATUS_RE-INVESTIGATE" is not a legal bash
+# identifier -- the indirect expansion below would throw "invalid variable
+# name" the first time any re-investigate/redesign case exercised this stub.
+phase_upper="$(printf '%s' "$phase" | tr '[:lower:]' '[:upper:]' | tr '-' '_')"
 skip_status_var="AP_TEST_SKIP_STATUS_$phase_upper"
 exit_code_var="AP_TEST_EXIT_CODE_$phase_upper"
 skip_status="${!skip_status_var:-}"
@@ -296,6 +359,14 @@ AP_TEST_VARS=(
   AP_TEST_SKIP_STATUS_REPLAN AP_TEST_STATUS_TO_ADHOC AP_TEST_ADHOC_STATUS_ISSUE
   AP_TEST_EXIT_CODE_IMPLEMENT AP_TEST_EXIT_CODE_SHIP AP_TEST_EXIT_CODE_PLAN
   AP_TEST_EXIT_CODE_REPLAN
+  AP_TEST_INVESTIGATE_STATUS AP_TEST_FIX_STATUS AP_TEST_REVIEW_STATUS
+  AP_TEST_DESIGN_STATUS AP_TEST_BUILD_STATUS
+  AP_TEST_SKIP_STATUS_INVESTIGATE AP_TEST_SKIP_STATUS_FIX AP_TEST_SKIP_STATUS_REVIEW
+  AP_TEST_SKIP_STATUS_DESIGN AP_TEST_SKIP_STATUS_BUILD
+  AP_TEST_SKIP_STATUS_RE_INVESTIGATE AP_TEST_SKIP_STATUS_REDESIGN
+  AP_TEST_EXIT_CODE_INVESTIGATE AP_TEST_EXIT_CODE_FIX AP_TEST_EXIT_CODE_REVIEW
+  AP_TEST_EXIT_CODE_DESIGN AP_TEST_EXIT_CODE_BUILD
+  AP_TEST_EXIT_CODE_RE_INVESTIGATE AP_TEST_EXIT_CODE_REDESIGN
 )
 
 setup_case() {
@@ -304,7 +375,7 @@ setup_case() {
   CASE_WORK_REPO="$(mktemp -d)"
   make_stub_dir "$CASE_STUB_DIR"
   for v in "${AP_TEST_VARS[@]}"; do unset "$v"; done
-  unset AP_BUILD_SLOTS AP_SHIP_SLOTS AP_LIMIT_COOLDOWN_MIN AP_AUTO_APPROVE
+  unset AP_PLAN_SLOTS AP_BUILD_SLOTS AP_SHIP_SLOTS AP_REVIEW_SLOTS AP_LIMIT_COOLDOWN_MIN AP_AUTO_APPROVE
 }
 
 run_case() {
@@ -459,15 +530,20 @@ assert "case3b: at cap but approved -> ticket left plan-review behind" \
   [ "$(ticket_field "$CASE_AP_HOME" ENG-3b state)" != "plan-review" ]
 
 # =============================================================================
-# Case 4: decide (real, unstubbed) claims a queued ticket -> ONE claude call
-# (the plan act itself -- deciding is free, no model call for it anymore) with
-# --settings <path> and "--headless" in the prompt arg.
+# Case 4 (CORRECTED, not preserved -- see the piv feature-fork plan's own
+# instruction that this is a required rewrite): after the intake cutover, a
+# `queued` ticket of the default (feature) kind never produces
+# `action: plan`/`implement-issue --phase plan` again -- tier 5 always routes
+# it to `design`/`piv-plan-implementation` now. decide (real, unstubbed)
+# claims a queued ticket -> ONE claude call (the design act itself -- deciding
+# is free, no model call for it) with --settings <path> and "--headless" in
+# the prompt arg.
 # =============================================================================
 setup_case
 seed_ticket "$CASE_AP_HOME" ENG-4 queued
 rc="$(run_case)"
 assert "case4: exit 0" [ "$rc" -eq 0 ]
-assert "case4: exactly one claude call (the plan act; decide is free)" \
+assert "case4: exactly one claude call (the design act; decide is free)" \
   [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 1 ]
 act_args="$CASE_STUB_DIR/claude_calls/1.args"
 if [[ -f "$act_args" ]]; then
@@ -475,16 +551,16 @@ if [[ -f "$act_args" ]]; then
   assert "case4: act call settings path is absolute autopilot.json" bash -c "grep -q '/autopilot/settings/autopilot.json$' '$act_args'"
   assert "case4: act call prompt has --headless" bash -c "grep -q -- '--headless' '$act_args'"
   assert "case4: act call prompt has --run-dir with the run path" bash -c "grep -q -- '--run-dir /' '$act_args'"
-  assert "case4: act call prompt targets implement-issue --phase plan ENG-4" bash -c "grep -q 'implement-issue --phase plan ENG-4' '$act_args'"
+  assert "case4: act call prompt targets piv-plan-implementation ENG-4 --headless" bash -c "grep -q 'piv-plan-implementation ENG-4 --headless' '$act_args'"
   assert "case4: plan DONE pings the owner (plan ready for review)" bash -c \
     "grep -rl 'plan ready for review' '$CASE_STUB_DIR/notify_calls' >/dev/null"
 else
   fail "case4: act call has --settings (no 1.args file)"
   fail "case4: act call settings path is absolute autopilot.json"
   fail "case4: act call prompt has --headless"
-  fail "case4: act call prompt targets implement-issue --phase plan ENG-4"
+  fail "case4: act call prompt targets piv-plan-implementation ENG-4 --headless"
 fi
-assert "case4(claim): ticket state -> planning" [ "$(ticket_field "$CASE_AP_HOME" ENG-4 state)" = "planning" ]
+assert "case4(claim): ticket state -> piv-drafting" [ "$(ticket_field "$CASE_AP_HOME" ENG-4 state)" = "piv-drafting" ]
 
 # =============================================================================
 # Case 5: status NEEDS_HUMAN with question -> notify stub called with the
@@ -829,13 +905,15 @@ assert "case16: recorded prompt's --feedback unescapes back to the original text
 # =============================================================================
 # Case 23: session writes status.json to the adhoc fallback (could not resolve
 # the run dir) -> wrapper adopts it instead of declaring FAILED.
+# CORRECTED (not preserved): the ticket's phase is "design" now, not "plan" --
+# a queued/default-kind ticket routes through piv-plan-implementation.
 # =============================================================================
 setup_case
 seed_ticket "$CASE_AP_HOME" ENG-23 queued
 rc="$(AP_TEST_STATUS_TO_ADHOC=1 AP_TEST_ACT_ISSUE=ENG-23 run_case)"
 assert "case23: exit 0" [ "$rc" -eq 0 ]
-assert "case23: ledger plan row adopted DONE from adhoc" bash -c \
-  "cat '$CASE_AP_HOME/runs/'*.jsonl | python3 -c 'import json,sys; rows=[json.loads(l) for l in sys.stdin if l.strip()]; sys.exit(0 if any(r[\"phase\"]==\"plan\" and r[\"status\"]==\"DONE\" for r in rows) else 1)'"
+assert "case23: ledger design row adopted DONE from adhoc" bash -c \
+  "cat '$CASE_AP_HOME/runs/'*.jsonl | python3 -c 'import json,sys; rows=[json.loads(l) for l in sys.stdin if l.strip()]; sys.exit(0 if any(r[\"phase\"]==\"design\" and r[\"status\"]==\"DONE\" for r in rows) else 1)'"
 assert "case23: ticket not moved to failed" [ "$(ticket_field "$CASE_AP_HOME" ENG-23 state)" != "failed" ]
 assert "case23: adhoc file consumed (moved, not left stale)" bash -c \
   "[ ! -f '$CASE_AP_HOME/runs/adhoc/status.json' ]"
@@ -846,14 +924,15 @@ assert "case23: adhoc file consumed (moved, not left stale)" bash -c \
 # concurrent act's leftover file sharing the one adhoc path. Must NOT be
 # adopted: left in place, this act is treated as FAILED (no status.json ever
 # resolved for it), and the mismatched file survives for its real owner.
+# CORRECTED (not preserved): phase is "design" now, not "plan".
 # =============================================================================
 setup_case
 seed_ticket "$CASE_AP_HOME" ENG-23B queued
 rc="$(AP_TEST_STATUS_TO_ADHOC=1 AP_TEST_ACT_ISSUE=ENG-23B \
   AP_TEST_ADHOC_STATUS_ISSUE=ENG-OTHER run_case)"
 assert "case23b: exit 0" [ "$rc" -eq 0 ]
-assert "case23b: ledger plan row is FAILED, not adopted from the mismatched adhoc file" bash -c \
-  "cat '$CASE_AP_HOME/runs/'*.jsonl | python3 -c 'import json,sys; rows=[json.loads(l) for l in sys.stdin if l.strip()]; sys.exit(0 if any(r[\"phase\"]==\"plan\" and r[\"status\"]==\"FAILED\" for r in rows) else 1)'"
+assert "case23b: ledger design row is FAILED, not adopted from the mismatched adhoc file" bash -c \
+  "cat '$CASE_AP_HOME/runs/'*.jsonl | python3 -c 'import json,sys; rows=[json.loads(l) for l in sys.stdin if l.strip()]; sys.exit(0 if any(r[\"phase\"]==\"design\" and r[\"status\"]==\"FAILED\" for r in rows) else 1)'"
 assert "case23b: mismatched adhoc file left in place (not consumed)" bash -c \
   "[ -f '$CASE_AP_HOME/runs/adhoc/status.json' ]"
 
@@ -865,11 +944,13 @@ assert "case23b: mismatched adhoc file left in place (not consumed)" bash -c \
 # a recorded call to inspect for the free decide step itself).
 # =============================================================================
 
-# --- (i) build lane held + a queued ticket present -> a plan act proceeds
+# --- (i) build lane held + a queued ticket present -> a design act proceeds
 # (plan lane is free) despite the build lane being full.
 # AP_BUILD_SLOTS=1 here: this exercises the "lane busy" boundary itself
 # (single-slot semantics), not slot-count behavior -- that's covered
 # separately below (build slot concurrency, Feature 1).
+# CORRECTED (not preserved): the dispatched prompt is piv-plan-implementation
+# now, not implement-issue --phase plan.
 setup_case
 seed_ticket "$CASE_AP_HOME" ENG-2001 queued
 hold_lane_lock "$CASE_AP_HOME/lock.build.1" 3; build_holder="$LANE_HOLDER_PID"
@@ -878,8 +959,8 @@ rc="$(AP_BUILD_SLOTS=1 run_case)"
 wait "$build_holder" 2>/dev/null
 assert "laneB(i): exit 0" [ "$rc" -eq 0 ]
 act_args="$CASE_STUB_DIR/claude_calls/1.args"
-assert "laneB(i): plan act proceeded (plan lane free)" bash -c \
-  "[ -f '$act_args' ] && grep -q 'implement-issue --phase plan ENG-2001' '$act_args'"
+assert "laneB(i): design act proceeded (plan lane free)" bash -c \
+  "[ -f '$act_args' ] && grep -q 'piv-plan-implementation ENG-2001' '$act_args'"
 
 # --- (ii) plan lane held + an approved plan-review ticket present ->
 # implement proceeds (build lane is free).
@@ -1045,12 +1126,15 @@ assert "case26: implement cycle exit 0" [ "$rc" -eq 0 ]
 assert_model "case26: implement" "$CASE_STUB_DIR/claude_calls/1.args" sonnet
 assert_model "case26: ship" "$CASE_STUB_DIR/claude_calls/2.args" sonnet
 
-# env override wins, so a hard ticket can be raised without changing the default
+# env override wins, so a hard ticket can be raised without changing the
+# default. CORRECTED (not preserved): a queued ticket's act is "design" now,
+# governed by AP_DESIGN_MODEL, not AP_PLAN_MODEL (which no tier emits an
+# action for any more).
 setup_case
 seed_ticket "$CASE_AP_HOME" ENG-26C queued
-rc="$(AP_PLAN_MODEL=fable run_case)"
+rc="$(AP_DESIGN_MODEL=fable run_case)"
 assert "case26: override cycle exit 0" [ "$rc" -eq 0 ]
-assert_model "case26: plan honours AP_PLAN_MODEL" "$CASE_STUB_DIR/claude_calls/1.args" fable
+assert_model "case26: design honours AP_DESIGN_MODEL" "$CASE_STUB_DIR/claude_calls/1.args" fable
 
 # =============================================================================
 # Case 27: the ledger row records the model the act ran on. Without it the only
@@ -1059,6 +1143,9 @@ assert_model "case26: plan honours AP_PLAN_MODEL" "$CASE_STUB_DIR/claude_calls/1
 # poll row itself always records the fixed literal model "none" and
 # session_id "deterministic" -- merged in from the old suite's
 # AP_POLL_MODE=deterministic case A, now that deterministic is the only mode.
+# CORRECTED (not preserved): a queued ticket's act phase is "design" now, not
+# "plan" -- see the piv feature-fork plan's own note that this rewrite is
+# required, not new coverage layered on an unmodified file.
 # =============================================================================
 setup_case
 seed_ticket "$CASE_AP_HOME" ENG-27 queued
@@ -1070,25 +1157,25 @@ assert "case27: poll row records model=none, session=deterministic; act row reco
 import json
 rows = [json.loads(l) for l in open('$ledger') if l.strip()]
 poll = [r for r in rows if r['phase'] == 'poll']
-plan = [r for r in rows if r['phase'] == 'plan']
-assert len(poll) == 1 and len(plan) == 1, rows
+design = [r for r in rows if r['phase'] == 'design']
+assert len(poll) == 1 and len(design) == 1, rows
 assert poll[0]['model'] == 'none', poll[0]
 assert poll[0]['session_id'] == 'deterministic', poll[0]
-assert plan[0]['model'] == 'opus', plan[0]
+assert design[0]['model'] == 'opus', design[0]
 \""
 
 # the override must reach the ledger too, not just the argv
 setup_case
 seed_ticket "$CASE_AP_HOME" ENG-27B queued
-rc="$(AP_PLAN_MODEL=fable run_case)"
+rc="$(AP_DESIGN_MODEL=fable run_case)"
 ledger="$(today_ledger)"
 assert "case27: override cycle exit 0" [ "$rc" -eq 0 ]
 assert "case27: ledger records the overridden model" bash -c \
   "python3 -c \"
 import json
 rows = [json.loads(l) for l in open('$ledger') if l.strip()]
-plan = [r for r in rows if r['phase'] == 'plan']
-assert plan and plan[0]['model'] == 'fable', plan
+design = [r for r in rows if r['phase'] == 'design']
+assert design and design[0]['model'] == 'fable', design
 \""
 
 # =============================================================================
@@ -1120,6 +1207,8 @@ assert "slots(1): prompt carries --ports fe=5175,be=8002 (slot 2)" bash -c \
 # --- (2) both slots held: an approved plan-review ticket does NOT get
 # claimed (build lane full), while a queued ticket (plan lane free) still
 # proceeds.
+# CORRECTED (not preserved): the dispatched prompt is piv-plan-implementation
+# now, not implement-issue --phase plan.
 setup_case
 seed_ticket "$CASE_AP_HOME" ENG-2101 queued
 seed_ticket "$CASE_AP_HOME" ENG-2102 plan-review pending_approval=true
@@ -1131,8 +1220,8 @@ rc="$(AP_BUILD_SLOTS=2 run_case)"
 wait "$b1_holder" "$b2_holder" 2>/dev/null
 assert "slots(2): exit 0" [ "$rc" -eq 0 ]
 act_args="$CASE_STUB_DIR/claude_calls/1.args"
-assert "slots(2): plan act proceeded (plan lane free, build's approval skipped)" bash -c \
-  "[ -f '$act_args' ] && grep -q 'implement-issue --phase plan ENG-2101' '$act_args'"
+assert "slots(2): design act proceeded (plan lane free, build's approval skipped)" bash -c \
+  "[ -f '$act_args' ] && grep -q 'piv-plan-implementation ENG-2101' '$act_args'"
 assert "slots(2): the approved-but-build-busy ticket was left untouched" \
   [ "$(ticket_field "$CASE_AP_HOME" ENG-2102 state)" = "plan-review" ]
 
@@ -1171,6 +1260,77 @@ assert "slots(5): no recorded prompt ever assigns fe=5173" \
 assert "slots(5): no recorded prompt ever assigns be=8000" \
   bash -c "! grep -q 'be=8000' '$PORTS_SEEN_FILE'"
 rm -f "$PORTS_SEEN_FILE"
+
+# =============================================================================
+# Feature: N concurrent plan slots (AP_PLAN_SLOTS). The plan lane used to be
+# one hard-coded lock.plan, which serialized ALL new intake -- tier 5 is the
+# only way a queued ticket enters the pipeline, so one long plan act stalled
+# every new ticket no matter how many build/ship slots were idle. Slot 1
+# keeps the ORIGINAL lock.plan path (see ap-env.sh's plan_lock_file) so an
+# act already in flight across the rollout still occupies a visible slot;
+# slots 2..N are lock.plan.$n. Plan acts get no port pair -- they start no
+# servers -- so unlike the build cases above there is nothing to assert on
+# ports here.
+# =============================================================================
+
+# --- (1) slot 1 held, AP_PLAN_SLOTS=2 -> a queued ticket STILL gets planned,
+# on slot 2. This is the whole point of the feature: under the old single
+# lane this exact fixture produced no act at all.
+# CORRECTED (not preserved): dispatched prompt is piv-plan-implementation and
+# the claim state is piv-drafting now, not implement-issue/planning.
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-PLANSLOT1 queued
+hold_lane_lock "$CASE_AP_HOME/lock.plan" 3; p1_holder="$LANE_HOLDER_PID"
+sleep 0.4
+rc="$(AP_PLAN_SLOTS=2 run_case)"
+wait "$p1_holder" 2>/dev/null
+assert "planslots(1): exit 0" [ "$rc" -eq 0 ]
+act_args="$CASE_STUB_DIR/claude_calls/1.args"
+assert "planslots(1): design act proceeded on slot 2 while slot 1 was held" bash -c \
+  "[ -f '$act_args' ] && grep -q 'piv-plan-implementation ENG-PLANSLOT1' '$act_args'"
+assert "planslots(1): the ticket was claimed into piv-drafting" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-PLANSLOT1 state)" = "piv-drafting" ]
+
+# --- (2) every slot held -> no plan act, and the queued ticket is left
+# untouched for a later cycle (never half-claimed).
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-PLANSLOT2 queued
+hold_lane_lock "$CASE_AP_HOME/lock.plan" 3;   pa_holder="$LANE_HOLDER_PID"
+hold_lane_lock "$CASE_AP_HOME/lock.plan.2" 3; pb_holder="$LANE_HOLDER_PID"
+sleep 0.4
+rc="$(AP_PLAN_SLOTS=2 run_case)"
+wait "$pa_holder" "$pb_holder" 2>/dev/null
+assert "planslots(2): exit 0" [ "$rc" -eq 0 ]
+assert "planslots(2): no act dispatched (plan pool full)" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 0 ]
+assert "planslots(2): queued ticket left untouched" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-PLANSLOT2 state)" = "queued" ]
+
+# --- (3) AP_PLAN_SLOTS=1 reproduces the old single-lane behavior exactly:
+# slot 1 held -> nothing dispatched, ticket stays queued.
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-PLANSLOT3 queued
+hold_lane_lock "$CASE_AP_HOME/lock.plan" 3; p3_holder="$LANE_HOLDER_PID"
+sleep 0.4
+rc="$(AP_PLAN_SLOTS=1 run_case)"
+wait "$p3_holder" 2>/dev/null
+assert "planslots(3): exit 0" [ "$rc" -eq 0 ]
+assert "planslots(3): AP_PLAN_SLOTS=1 + slot held -> no act (old behavior)" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 0 ]
+assert "planslots(3): ticket stays queued" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-PLANSLOT3 state)" = "queued" ]
+
+# --- (4) nothing held -> lowest free slot wins, i.e. slot 1's ORIGINAL
+# lock.plan path is used, not lock.plan.1. A regression here would make an
+# in-flight act invisible to the next cycle's probe.
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-PLANSLOT4 queued
+rc="$(AP_PLAN_SLOTS=2 run_case)"
+assert "planslots(4): exit 0" [ "$rc" -eq 0 ]
+assert "planslots(4): plan act proceeded" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -ge 1 ]
+assert "planslots(4): slot 1 is lock.plan, and lock.plan.1 was never created" \
+  bash -c "[ -e '$CASE_AP_HOME/lock.plan' ] && [ ! -e '$CASE_AP_HOME/lock.plan.1' ]"
 
 # =============================================================================
 # Feature: limit-aware auto-resume. AP_LIMIT_COOLDOWN_MIN default is 60
@@ -1416,6 +1576,8 @@ assert "shipLane(a): dispatched ship" bash -c \
 # --- (b) all ship slots busy + a ship-pending ticket -> the ticket is left
 # untouched (not claimed, re-fires once free) while a plan-lane ticket
 # proceeds independently.
+# CORRECTED (not preserved): the plan-lane ticket's dispatched prompt is
+# piv-plan-implementation now, not implement-issue --phase plan.
 setup_case
 seed_ticket "$CASE_AP_HOME" ENG-705 ship-pending
 seed_plan_file "$CASE_WORK_REPO" ENG-705
@@ -1426,8 +1588,8 @@ rc="$(AP_SHIP_SLOTS=1 run_case)"
 wait "$b_ship_holder" 2>/dev/null
 assert "shipLane(b): exit 0" [ "$rc" -eq 0 ]
 act_args="$CASE_STUB_DIR/claude_calls/1.args"
-assert "shipLane(b): plan act proceeded (plan lane free, ship-pending skipped)" bash -c \
-  "[ -f '$act_args' ] && grep -q 'implement-issue --phase plan ENG-706' '$act_args'"
+assert "shipLane(b): design act proceeded (plan lane free, ship-pending skipped)" bash -c \
+  "[ -f '$act_args' ] && grep -q 'piv-plan-implementation ENG-706' '$act_args'"
 assert "shipLane(b): ship-pending ticket NOT claimed (re-fires once free)" \
   [ "$(ticket_field "$CASE_AP_HOME" ENG-705 state)" = "ship-pending" ]
 
@@ -1490,6 +1652,9 @@ assert "questionEcho: history is marked as a needs-input event" \
 # =============================================================================
 
 # --- persist(A): NEEDS_HUMAN parks -- registry written, window left alive --
+# CORRECTED (not preserved): a queued (default-kind) ticket's act phase is
+# "design" now, not "plan" -- the registry's phase field and the window name
+# both reflect that.
 setup_case
 export AP_ACT_LAUNCH_MODE=persistent
 export AP_TMUX_SESSION=ap-test-should-never-be-real
@@ -1500,14 +1665,15 @@ assert "persist(A): exit 0" [ "$rc" -eq 0 ]
 assert "persist(A): parked registry written, keyed by ENG-id filename" \
   [ -f "$CASE_AP_HOME/parked/ENG-PA.json" ]
 assert "persist(A): registry records the right issue/phase/lane" bash -c \
-  "python3 -c \"import json; d=json.load(open('$CASE_AP_HOME/parked/ENG-PA.json')); assert d['issue']=='ENG-PA' and d['phase']=='plan' and d['lane']=='plan', d\""
+  "python3 -c \"import json; d=json.load(open('$CASE_AP_HOME/parked/ENG-PA.json')); assert d['issue']=='ENG-PA' and d['phase']=='design' and d['lane']=='plan', d\""
 assert "persist(A): registry records the question" bash -c \
   "python3 -c \"import json; d=json.load(open('$CASE_AP_HOME/parked/ENG-PA.json')); assert d.get('question'), d\""
 assert "persist(A): window was NOT torn down (still tracked by fake tmux)" bash -c \
-  "ls '$CASE_AP_HOME/.test-tmux/'act_plan_ENG-PA_plan.meta >/dev/null 2>&1"
+  "ls '$CASE_AP_HOME/.test-tmux/'act_plan_ENG-PA_design.meta >/dev/null 2>&1"
 unset AP_ACT_LAUNCH_MODE AP_TMUX_SESSION AP_TEST_ACT_STATUS
 
 # --- persist(B): DONE tears the window down ---------------------------------
+# CORRECTED (not preserved): window name reflects the "design" phase now.
 setup_case
 export AP_ACT_LAUNCH_MODE=persistent
 export AP_TMUX_SESSION=ap-test-should-never-be-real
@@ -1517,7 +1683,7 @@ assert "persist(B): exit 0" [ "$rc" -eq 0 ]
 assert "persist(B): no parked registry (DONE, not NEEDS_HUMAN)" \
   bash -c "[ ! -f '$CASE_AP_HOME/parked/ENG-PB.json' ]"
 assert "persist(B): window WAS torn down" bash -c \
-  "[ ! -f '$CASE_AP_HOME/.test-tmux/act_plan_ENG-PB_plan.meta' ]"
+  "[ ! -f '$CASE_AP_HOME/.test-tmux/act_plan_ENG-PB_design.meta' ]"
 unset AP_ACT_LAUNCH_MODE AP_TMUX_SESSION
 
 # --- persist(C): a parked ticket is skipped by ap-decide.py's tier3, end to
@@ -1547,7 +1713,14 @@ assert "persist(C): ticket left exactly as it was (still needs-input, feedback u
 # busy-lane skip in this file already has). Invoke ap-resume.sh directly
 # (not through the backgrounded scan_parked_replies path, to avoid timing
 # flakiness) with both build slots deliberately held busy.
+#
+# A real queue ticket for ENG-PD (state needs-input) must exist on disk, not
+# just the parked/*.json registry file: ap-resume.sh's superseded-parked-entry
+# check (added this session for the ENG-1549 gap) treats a MISSING ticket
+# file as "superseded" and tears the parked entry down immediately, before
+# ever reaching the lane-busy check this case exists to exercise.
 setup_case
+seed_ticket "$CASE_AP_HOME" ENG-PD needs-input feedback='"go with option A"' phase_at_question='"implement"'
 mkdir -p "$CASE_AP_HOME/parked" "$CASE_AP_HOME/.test-tmux"
 cat >"$CASE_AP_HOME/parked/ENG-PD.json" <<'EOF'
 {"issue": "ENG-PD", "phase": "implement", "lane": "build",
@@ -1574,6 +1747,558 @@ assert "persist(D): last_relayed_feedback_seq was NOT advanced (feedback_seq 1 n
   "python3 -c \"import json; d=json.load(open('$CASE_AP_HOME/parked/ENG-PD.json')); assert d.get('last_relayed_feedback_seq') == 0, d\""
 assert "persist(D): cycle.log records the 'no free slot' bail reason" \
   bash -c "grep -q 'no free slot' '$CASE_AP_HOME/logs/cycle.log'"
+
+# =============================================================================
+# piv bug-path pipeline (docs/plans/2026-09-03-ap-piv-bug-path-pipeline.md).
+# `kind=bug` routes through piv-investigate-issue -> (human RCA gate) ->
+# piv-implement-issue (fix) -> piv-review-pr (review), on the shared
+# piv-drafting/piv-draft-review/piv-implementing/piv-review-pending/
+# piv-reviewing state set. Review-lane ports/exhaustion/clamping and the
+# port-collision matrix are exercised ONCE here and are kind-independent --
+# not re-tested under the feature-kind section below (per both piv plans'
+# own instruction not to duplicate kind-independent coverage).
+# =============================================================================
+
+# --- bug(1): queued + kind=bug -> investigate dispatch, piv-drafting, cwd
+# discipline preserved.
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-BUG1 queued kind=bug
+rc="$(run_case)"
+assert "bug1: exit 0" [ "$rc" -eq 0 ]
+assert "bug1: exactly one claude call (investigate act; decide is free)" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 1 ]
+act_args="$CASE_STUB_DIR/claude_calls/1.args"
+assert "bug1: prompt targets piv-investigate-issue ENG-BUG1 --headless" bash -c \
+  "[ -f '$act_args' ] && grep -q 'piv-investigate-issue ENG-BUG1 --headless' '$act_args'"
+assert "bug1: prompt carries --run-dir" bash -c \
+  "[ -f '$act_args' ] && grep -q -- '--run-dir /' '$act_args'"
+assert "bug1: ticket claimed into piv-drafting" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-BUG1 state)" = "piv-drafting" ]
+for f in "$CASE_STUB_DIR"/claude_calls/*.pwd; do
+  [[ -e "$f" ]] || continue
+  assert "bug1: act ran in the work repo" [ "$(cat "$f")" = "$CASE_WORK_REPO" ]
+done
+
+# --- bug(2): investigate DONE pings "RCA ready for review", not "plan ready".
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-BUG2 queued kind=bug
+rc="$(AP_TEST_INVESTIGATE_STATUS=DONE run_case)"
+assert "bug2: exit 0" [ "$rc" -eq 0 ]
+assert "bug2: investigate DONE pings 'RCA ready for review'" bash -c \
+  "grep -rl 'RCA ready for review' '$CASE_STUB_DIR/notify_calls' >/dev/null"
+
+# --- bug(3): piv-draft-review approved -> fix dispatch with --rca and slot-1
+# build ports; slot 1 held -> slot 2.
+setup_case
+artifact="$(seed_artifact_file "$CASE_WORK_REPO" docs/issues issue-eng-bug3.md)"
+seed_ticket "$CASE_AP_HOME" ENG-BUG3 piv-draft-review kind=bug pending_approval=true "artifact_path=$artifact"
+rc="$(run_case)"
+assert "bug3: exit 0" [ "$rc" -eq 0 ]
+act_args="$CASE_STUB_DIR/claude_calls/1.args"
+assert "bug3: prompt targets piv-implement-issue with --rca and slot-1 ports" bash -c \
+  "[ -f '$act_args' ] && grep -q 'piv-implement-issue ENG-BUG3' '$act_args' && grep -q -- '--rca' '$act_args' && grep -q -- '--ports fe=5174,be=8001' '$act_args'"
+# The claim write (piv-draft-review -> piv-implementing) happens BEFORE the
+# fix act dispatches, but the stub's default status is DONE, so by the time
+# this synchronous run_case call returns, the ticket has already advanced
+# past piv-implementing to piv-review-pending -- see bug(4) below for the
+# dedicated assertion on that transition. There is no synchronous way to
+# observe the transient piv-implementing claim state through this harness.
+assert "bug3: ticket ends at piv-review-pending (fix ran to DONE synchronously)" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-BUG3 state)" = "piv-review-pending" ]
+
+setup_case
+artifact="$(seed_artifact_file "$CASE_WORK_REPO" docs/issues issue-eng-bug3b.md)"
+seed_ticket "$CASE_AP_HOME" ENG-BUG3B piv-draft-review kind=bug pending_approval=true "artifact_path=$artifact"
+hold_lane_lock "$CASE_AP_HOME/lock.build.1" 3; b_holder="$LANE_HOLDER_PID"
+sleep 0.4
+rc="$(AP_BUILD_SLOTS=2 run_case)"
+wait "$b_holder" 2>/dev/null
+assert "bug3b: exit 0" [ "$rc" -eq 0 ]
+act_args="$CASE_STUB_DIR/claude_calls/1.args"
+assert "bug3b: slot 1 busy -> slot 2 ports (fe=5175,be=8002)" bash -c \
+  "[ -f '$act_args' ] && grep -q -- '--ports fe=5175,be=8002' '$act_args'"
+
+# --- bug(4): fix DONE -> exactly ONE claude call this cycle (no chained
+# review!), ticket -> piv-review-pending, notify says "review pending".
+setup_case
+artifact="$(seed_artifact_file "$CASE_WORK_REPO" docs/issues issue-eng-bug4.md)"
+seed_ticket "$CASE_AP_HOME" ENG-BUG4 piv-draft-review kind=bug pending_approval=true "artifact_path=$artifact"
+rc="$(AP_TEST_FIX_STATUS=DONE run_case)"
+assert "bug4: exit 0" [ "$rc" -eq 0 ]
+assert "bug4: exactly one claude call (no chained review)" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 1 ]
+assert "bug4: ticket -> piv-review-pending" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-BUG4 state)" = "piv-review-pending" ]
+assert "bug4: notify says review pending" bash -c \
+  "grep -rl '^review pending: ENG-BUG4\$' '$CASE_STUB_DIR/notify_calls' >/dev/null"
+
+# --- bug(5): piv-review-pending -> review dispatch with the resolved PR url,
+# --issue, and review-slot-1 ports (fe=5188,be=8021).
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-BUG5 piv-review-pending kind=bug 'pr_urls=["https://github.com/x/y/pull/9"]'
+rc="$(run_case)"
+assert "bug5: exit 0" [ "$rc" -eq 0 ]
+act_args="$CASE_STUB_DIR/claude_calls/1.args"
+assert "bug5: prompt targets piv-review-pr with the resolved PR url and --issue" bash -c \
+  "[ -f '$act_args' ] && grep -q 'piv-review-pr https://github.com/x/y/pull/9 --headless --issue ENG-BUG5' '$act_args'"
+assert "bug5: review-slot-1 ports (fe=5188,be=8021)" bash -c \
+  "[ -f '$act_args' ] && grep -q -- '--ports fe=5188,be=8021' '$act_args'"
+assert "bug5: ticket -> piv-reviewing" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-BUG5 state)" = "piv-reviewing" ]
+
+# --- revFull: every review slot held + a piv-review-pending ticket -> no
+# claude call for it, ticket untouched, but a free ship lane still ships a
+# ship-pending ticket in the SAME cycle (per-entry lane check, no cross-lane
+# starvation). Kind-independent -- exercised once here.
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-REVFULL piv-review-pending kind=bug 'pr_urls=["https://github.com/x/y/pull/1"]'
+seed_ticket "$CASE_AP_HOME" ENG-SHIPFREE ship-pending
+seed_plan_file "$CASE_WORK_REPO" ENG-SHIPFREE
+hold_lane_lock "$CASE_AP_HOME/lock.review.1" 3; r1_holder="$LANE_HOLDER_PID"
+hold_lane_lock "$CASE_AP_HOME/lock.review.2" 3; r2_holder="$LANE_HOLDER_PID"
+sleep 0.4
+rc="$(AP_REVIEW_SLOTS=2 AP_TEST_SHIP_STATUS=DONE run_case)"
+wait "$r1_holder" "$r2_holder" 2>/dev/null
+assert "revFull: exit 0" [ "$rc" -eq 0 ]
+act_args="$CASE_STUB_DIR/claude_calls/1.args"
+assert "revFull: no review call was ever made" bash -c \
+  "! grep -rq 'piv-review-pr' '$CASE_STUB_DIR/claude_calls' 2>/dev/null"
+assert "revFull: the free ship lane still shipped" bash -c \
+  "[ -f '$act_args' ] && grep -q 'ship-work' '$act_args'"
+assert "revFull: review-pending ticket left untouched (re-fires once free)" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-REVFULL state)" = "piv-review-pending" ]
+
+# --- portCollision: review lane ports never collide with build's
+# (5174-5177/8001-8004, AP_BUILD_SLOTS<=4), ship's (5181-5186/8011-8016,
+# AP_SHIP_SLOTS<=6), or the human's own baseline (5173/8000), for every
+# review slot 1..4. Kind-independent, arithmetic on the same fixed formulas
+# ap-cycle.sh's review-lane arm uses (5187+n/8020+n) -- extends the
+# pre-existing "no slot is ever assigned the human's baseline" case.
+for n in 1 2 3 4; do
+  rfe=$((5187 + n)); rbe=$((8020 + n))
+  assert "portCollision: review slot $n fe=$rfe not in build range 5174-5177" \
+    bash -c "[ $rfe -lt 5174 ] || [ $rfe -gt 5177 ]"
+  assert "portCollision: review slot $n fe=$rfe not in ship range 5181-5186" \
+    bash -c "[ $rfe -lt 5181 ] || [ $rfe -gt 5186 ]"
+  assert "portCollision: review slot $n fe=$rfe is never the baseline 5173" [ "$rfe" -ne 5173 ]
+  assert "portCollision: review slot $n be=$rbe not in build range 8001-8004" \
+    bash -c "[ $rbe -lt 8001 ] || [ $rbe -gt 8004 ]"
+  assert "portCollision: review slot $n be=$rbe not in ship range 8011-8016" \
+    bash -c "[ $rbe -lt 8011 ] || [ $rbe -gt 8016 ]"
+  assert "portCollision: review slot $n be=$rbe is never the baseline 8000" [ "$rbe" -ne 8000 ]
+done
+
+# --- reviewSlots: AP_REVIEW_SLOTS clamping, same idiom ap-env.sh uses for
+# every other lane -- 99 -> 4, 0 -> 1, abc -> the default 2.
+assert "reviewSlots: 99 clamps to 4" bash -c \
+  "[ \"\$(AP_HOME=\$(mktemp -d) AP_REVIEW_SLOTS=99 bash -c 'source \"$BIN_DIR/ap-env.sh\"; echo \$AP_REVIEW_SLOTS')\" = 4 ]"
+assert "reviewSlots: 0 clamps to 1" bash -c \
+  "[ \"\$(AP_HOME=\$(mktemp -d) AP_REVIEW_SLOTS=0 bash -c 'source \"$BIN_DIR/ap-env.sh\"; echo \$AP_REVIEW_SLOTS')\" = 1 ]"
+assert "reviewSlots: abc clamps to the default 2" bash -c \
+  "[ \"\$(AP_HOME=\$(mktemp -d) AP_REVIEW_SLOTS=abc bash -c 'source \"$BIN_DIR/ap-env.sh\"; echo \$AP_REVIEW_SLOTS')\" = 2 ]"
+
+# --- bugNH: NEEDS_HUMAN at each of investigate/fix/review -> needs-input +
+# the right phase_at_question + notify + (persistent mode) a parked-registry
+# entry.
+setup_case
+export AP_ACT_LAUNCH_MODE=persistent
+export AP_TMUX_SESSION=ap-test-should-never-be-real
+seed_ticket "$CASE_AP_HOME" ENG-BUGNH1 queued kind=bug
+rc="$(AP_TEST_INVESTIGATE_STATUS=NEEDS_HUMAN AP_TEST_QUESTION="which repro?" run_case)"
+assert "bugNH(investigate): exit 0" [ "$rc" -eq 0 ]
+assert "bugNH(investigate): ticket -> needs-input" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-BUGNH1 state)" = "needs-input" ]
+assert "bugNH(investigate): phase_at_question=investigate" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-BUGNH1 phase_at_question)" = "investigate" ]
+assert "bugNH(investigate): notify includes the question" bash -c \
+  "grep -rl 'which repro?' '$CASE_STUB_DIR/notify_calls' >/dev/null"
+assert "bugNH(investigate): parked registry written" \
+  [ -f "$CASE_AP_HOME/parked/ENG-BUGNH1.json" ]
+unset AP_ACT_LAUNCH_MODE AP_TMUX_SESSION
+
+setup_case
+export AP_ACT_LAUNCH_MODE=persistent
+export AP_TMUX_SESSION=ap-test-should-never-be-real
+artifact="$(seed_artifact_file "$CASE_WORK_REPO" docs/issues issue-eng-bugnh2.md)"
+seed_ticket "$CASE_AP_HOME" ENG-BUGNH2 piv-draft-review kind=bug pending_approval=true "artifact_path=$artifact"
+rc="$(AP_TEST_FIX_STATUS=NEEDS_HUMAN AP_TEST_QUESTION="which branch?" run_case)"
+assert "bugNH(fix): exit 0" [ "$rc" -eq 0 ]
+assert "bugNH(fix): ticket -> needs-input" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-BUGNH2 state)" = "needs-input" ]
+assert "bugNH(fix): phase_at_question=fix" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-BUGNH2 phase_at_question)" = "fix" ]
+assert "bugNH(fix): parked registry written" \
+  [ -f "$CASE_AP_HOME/parked/ENG-BUGNH2.json" ]
+unset AP_ACT_LAUNCH_MODE AP_TMUX_SESSION
+
+setup_case
+export AP_ACT_LAUNCH_MODE=persistent
+export AP_TMUX_SESSION=ap-test-should-never-be-real
+seed_ticket "$CASE_AP_HOME" ENG-BUGNH3 piv-review-pending kind=bug 'pr_urls=["https://github.com/x/y/pull/2"]'
+rc="$(AP_TEST_REVIEW_STATUS=NEEDS_HUMAN AP_TEST_QUESTION="merge conflict?" run_case)"
+assert "bugNH(review): exit 0" [ "$rc" -eq 0 ]
+assert "bugNH(review): ticket -> needs-input" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-BUGNH3 state)" = "needs-input" ]
+assert "bugNH(review): phase_at_question=review" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-BUGNH3 phase_at_question)" = "review" ]
+assert "bugNH(review): parked registry written" \
+  [ -f "$CASE_AP_HOME/parked/ENG-BUGNH3.json" ]
+unset AP_ACT_LAUNCH_MODE AP_TMUX_SESSION
+
+# --- bugExt: FAILED with an external signature at each bug phase ->
+# requeued to the state that phase started from, never `failed`.
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-BUGEXT1 queued kind=bug
+rc="$(AP_TEST_ACT_STATUS=FAILED AP_TEST_ACT_STDERR="Claude session limit reached" run_case)"
+assert "bugExt(investigate): exit 0" [ "$rc" -eq 0 ]
+assert "bugExt(investigate): ticket requeued to queued" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-BUGEXT1 state)" = "queued" ]
+assert "bugExt(investigate): history names the matched signature" \
+  ticket_history_has "$CASE_AP_HOME" ENG-BUGEXT1 "session limit"
+assert "bugExt(investigate): fail_count incremented" \
+  bash -c "[ \"\$(cat '$CASE_AP_HOME/fail_count')\" = 1 ]"
+
+setup_case
+artifact="$(seed_artifact_file "$CASE_WORK_REPO" docs/issues issue-eng-bugext2.md)"
+seed_ticket "$CASE_AP_HOME" ENG-BUGEXT2 piv-draft-review kind=bug pending_approval=true "artifact_path=$artifact"
+rc="$(AP_TEST_ACT_STATUS=FAILED AP_TEST_ACT_STDERR="Claude session limit reached" run_case)"
+assert "bugExt(fix): ticket requeued to piv-draft-review" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-BUGEXT2 state)" = "piv-draft-review" ]
+
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-BUGEXT3 piv-review-pending kind=bug 'pr_urls=["https://github.com/x/y/pull/3"]'
+rc="$(AP_TEST_ACT_STATUS=FAILED AP_TEST_ACT_STDERR="Claude session limit reached" run_case)"
+assert "bugExt(review): ticket requeued to piv-review-pending" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-BUGEXT3 state)" = "piv-review-pending" ]
+
+# --- bugFail: FAILED with NO external signature -> terminal `failed`, real
+# reason in history.
+setup_case
+artifact="$(seed_artifact_file "$CASE_WORK_REPO" docs/issues issue-eng-bugfail.md)"
+seed_ticket "$CASE_AP_HOME" ENG-BUGFAIL piv-draft-review kind=bug pending_approval=true "artifact_path=$artifact"
+rc="$(AP_TEST_ACT_STATUS=FAILED AP_TEST_ACT_STDERR="assertion error: unexpected None" run_case)"
+assert "bugFail: ticket -> failed (terminal, no external signature)" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-BUGFAIL state)" = "failed" ]
+assert "bugFail: history records a real reason" \
+  ticket_history_has "$CASE_AP_HOME" ENG-BUGFAIL "run failed"
+
+# --- bugWin: persistent-mode window naming for the bug phases, and
+# ap-runs.py's own _ACT_WINDOW_RE actually matches them (not a hand-copied
+# regex -- imported straight from ap-runs.py so the two can never drift).
+setup_case
+export AP_ACT_LAUNCH_MODE=persistent
+export AP_TMUX_SESSION=ap-test-should-never-be-real
+seed_ticket "$CASE_AP_HOME" ENG-BUGWIN1 queued kind=bug
+rc="$(AP_TEST_ACT_STATUS=NEEDS_HUMAN run_case)"
+assert "bugWin(investigate): window act_plan_ENG-BUGWIN1_investigate tracked" \
+  [ -f "$CASE_AP_HOME/.test-tmux/act_plan_ENG-BUGWIN1_investigate.meta" ]
+unset AP_ACT_LAUNCH_MODE AP_TMUX_SESSION
+
+setup_case
+export AP_ACT_LAUNCH_MODE=persistent
+export AP_TMUX_SESSION=ap-test-should-never-be-real
+seed_ticket "$CASE_AP_HOME" ENG-BUGWIN3 piv-review-pending kind=bug 'pr_urls=["https://github.com/x/y/pull/5"]'
+rc="$(AP_TEST_ACT_STATUS=NEEDS_HUMAN run_case)"
+assert "bugWin(review): window act_review_1_ENG-BUGWIN3_review tracked" \
+  [ -f "$CASE_AP_HOME/.test-tmux/act_review_1_ENG-BUGWIN3_review.meta" ]
+unset AP_ACT_LAUNCH_MODE AP_TMUX_SESSION
+
+assert "windowRe: ap-runs.py's own _ACT_WINDOW_RE matches every piv phase's window name" bash -c \
+  "python3 -c \"
+import sys; sys.path.insert(0, '$BIN_DIR')
+import importlib.util
+spec = importlib.util.spec_from_file_location('ap_runs_mod', '$BIN_DIR/ap-runs.py')
+ap_runs_mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ap_runs_mod)
+names = [
+    'act_plan_ENG-BUGWIN1_investigate',
+    'act_plan_ENG-X_design',
+    'act_build_1_ENG-X_fix',
+    'act_build_2_ENG-X_build',
+    'act_review_1_ENG-BUGWIN3_review',
+]
+for n in names:
+    assert ap_runs_mod._ACT_WINDOW_RE.match(n), n
+\""
+
+# --- bugResume (plan-critic audit regression, ENG gap): a parked FIX act
+# resumes to DONE -> ticket ends at piv-review-pending via ap-resume.sh's
+# `fix|build)` arm, not stranded at needs-input. ap-resume.sh previously had
+# NO arm at all for a resumed fix/build act's DONE.
+setup_case
+export AP_ACT_LAUNCH_MODE=persistent
+export AP_TMUX_SESSION=ap-test-should-never-be-real
+artifact="$(seed_artifact_file "$CASE_WORK_REPO" docs/issues issue-eng-bugresume.md)"
+seed_ticket "$CASE_AP_HOME" ENG-BUGRESUME piv-draft-review kind=bug pending_approval=true "artifact_path=$artifact"
+rc="$(AP_TEST_FIX_STATUS=NEEDS_HUMAN AP_TEST_QUESTION="confirm repro" run_case)"
+assert "bugResume: park exit 0" [ "$rc" -eq 0 ]
+assert "bugResume: parked registry written for fix" \
+  [ -f "$CASE_AP_HOME/parked/ENG-BUGRESUME.json" ]
+assert "bugResume: registry phase is fix" bash -c \
+  "python3 -c \"import json; d=json.load(open('$CASE_AP_HOME/parked/ENG-BUGRESUME.json')); assert d['phase']=='fix', d\""
+run_dir="$(python3 -c "import json; print(json.load(open('$CASE_AP_HOME/parked/ENG-BUGRESUME.json'))['run_dir'])")"
+unset AP_ACT_LAUNCH_MODE AP_TMUX_SESSION
+AP_HOME="$CASE_AP_HOME" AP_WORK_REPO="$CASE_WORK_REPO" AP_TEST_STUB_DIR="$CASE_STUB_DIR" \
+AP_TMUX_SESSION=ap-test-should-never-be-real AP_BUILD_SLOTS=2 \
+PATH="$CASE_STUB_DIR:$PATH" \
+  bash "$BIN_DIR/ap-resume.sh" ENG-BUGRESUME "" \
+  >"$CASE_AP_HOME/resume-bug.stdout.log" 2>"$CASE_AP_HOME/resume-bug.stderr.log" &
+resume_pid=$!
+sleep 1
+echo '{"status":"DONE","issue":"ENG-BUGRESUME","pr_urls":["https://github.com/x/y/pull/9"]}' >"$run_dir/status.json"
+wait "$resume_pid"; resume_rc=$?
+assert "bugResume: ap-resume.sh exits 0" [ "$resume_rc" -eq 0 ]
+assert "bugResume: ticket ends at piv-review-pending, not stranded at needs-input" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-BUGRESUME state)" = "piv-review-pending" ]
+assert "bugResume: parked registry cleared" \
+  [ ! -f "$CASE_AP_HOME/parked/ENG-BUGRESUME.json" ]
+
+# =============================================================================
+# piv feature-fork pipeline
+# (docs/plans/2026-09-03-ap-piv-feature-fork-pipeline.md). `kind=feature` (or
+# absent -- the default) routes through piv-plan-implementation (design) ->
+# (human plan-review gate) -> piv-implement (build) -> piv-review-pr
+# (review), reusing the SAME shared piv state set as the bug fork above.
+# Kind-independent coverage (review-lane ports/exhaustion/clamping, the
+# port-collision matrix, the review dispatch prompt shape) is NOT repeated
+# here -- it was already exercised once, via the bug-kind section above, per
+# both piv plans' own instruction against duplicating it per kind.
+# =============================================================================
+
+# --- feat(1): queued + kind=feature -> design dispatch, piv-drafting.
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-FEAT1 queued kind=feature
+rc="$(run_case)"
+assert "feat1: exit 0" [ "$rc" -eq 0 ]
+assert "feat1: exactly one claude call (design act)" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 1 ]
+act_args="$CASE_STUB_DIR/claude_calls/1.args"
+assert "feat1: prompt targets piv-plan-implementation ENG-FEAT1 --headless" bash -c \
+  "[ -f '$act_args' ] && grep -q 'piv-plan-implementation ENG-FEAT1 --headless' '$act_args'"
+assert "feat1: prompt carries --run-dir" bash -c \
+  "[ -f '$act_args' ] && grep -q -- '--run-dir /' '$act_args'"
+assert "feat1: ticket claimed into piv-drafting" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-FEAT1 state)" = "piv-drafting" ]
+
+# --- feat(2): design DONE pings "plan ready for review".
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-FEAT2 queued kind=feature
+rc="$(AP_TEST_DESIGN_STATUS=DONE run_case)"
+assert "feat2: exit 0" [ "$rc" -eq 0 ]
+assert "feat2: design DONE pings 'plan ready for review'" bash -c \
+  "grep -rl 'plan ready for review' '$CASE_STUB_DIR/notify_calls' >/dev/null"
+
+# --- feat(2b): same, but the ticket's own auto_approve is set -> the ping
+# says "plan auto-approved, building" instead of asking for `ap approve`.
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-FEAT2B queued kind=feature auto_approve=true
+rc="$(AP_TEST_DESIGN_STATUS=DONE run_case)"
+assert "feat2b: exit 0" [ "$rc" -eq 0 ]
+assert "feat2b: notify says auto-approved, building" bash -c \
+  "grep -rl '^plan auto-approved, building: ENG-FEAT2B\$' '$CASE_STUB_DIR/notify_calls' >/dev/null"
+
+# --- feat(3): piv-draft-review + kind=feature + approved -> build dispatch
+# with --plan, --issue, and slot-1 ports; slot 1 held -> slot 2.
+setup_case
+artifact="$(seed_artifact_file "$CASE_WORK_REPO" docs/plans eng-feat3-thing.md)"
+seed_ticket "$CASE_AP_HOME" ENG-FEAT3 piv-draft-review kind=feature pending_approval=true "artifact_path=$artifact"
+rc="$(run_case)"
+assert "feat3: exit 0" [ "$rc" -eq 0 ]
+act_args="$CASE_STUB_DIR/claude_calls/1.args"
+assert "feat3: prompt targets piv-implement with --plan, --issue, slot-1 ports" bash -c \
+  "[ -f '$act_args' ] && grep -q -- '--plan' '$act_args' && grep -q -- '--issue ENG-FEAT3' '$act_args' && grep -q -- '--ports fe=5174,be=8001' '$act_args'"
+# Same synchronous-completion note as bug(3) above: the stub's default
+# status is DONE, so by the time run_case returns the ticket has already
+# advanced past the transient piv-implementing claim state.
+assert "feat3: ticket ends at piv-review-pending (build ran to DONE synchronously)" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-FEAT3 state)" = "piv-review-pending" ]
+
+setup_case
+artifact="$(seed_artifact_file "$CASE_WORK_REPO" docs/plans eng-feat3b-thing.md)"
+seed_ticket "$CASE_AP_HOME" ENG-FEAT3B piv-draft-review kind=feature pending_approval=true "artifact_path=$artifact"
+hold_lane_lock "$CASE_AP_HOME/lock.build.1" 3; fb_holder="$LANE_HOLDER_PID"
+sleep 0.4
+rc="$(AP_BUILD_SLOTS=2 run_case)"
+wait "$fb_holder" 2>/dev/null
+assert "feat3b: exit 0" [ "$rc" -eq 0 ]
+act_args="$CASE_STUB_DIR/claude_calls/1.args"
+assert "feat3b: slot 1 busy -> slot 2 ports (fe=5175,be=8002)" bash -c \
+  "[ -f '$act_args' ] && grep -q -- '--ports fe=5175,be=8002' '$act_args'"
+
+# --- feat(4): build DONE -> exactly ONE claude call this cycle (proves the
+# implement->ship chain is unreachable for a feature ticket), ticket ->
+# piv-review-pending, notify says "review pending".
+setup_case
+artifact="$(seed_artifact_file "$CASE_WORK_REPO" docs/plans eng-feat4-thing.md)"
+seed_ticket "$CASE_AP_HOME" ENG-FEAT4 piv-draft-review kind=feature pending_approval=true "artifact_path=$artifact"
+rc="$(AP_TEST_BUILD_STATUS=DONE run_case)"
+assert "feat4: exit 0" [ "$rc" -eq 0 ]
+assert "feat4: exactly one claude call (no chained ship)" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 1 ]
+assert "feat4: ticket -> piv-review-pending" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-FEAT4 state)" = "piv-review-pending" ]
+assert "feat4: notify says review pending" bash -c \
+  "grep -rl '^review pending: ENG-FEAT4\$' '$CASE_STUB_DIR/notify_calls' >/dev/null"
+
+# --- featNH: NEEDS_HUMAN at each of design/build -> needs-input + the right
+# phase_at_question + notify + (persistent mode) a parked-registry entry.
+setup_case
+export AP_ACT_LAUNCH_MODE=persistent
+export AP_TMUX_SESSION=ap-test-should-never-be-real
+seed_ticket "$CASE_AP_HOME" ENG-FEATNH1 queued kind=feature
+rc="$(AP_TEST_DESIGN_STATUS=NEEDS_HUMAN AP_TEST_QUESTION="which pattern?" run_case)"
+assert "featNH(design): exit 0" [ "$rc" -eq 0 ]
+assert "featNH(design): ticket -> needs-input" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-FEATNH1 state)" = "needs-input" ]
+assert "featNH(design): phase_at_question=design" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-FEATNH1 phase_at_question)" = "design" ]
+assert "featNH(design): parked registry written" \
+  [ -f "$CASE_AP_HOME/parked/ENG-FEATNH1.json" ]
+unset AP_ACT_LAUNCH_MODE AP_TMUX_SESSION
+
+setup_case
+export AP_ACT_LAUNCH_MODE=persistent
+export AP_TMUX_SESSION=ap-test-should-never-be-real
+artifact="$(seed_artifact_file "$CASE_WORK_REPO" docs/plans eng-featnh2-thing.md)"
+seed_ticket "$CASE_AP_HOME" ENG-FEATNH2 piv-draft-review kind=feature pending_approval=true "artifact_path=$artifact"
+rc="$(AP_TEST_BUILD_STATUS=NEEDS_HUMAN AP_TEST_QUESTION="dirty worktree" run_case)"
+assert "featNH(build): exit 0" [ "$rc" -eq 0 ]
+assert "featNH(build): ticket -> needs-input" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-FEATNH2 state)" = "needs-input" ]
+assert "featNH(build): phase_at_question=build" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-FEATNH2 phase_at_question)" = "build" ]
+assert "featNH(build): parked registry written" \
+  [ -f "$CASE_AP_HOME/parked/ENG-FEATNH2.json" ]
+unset AP_ACT_LAUNCH_MODE AP_TMUX_SESSION
+
+# --- featExt: FAILED with an external signature at each feature phase ->
+# requeued, never `failed`.
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-FEATEXT1 queued kind=feature
+rc="$(AP_TEST_ACT_STATUS=FAILED AP_TEST_ACT_STDERR="You've hit your session limit" run_case)"
+assert "featExt(design): ticket requeued to queued" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-FEATEXT1 state)" = "queued" ]
+
+setup_case
+artifact="$(seed_artifact_file "$CASE_WORK_REPO" docs/plans eng-featext2-thing.md)"
+seed_ticket "$CASE_AP_HOME" ENG-FEATEXT2 piv-draft-review kind=feature pending_approval=true "artifact_path=$artifact"
+rc="$(AP_TEST_ACT_STATUS=FAILED AP_TEST_ACT_STDERR="You've hit your session limit" run_case)"
+assert "featExt(build): ticket requeued to piv-draft-review" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-FEATEXT2 state)" = "piv-draft-review" ]
+
+# --- featFail: FAILED with NO external signature -> terminal `failed`.
+setup_case
+artifact="$(seed_artifact_file "$CASE_WORK_REPO" docs/plans eng-featfail-thing.md)"
+seed_ticket "$CASE_AP_HOME" ENG-FEATFAIL piv-draft-review kind=feature pending_approval=true "artifact_path=$artifact"
+rc="$(AP_TEST_ACT_STATUS=FAILED AP_TEST_ACT_STDERR="assertion error: unexpected None" run_case)"
+assert "featFail: ticket -> failed" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-FEATFAIL state)" = "failed" ]
+
+# --- featWin: persistent-mode window naming for design/build.
+setup_case
+export AP_ACT_LAUNCH_MODE=persistent
+export AP_TMUX_SESSION=ap-test-should-never-be-real
+seed_ticket "$CASE_AP_HOME" ENG-FEATWIN1 queued kind=feature
+rc="$(AP_TEST_ACT_STATUS=NEEDS_HUMAN run_case)"
+assert "featWin(design): window act_plan_ENG-FEATWIN1_design tracked" \
+  [ -f "$CASE_AP_HOME/.test-tmux/act_plan_ENG-FEATWIN1_design.meta" ]
+unset AP_ACT_LAUNCH_MODE AP_TMUX_SESSION
+
+setup_case
+export AP_ACT_LAUNCH_MODE=persistent
+export AP_TMUX_SESSION=ap-test-should-never-be-real
+artifact="$(seed_artifact_file "$CASE_WORK_REPO" docs/plans eng-featwin2-thing.md)"
+seed_ticket "$CASE_AP_HOME" ENG-FEATWIN2 piv-draft-review kind=feature pending_approval=true "artifact_path=$artifact"
+rc="$(AP_TEST_ACT_STATUS=NEEDS_HUMAN run_case)"
+assert "featWin(build): window act_build_1_ENG-FEATWIN2_build tracked" \
+  [ -f "$CASE_AP_HOME/.test-tmux/act_build_1_ENG-FEATWIN2_build.meta" ]
+unset AP_ACT_LAUNCH_MODE AP_TMUX_SESSION
+
+# --- featResume (the exact ENG-1549 bug this session found and fixed live):
+# a parked BUILD act resumes to DONE -> ticket ends at piv-review-pending via
+# ap-resume.sh's `fix|build)` arm, not stranded at needs-input.
+setup_case
+export AP_ACT_LAUNCH_MODE=persistent
+export AP_TMUX_SESSION=ap-test-should-never-be-real
+artifact="$(seed_artifact_file "$CASE_WORK_REPO" docs/plans eng-featresume-thing.md)"
+seed_ticket "$CASE_AP_HOME" ENG-FEATRESUME piv-draft-review kind=feature pending_approval=true "artifact_path=$artifact"
+rc="$(AP_TEST_BUILD_STATUS=NEEDS_HUMAN AP_TEST_QUESTION="confirm scope" run_case)"
+assert "featResume: park exit 0" [ "$rc" -eq 0 ]
+assert "featResume: parked registry written for build" \
+  [ -f "$CASE_AP_HOME/parked/ENG-FEATRESUME.json" ]
+assert "featResume: registry phase is build" bash -c \
+  "python3 -c \"import json; d=json.load(open('$CASE_AP_HOME/parked/ENG-FEATRESUME.json')); assert d['phase']=='build', d\""
+run_dir="$(python3 -c "import json; print(json.load(open('$CASE_AP_HOME/parked/ENG-FEATRESUME.json'))['run_dir'])")"
+unset AP_ACT_LAUNCH_MODE AP_TMUX_SESSION
+AP_HOME="$CASE_AP_HOME" AP_WORK_REPO="$CASE_WORK_REPO" AP_TEST_STUB_DIR="$CASE_STUB_DIR" \
+AP_TMUX_SESSION=ap-test-should-never-be-real AP_BUILD_SLOTS=2 \
+PATH="$CASE_STUB_DIR:$PATH" \
+  bash "$BIN_DIR/ap-resume.sh" ENG-FEATRESUME "" \
+  >"$CASE_AP_HOME/resume-feat.stdout.log" 2>"$CASE_AP_HOME/resume-feat.stderr.log" &
+resume_pid=$!
+sleep 1
+echo '{"status":"DONE","issue":"ENG-FEATRESUME","pr_urls":["https://github.com/x/y/pull/10"]}' >"$run_dir/status.json"
+wait "$resume_pid"; resume_rc=$?
+assert "featResume: ap-resume.sh exits 0" [ "$resume_rc" -eq 0 ]
+assert "featResume: ticket ends at piv-review-pending, not stranded at needs-input" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-FEATRESUME state)" = "piv-review-pending" ]
+assert "featResume: parked registry cleared" \
+  [ ! -f "$CASE_AP_HOME/parked/ENG-FEATRESUME.json" ]
+
+# --- legacyInert: a `queued` ticket with NO `kind` field at all (the
+# back-compat default) never invokes /implement-issue or /ship-work --
+# assert on the recorded claude argv, not just the final state.
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-LEGACY1 queued
+rc="$(run_case)"
+assert "legacyInert: exit 0" [ "$rc" -eq 0 ]
+assert "legacyInert: exactly one claude call" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 1 ]
+act_args="$CASE_STUB_DIR/claude_calls/1.args"
+assert "legacyInert: dispatches piv-plan-implementation" bash -c \
+  "[ -f '$act_args' ] && grep -q 'piv-plan-implementation ENG-LEGACY1' '$act_args'"
+assert "legacyInert: never invokes implement-issue" bash -c \
+  "[ -f '$act_args' ] && ! grep -q 'implement-issue' '$act_args'"
+assert "legacyInert: never invokes ship-work" bash -c \
+  "[ -f '$act_args' ] && ! grep -q 'ship-work' '$act_args'"
+
+# =============================================================================
+# unrecognizedAction: an unrecognized action from the decider must never
+# strand a claimed ticket with no dispatched claude call and no state change
+# -- ap-cycle.sh's own lane-lock case statement fails closed to needs-input.
+# Kind-independent; exercised via a stubbed ap-decide.sh. NOT a symlinked bin
+# dir (case9/case10's pattern): ap-cycle.sh resolves its own SCRIPT_DIR via
+# `readlink -f "${BASH_SOURCE[0]}"`, which FOLLOWS a symlink straight back to
+# the real bin dir -- a symlinked ap-cycle.sh would always source/call the
+# REAL ap-decide.sh regardless of where the symlink lives. A full, real COPY
+# of the bin dir (not symlinks) has no such indirection to defeat.
+# =============================================================================
+setup_case
+COPY_BIN="$(mktemp -d)"
+cp -a "$BIN_DIR"/. "$COPY_BIN"/
+cat >"$COPY_BIN/ap-decide.sh" <<'EOF'
+#!/usr/bin/env bash
+echo '{"action":"frobnicate","issue":"ENG-BADACT"}'
+EOF
+chmod +x "$COPY_BIN/ap-decide.sh"
+seed_ticket "$CASE_AP_HOME" ENG-BADACT queued
+rc="$(
+  AP_HOME="$CASE_AP_HOME" \
+  AP_WORK_REPO="$CASE_WORK_REPO" \
+  AP_TEST_STUB_DIR="$CASE_STUB_DIR" \
+  AP_ACT_LAUNCH_MODE=oneshot \
+  AP_TMUX_SESSION=ap-test-should-never-be-real \
+  PATH="$CASE_STUB_DIR:$PATH" \
+    bash "$COPY_BIN/ap-cycle.sh" >"$CASE_AP_HOME/stdout.log" 2>"$CASE_AP_HOME/stderr.log"
+  echo $?
+)"
+assert "unrecognizedAction: exit 0" [ "$rc" -eq 0 ]
+assert "unrecognizedAction: no claude call at all" \
+  [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 0 ]
+assert "unrecognizedAction: ticket routed to needs-input, not stranded claimed" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-BADACT state)" = "needs-input" ]
+assert "unrecognizedAction: question names the unrecognized action" bash -c \
+  "python3 -c \"import json; d=json.load(open('$CASE_AP_HOME/queue/ENG-BADACT.json')); assert 'frobnicate' in (d.get('question') or ''), d\""
 
 if [[ "$FAILURES" -eq 0 ]]; then
   echo "ALL PASS"

@@ -1005,7 +1005,22 @@ case "$action" in
       # after its last tool call. Per each headless section, neither `fix`
       # nor `build` writes ticket state itself.
       if [[ -n "${issue:-}" && "$issue" != "null" ]]; then
-        queue_set "$issue" --state piv-review-pending --event "$final_phase done, PR open -> review pending"
+        # Belt-and-suspenders on pr_urls: each headless section also tells the
+        # skill to record pr_urls on the ticket itself in its own last write
+        # ("Record on the ticket in one write: --field pr_urls=..."), but a
+        # session that completes every other step and skips just that one
+        # extra CLI call still writes a DONE status.json with pr_urls filled
+        # (confirmed live on ENG-1594, 2026-09-05: status.json had the PR,
+        # the ticket's own pr_urls stayed [], and review parked with "Could
+        # not resolve the PR"). status_file is still the completed act's own
+        # file here -- read straight from it rather than trust the skill's
+        # side channel landed.
+        done_pr_urls="$(json_field "$(cat "$status_file" 2>/dev/null)" ".pr_urls")"
+        pr_urls_args=()
+        if [[ -n "$done_pr_urls" && "$done_pr_urls" != "null" ]]; then
+          pr_urls_args=(--field "pr_urls=$done_pr_urls")
+        fi
+        queue_set "$issue" --state piv-review-pending "${pr_urls_args[@]}" --event "$final_phase done, PR open -> review pending"
         ap-notify.sh "review pending: ${issue:-$action}" "$final_phase committed, PR open, agentic review queued" || true
       fi
     fi
@@ -1149,11 +1164,22 @@ $transcript_tail}"
       if [[ -n "${issue:-}" && "$issue" != "null" ]]; then
         # A bare "run failed" event told you nothing beyond the STATUS
         # column already showing FAILED -- this is exactly what "I should
-        # be able to see the reason" was missing. Pull the first real line
-        # out of the transcript's own explanation (falls back to stderr),
-        # since that's usually the model's own account of what went wrong,
-        # not just a stack trace.
-        fail_reason="$(printf '%s' "${transcript_tail:-$stderr_tail}" | grep -m1 -v '^[[:space:]]*$' | tr -d '\n' | cut -c1-200)"
+        # be able to see the reason" was missing. status.json's own
+        # `detail` (falling back to `question`) is preferred when present:
+        # it's the session's own structured account of what went wrong,
+        # written deliberately, not scraped -- the transcript/stderr grep
+        # below can otherwise pick up a stray fragment of the model's own
+        # conversational narration (confirmed live, ENG-1549: "That works.
+        # Let me find AP_HOME.") or miss a fully-populated detail entirely
+        # (confirmed live, ENG-17990: detail had the real reason -- a
+        # nonexistent ticket ID plus Bash denied wholesale -- while this
+        # grep produced only "no stderr/transcript captured").
+        fail_reason="$(json_field "$status_json" ".detail")"
+        [[ -z "$fail_reason" ]] && fail_reason="$(json_field "$status_json" ".question")"
+        if [[ -z "$fail_reason" ]]; then
+          fail_reason="$(printf '%s' "${transcript_tail:-$stderr_tail}" | grep -m1 -v '^[[:space:]]*$' | tr -d '\n' | cut -c1-200)"
+        fi
+        fail_reason="$(printf '%s' "$fail_reason" | tr -d '\n' | cut -c1-200)"
         [[ -z "$fail_reason" ]] && fail_reason="no stderr/transcript captured"
         queue_set "$issue" --state failed --event "run failed: $fail_reason"
       fi

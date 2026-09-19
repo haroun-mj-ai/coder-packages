@@ -323,6 +323,31 @@ interim `status.json` (`FAILED`, `detail: "gates still running at turn
 end"`) first and let the retry recover — never leave the file unwritten
 while waiting.
 
+**This rule does not apply to dispatching a sub-agent via the `Agent` tool**
+(a `plan-critic`/`red-team`/`challenge` audit, a Codex second draft, or any
+other fresh-agent dispatch a skill's own steps call for). Ending the turn
+right after such a dispatch is the *correct* move, not a risk to guard
+against: the background-wait ceiling above is specifically about a literal
+shell command the model is synchronously blocking on (a test suite run as a
+foreground `Bash` call); an `Agent` dispatch is not that — it returns
+immediately, and its result arrives as an ordinary later message in the
+*same* session (interactive or a persistent-mode tmux window alike), which
+the harness delivers and resumes on its own, no ceiling involved. **Do not
+write an interim `status.json` after dispatching a sub-agent and stop
+there** — doing so is actively harmful, not merely unnecessary: the wrapper
+in `ap-cycle.sh` treats a `FAILED`/`DONE` `status.json`'s mere existence as
+the act being finished and tears the window down within a few seconds,
+which permanently cuts off the dispatch's own notification before it can
+ever arrive — turning a run that would have completed successfully into a
+guaranteed, wasted failure. Just end the turn with nothing written; the
+next message (the dispatch's result) continues the same run normally.
+Caught live on `ENG-1594`'s `piv-investigate-issue` run on 2026-09-04:
+step 7's red-team/challenge dispatch led the act to (mistakenly) treat a
+now-deprecated `TaskOutput` tool as the only way to retrieve the result,
+concluded it therefore "must await the notification" — correctly — but then
+wrote an interim `FAILED` status.json anyway "to be safe," which is exactly
+what got the run killed before that notification could land.
+
 ## Pipelines and their phase vocabularies
 
 | pipeline | selected by | phases (`status.json`'s `phase`) | states | lanes |

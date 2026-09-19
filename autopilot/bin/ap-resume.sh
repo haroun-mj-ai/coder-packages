@@ -505,7 +505,19 @@ case "$final_status" in
       # exactly the same reasoning, which is why the arm is widened to
       # fix|build now rather than left fix-only for a later fork to discover
       # missing a second time.
-      queue_set --state piv-review-pending --event "$phase done (resumed), PR open -> review pending"
+      # Belt-and-suspenders on pr_urls, mirroring ap-cycle.sh's own fix|build
+      # DONE arm (and the same live bug, ENG-1594, 2026-09-05): the skill's
+      # own status.json can have pr_urls filled while its separate "record
+      # pr_urls on the ticket" CLI call gets skipped, leaving the ticket's
+      # own pr_urls stuck at [] and review parking on "Could not resolve the
+      # PR." Read it straight from this resumed act's own status_json rather
+      # than trust the skill's side channel landed.
+      resumed_pr_urls="$(json_field "$status_json" ".pr_urls")"
+      resumed_pr_urls_args=()
+      if [[ -n "$resumed_pr_urls" && "$resumed_pr_urls" != "null" ]]; then
+        resumed_pr_urls_args=(--field "pr_urls=$resumed_pr_urls")
+      fi
+      queue_set --state piv-review-pending "${resumed_pr_urls_args[@]}" --event "$phase done (resumed), PR open -> review pending"
       teardown_window "$window"
       ap-notify.sh "review pending: $eng_id" "PR open; will review automatically next cycle" || true
     elif [[ "$phase" == "implement" ]]; then

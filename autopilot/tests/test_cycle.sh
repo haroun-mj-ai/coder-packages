@@ -225,14 +225,16 @@ fi
 status_issue="${AP_TEST_ADHOC_STATUS_ISSUE:-${AP_TEST_ACT_ISSUE:-}}"
 if [[ "$skip_status" != "1" && -n "${AP_RUN_DIR:-}" ]]; then
   mkdir -p "$AP_RUN_DIR"
-  python3 - "$status" "${AP_TEST_QUESTION:-what should I do}" "${AP_TEST_PR_URL:-https://github.com/x/y/pull/1}" "$status_issue" <<'PY' >"$status_dest"
+  python3 - "$status" "${AP_TEST_QUESTION:-what should I do}" "${AP_TEST_PR_URL:-https://github.com/x/y/pull/1}" "$status_issue" "${AP_TEST_DETAIL:-}" <<'PY' >"$status_dest"
 import json, sys
-status, question, pr_url, issue = sys.argv[1:5]
+status, question, pr_url, issue, detail = sys.argv[1:6]
 d = {"status": status, "issue": (issue or None)}
 if status == "NEEDS_HUMAN":
     d["question"] = question
 if status == "DONE":
     d["pr_urls"] = [pr_url]
+if status == "FAILED" and detail:
+    d["detail"] = detail
 print(json.dumps(d))
 PY
 fi
@@ -594,6 +596,21 @@ assert "case6: exit 0" [ "$rc" -eq 0 ]
 assert "case6: ticket state -> failed" [ "$(ticket_field "$CASE_AP_HOME" ENG-6 state)" = "failed" ]
 assert "case6: history records the failure" ticket_history_has "$CASE_AP_HOME" ENG-6 "run failed"
 assert "case6: notify called" [ "$(count_files "$CASE_STUB_DIR/notify_calls")" -ge 1 ]
+
+# --- Case 6b (ENG-1549/ENG-17990 regression, 2026-09-06): FAILED status.json
+# carrying a real `detail` must win over stray stderr/transcript noise as the
+# queue's recorded failure reason -- previously the transcript/stderr grep ran
+# unconditionally and could pick up a fragment of the model's own
+# conversational narration (or nothing at all) even when `detail` had the
+# real, structured explanation.
+setup_case
+seed_ticket "$CASE_AP_HOME" ENG-6B plan-review pending_approval=true
+seed_plan_file "$CASE_WORK_REPO" ENG-6B
+rc="$(AP_TEST_ACT_STATUS=FAILED AP_TEST_DETAIL="the real, structured reason" AP_TEST_ACT_STDERR="That works. Let me find AP_HOME." run_case)"
+assert "case6b: exit 0" [ "$rc" -eq 0 ]
+assert "case6b: ticket state -> failed" [ "$(ticket_field "$CASE_AP_HOME" ENG-6B state)" = "failed" ]
+assert "case6b: history uses status.json's detail, not the stderr fragment" \
+  ticket_history_has "$CASE_AP_HOME" ENG-6B "run failed: the real, structured reason"
 
 # =============================================================================
 # Case 7: no status.json -> same failed handling; a second consecutive
@@ -1805,6 +1822,12 @@ assert "bug3: prompt targets piv-implement-issue with --rca and slot-1 ports" ba
 # observe the transient piv-implementing claim state through this harness.
 assert "bug3: ticket ends at piv-review-pending (fix ran to DONE synchronously)" \
   [ "$(ticket_field "$CASE_AP_HOME" ENG-BUG3 state)" = "piv-review-pending" ]
+# Regression: ENG-1594 live, 2026-09-05 -- the skill's own status.json had
+# pr_urls filled, but the ticket's own pr_urls field stayed [] because the
+# wrapper's DONE branch never read it, only the state transition. Review
+# then parked on "Could not resolve the PR for this ticket."
+assert "bug3: ticket's own pr_urls backfilled from status.json (not left [])" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-BUG3 pr_urls)" = '["https://github.com/x/y/pull/1"]' ]
 
 setup_case
 artifact="$(seed_artifact_file "$CASE_WORK_REPO" docs/issues issue-eng-bug3b.md)"
@@ -1829,6 +1852,8 @@ assert "bug4: exactly one claude call (no chained review)" \
   [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 1 ]
 assert "bug4: ticket -> piv-review-pending" \
   [ "$(ticket_field "$CASE_AP_HOME" ENG-BUG4 state)" = "piv-review-pending" ]
+assert "bug4: ticket's own pr_urls backfilled from status.json (not left [])" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-BUG4 pr_urls)" = '["https://github.com/x/y/pull/1"]' ]
 assert "bug4: notify says review pending" bash -c \
   "grep -rl '^review pending: ENG-BUG4\$' '$CASE_STUB_DIR/notify_calls' >/dev/null"
 
@@ -2050,6 +2075,11 @@ wait "$resume_pid"; resume_rc=$?
 assert "bugResume: ap-resume.sh exits 0" [ "$resume_rc" -eq 0 ]
 assert "bugResume: ticket ends at piv-review-pending, not stranded at needs-input" \
   [ "$(ticket_field "$CASE_AP_HOME" ENG-BUGRESUME state)" = "piv-review-pending" ]
+# Regression: ap-resume.sh's fix|build DONE arm had the same pr_urls gap as
+# ap-cycle.sh's (ENG-1594 live, 2026-09-05) -- state transitioned but the
+# resumed act's own pr_urls never made it onto the ticket.
+assert "bugResume: ticket's own pr_urls backfilled from the resumed status.json" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-BUGRESUME pr_urls)" = '["https://github.com/x/y/pull/9"]' ]
 assert "bugResume: parked registry cleared" \
   [ ! -f "$CASE_AP_HOME/parked/ENG-BUGRESUME.json" ]
 
@@ -2112,6 +2142,12 @@ assert "feat3: prompt targets piv-implement with --plan, --issue, slot-1 ports" 
 # advanced past the transient piv-implementing claim state.
 assert "feat3: ticket ends at piv-review-pending (build ran to DONE synchronously)" \
   [ "$(ticket_field "$CASE_AP_HOME" ENG-FEAT3 state)" = "piv-review-pending" ]
+# Regression: ENG-1594 live, 2026-09-05 -- the skill's own status.json had
+# pr_urls filled, but the ticket's own pr_urls field stayed [] because the
+# wrapper's DONE branch never read it, only the state transition. Review
+# then parked on "Could not resolve the PR for this ticket."
+assert "feat3: ticket's own pr_urls backfilled from status.json (not left [])" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-FEAT3 pr_urls)" = '["https://github.com/x/y/pull/1"]' ]
 
 setup_case
 artifact="$(seed_artifact_file "$CASE_WORK_REPO" docs/plans eng-feat3b-thing.md)"
@@ -2137,6 +2173,8 @@ assert "feat4: exactly one claude call (no chained ship)" \
   [ "$(count_files "$CASE_STUB_DIR/claude_calls")" -eq 1 ]
 assert "feat4: ticket -> piv-review-pending" \
   [ "$(ticket_field "$CASE_AP_HOME" ENG-FEAT4 state)" = "piv-review-pending" ]
+assert "feat4: ticket's own pr_urls backfilled from status.json (not left [])" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-FEAT4 pr_urls)" = '["https://github.com/x/y/pull/1"]' ]
 assert "feat4: notify says review pending" bash -c \
   "grep -rl '^review pending: ENG-FEAT4\$' '$CASE_STUB_DIR/notify_calls' >/dev/null"
 
@@ -2242,6 +2280,8 @@ wait "$resume_pid"; resume_rc=$?
 assert "featResume: ap-resume.sh exits 0" [ "$resume_rc" -eq 0 ]
 assert "featResume: ticket ends at piv-review-pending, not stranded at needs-input" \
   [ "$(ticket_field "$CASE_AP_HOME" ENG-FEATRESUME state)" = "piv-review-pending" ]
+assert "featResume: ticket's own pr_urls backfilled from the resumed status.json" \
+  [ "$(ticket_field "$CASE_AP_HOME" ENG-FEATRESUME pr_urls)" = '["https://github.com/x/y/pull/10"]' ]
 assert "featResume: parked registry cleared" \
   [ ! -f "$CASE_AP_HOME/parked/ENG-FEATRESUME.json" ]
 

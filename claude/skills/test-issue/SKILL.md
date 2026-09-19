@@ -128,6 +128,108 @@ out — this command only asks the question, it never writes.
 If drift or a conflict is found, the handoff in step 7 says to run `/ship-work`
 (which rebases properly and waits on CI) — never suggest a manual rebase here.
 
+### 1b. Root-cause & surface coverage audit
+
+This is what turns "the tests pass" into "I'm confident this closes the root cause
+and nothing else shares its defect." It is cheap and deterministic — pure git/grep,
+no servers — so it runs here, before step 2's preflight, not bolted on at the end.
+
+**Read the issue's own investigation artifact**, whichever kind this issue has:
+
+- **Bug path**: `docs/issues/issue-<ENG-ID>.md` (the RCA, root repo) — pull its
+  **Evidence Chain (5 Whys)**, **Files to Modify**, and **Adversarial Review**
+  sections. Also read `docs/issues/reports/<ENG-ID>-fix-report.md` if it exists — the
+  implementer's own account of what it did and any deviations. Read it for *claims*,
+  not proof; every check below re-verifies those claims against the real diff rather
+  than trusting the narrative.
+- **Feature path**: the plan doc (`docs/plans/*.md`) — pull its **Relevant Codebase
+  Files** / **New Files to Create** and **Adversarial Review** sections instead.
+
+Four distinct checks. Keep them distinct in your notes and in step 6's verdict too —
+each answers a different question, and folding them into one bucket lets a PR that
+passes one hide a failure on another (a diff that does exactly what the RCA asked
+can still miss a surface the RCA never knew to ask about; that is not a lesser
+version of the same finding, it is a different, worse one).
+
+**1. Root-cause coverage — does the diff do what the artifact said to do?**
+
+```bash
+gh pr diff <PR#> -R JourneyAI-Team/<repo> --name-only
+```
+
+For every file the artifact names as needing a change:
+- **Present in the diff** — fine, move on.
+- **Absent from the diff** — find the artifact's own words for why (a "Decision"
+  section redirecting scope, an explicit "out of scope"/"descoped" callout, a
+  follow-up ticket named). If one exists, quote it in your report. **If none
+  exists, this is a real gap** — a location the investigation itself said needed to
+  change, that nothing changed. Report it prominently; a silent omission is not the
+  same as a documented descope, and only the latter is safe to merge past.
+
+A file the diff touches that the artifact never named needs only a one-line reason
+(a new test file, a docstring) — but unexplained production logic there is worth
+asking about, since it means the artifact's own root-cause scope may be incomplete.
+
+**This check is bounded by the artifact's own imagination — it can only confirm the
+PR covers what the RCA thought to name.** It cannot tell you the RCA missed
+something entirely; that is check 2's job, not this one, and a clean result here
+says nothing about whether check 2 is also clean.
+
+**2. Surface coverage — did the investigation itself fail to name a location that
+actually shares the defect?** This is a different question from check 1 and does
+not follow from it: check 1 asks "did the fix do what the RCA specified," this asks
+"did the RCA specify enough in the first place." Do not skip this because check 1
+came back clean — a clean check 1 on an incomplete RCA is exactly the failure mode
+this check exists to catch.
+
+Grep the *symbol* or *anti-pattern* the root cause centers on (a field name, a
+function, the specific missing guard or comparison) — not the ticket number, and
+critically, **not limited to the files the artifact already discusses**:
+
+```bash
+grep -rn "<the field/function/pattern the root cause centers on>" --include='*.py' <repo>
+```
+
+Sort every hit into one of three buckets: touched by this diff; named by the
+artifact as known-and-descoped (quote it — a location the RCA *named and chose not
+to fix* is a documented decision, not a miss); or **neither** — a location the RCA
+**never mentioned at all**, that the pattern still reaches. That third bucket, and
+only that third bucket, is a surface-coverage finding. A full-repo grep costs
+seconds; a sibling call site the investigation never knew about is exactly what
+comes back as a new ticket two weeks after everyone thought this was closed.
+
+**3. Adversarial-review test backing — does every must-preserve case actually have
+a test, or just a claim?** If the artifact's **Adversarial Review** section names a
+must-stay-suppressed/must-not-regress case, a discriminator attack, or a boundary a
+red-team/challenge pass insisted on (a timezone grace day, a null-fallback, a
+specific ordering, a case that must keep failing) — grep the diff's test files for a
+test whose name or docstring actually matches that scenario. A must-preserve case
+with no matching test is one that can regress silently on the very next refactor;
+name it explicitly rather than assuming the artifact's prose is enough on its own.
+
+**4. Mutation spot-check — did you watch a claimed test actually catch its
+regression, or only read that it does?** If the report claims mutation testing was
+done, don't take "reverted it, confirmed the test failed by name, restored it" on
+faith — reproduce it once yourself, for the single most load-bearing change
+(usually the exact line the root cause centers on):
+
+```bash
+git -C <worktree> stash push -u -m "test-issue-mutation-check-<ENG-ID>"
+# hand-revert the one line/guard the report claims is load-bearing
+poetry run pytest <the test file it claims covers it> -k <test name> -v   # must FAIL
+git -C <worktree> stash list --format='%H %gs'   # find your entry by its tag
+git -C <worktree> stash apply <that sha>                                  # never a bare pop
+poetry run pytest <same test> -v                                          # must PASS again
+git -C <worktree> stash drop <that sha>
+```
+
+Ten minutes here is the difference between "the implementer says the test is
+meaningful" and "I watched it fail for the right reason" — and it is the strongest
+single piece of evidence you can hand yourself before merging.
+
+Carry all four into step 6 as four separate lines, not one bucket — don't wait
+until then to write any of it down; capture findings as you go.
+
 ### 2. Environment preflight
 
 Cheap and deterministic — do this before anything that costs money or time. If
@@ -271,6 +373,26 @@ your testing, the issue simply has none.
 
 Short and evidence-led:
 
+Report step 1b's four checks as **four separate lines**, not one bucket — collapsing
+them lets a clean result on one stand in for the others, which is exactly the
+failure mode splitting them exists to prevent. If any of the four found nothing to
+flag, say so plainly rather than omitting the line — silence here should mean
+"checked, clean," never "skipped":
+
+- **Root-cause coverage** — which artifact-named fix sites are covered in the diff,
+  and which are absent with a documented descope, quoted. This answers only "did the
+  PR do what the RCA asked" — it says nothing about whether the RCA asked enough.
+- **Surface coverage** — what the independent re-scan (not the artifact's own list)
+  found: any location the root cause's pattern reaches that the artifact never named
+  at all. **This is the finding that should most change a merge decision** — an
+  undiscovered sibling sharing the same defect is not a nitpick, and a clean
+  Root-cause coverage line does not make this one clean too. If the re-scan found
+  nothing outside what the artifact already named, say that plainly.
+- **Adversarial-review test backing** — which must-preserve cases (if the artifact
+  has an Adversarial Review section) have a real matching test, and which have only
+  the artifact's word for it.
+- **Mutation spot-check** — the one claimed mutation you personally reproduced:
+  fail-then-pass, or "not attempted" and why.
 - **Verified here**, with the evidence — the diff, the screenshot pair, the passing
   spec output. Includes the spot-checked items from the artifact's own
   **Verified here** section (say which ones you spot-checked, not that you
@@ -282,8 +404,9 @@ Short and evidence-led:
   look right, is the copy correct, is the UX acceptable) belongs here too.
 - **Contradicts the artifact** — anything the QA artifact's sections (or, on
   the fallback path, the plan's Verification or Interaction surface section)
-  claimed that you found to be false. Lead with this if it exists; it is the
-  most important thing you will report.
+  claimed that you found to be false. Lead with this, or with a Root-cause
+  coverage or Surface coverage gap, whichever exists — those are the most
+  important things you will report, ahead of everything else in this list.
 - **Unexpected findings** — any console warning/error or failed network
   request the browser walk surfaced that the QA artifact didn't call out,
   even if it doesn't look related to this issue. List it here rather than
@@ -306,6 +429,14 @@ human merges it themselves (GitHub UI or `gh pr merge`).
 If step 1 found drift against `dev`/`main` or a conflict in the merge-tree probe,
 say so again here and point at `/ship-work` to resolve it (it rebases properly)
 — never propose a manual rebase from this skill.
+
+If step 1b found an undocumented gap — a Root-cause coverage gap (an artifact-named
+fix site the diff never touched, with no descope note) or a Surface coverage gap
+(an independently-found location sharing the same root cause that the artifact
+never named and nothing addresses) — **say so here too, explicitly, before printing
+the `/ship-work` line**, and name it as a reason to hold rather than merge. A
+documented, deliberate descope (a quoted "Decision" section, a named follow-up
+ticket) is not this — that is normal scoping and does not block the hand-off.
 
 And remind them explicitly: **after the merge, close the ticket**
 (`ap_queue.py set <ENG-ID> --state done --event "merged"`). The pipeline

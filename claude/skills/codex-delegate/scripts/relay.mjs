@@ -75,8 +75,79 @@ import {spawn, execFileSync, spawnSync } from "node:child_process";
 import { mkdirSync, writeFileSync, renameSync, readFileSync, existsSync, appendFileSync } from "node:fs";
 import {join, resolve, basename, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { constants, tmpdir } from "node:os";
+import { constants, tmpdir, homedir } from "node:os";
 import { StringDecoder } from "node:string_decoder";
+
+// Auth-failure circuit breaker: relay.mjs runs fresh per invocation, so nothing
+// remembers "the last N calls all failed on auth" unless we persist it somewhere.
+// Without this, a caller that retries on a schedule (autopilot, a debate lane, a
+// stuck resume loop) will happily keep re-dispatching `codex` against a broken
+// login forever - which is exactly the failure mode that got a real account
+// permanently banned (8 days of unattended 401s read by OpenAI as bot abuse).
+// This trips after two consecutive auth-shaped failures and then refuses to even
+// spawn `codex` until a human clears it by hand.
+const AUTH_FAILURE_RE = /\b401\b|unauthorized|missing bearer|token[_ ]?revoked|refresh token|could not be refreshed|log out and sign in/i;
+const AUTH_BREAKER_TRIP_THRESHOLD = 2;
+
+function breakerPath() {
+  const base = process.env.XDG_CONFIG_HOME ? process.env.XDG_CONFIG_HOME : join(homedir(), ".config");
+  return join(base, "delegate-skills", "codex-auth-breaker.json");
+}
+
+function readBreaker() {
+  try {
+    return JSON.parse(readFileSync(breakerPath(), "utf8"));
+  } catch {
+    return { consecutiveAuthFailures: 0, tripped: false };
+  }
+}
+
+function writeBreaker(state) {
+  try {
+    const p = breakerPath();
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, JSON.stringify(state, null, 2) + "\n");
+  } catch {
+    // Best-effort: a breaker we can't persist should never itself crash a run.
+  }
+}
+
+function checkBreakerOrFail() {
+  const state = readBreaker();
+  if (state.tripped) {
+    fail(
+      `codex auth circuit breaker is tripped (${state.consecutiveAuthFailures} consecutive auth-shaped ` +
+        `failures, last at ${state.lastFailureAt || "unknown time"}: ${state.lastReason || "auth failure"}). ` +
+        `Run \`codex login\` interactively and confirm \`codex exec\` actually succeeds by hand, then clear ` +
+        `${breakerPath()} before this will dispatch to codex again.`,
+      75,
+    );
+  }
+}
+
+function recordDispatchOutcome(succeeded, stderrTail) {
+  if (succeeded) {
+    if (existsSync(breakerPath())) writeBreaker({ consecutiveAuthFailures: 0, tripped: false });
+    return;
+  }
+  const looksLikeAuthFailure = (stderrTail || []).some((line) => AUTH_FAILURE_RE.test(line));
+  if (!looksLikeAuthFailure) return;
+  const state = readBreaker();
+  const consecutiveAuthFailures = (state.consecutiveAuthFailures || 0) + 1;
+  const tripped = consecutiveAuthFailures >= AUTH_BREAKER_TRIP_THRESHOLD;
+  writeBreaker({
+    consecutiveAuthFailures,
+    tripped,
+    lastFailureAt: new Date().toISOString(),
+    lastReason: (stderrTail || []).find((line) => AUTH_FAILURE_RE.test(line)) || "auth failure",
+  });
+  if (tripped) {
+    process.stderr.write(
+      `relay: tripped the codex auth circuit breaker after ${consecutiveAuthFailures} consecutive auth-shaped ` +
+        `failures - further invocations will fail fast until ${breakerPath()} is cleared by hand.\n`,
+    );
+  }
+}
 
 const VERSION_PROBE_TIMEOUT_MS = 10_000;
 const MAX_TIMER_MS = 2_147_483_647;
@@ -599,6 +670,8 @@ function dispatchToCodex(opts, brief, run, writeResult, env) {
     // orchestrators key off status and the relay exit code.
     const succeeded = code === 0 && !watchdogFired;
     const mapped = code ?? (constants.signals[signal] ? 128 + constants.signals[signal] : 1);
+    const finalStderrTail = stderrTail.slice(-20);
+    recordDispatchOutcome(succeeded, finalStderrTail);
     const result = writeResult({
       status: succeeded ? "completed" : watchdogFired ? "timeout" : "failed",
       exitCode: succeeded ? 0 : mapped === 0 ? 1 : mapped,
@@ -606,7 +679,7 @@ function dispatchToCodex(opts, brief, run, writeResult, env) {
       threadId,
       finalMessage,
       touchedFiles: gitTouchedFiles(opts.cd),
-      ...(succeeded ? {} : { stderrTail: stderrTail.slice(-20) }),
+      ...(succeeded ? {} : { stderrTail: finalStderrTail }),
       ...(watchdogFired ? { error: `codex did not finish within --timeout ${opts.timeout}; killed by the relay watchdog` } : {}),
     });
     printSummary(result, run.resultPath);
@@ -621,6 +694,7 @@ function dispatchToCodex(opts, brief, run, writeResult, env) {
 }
 
 function main() {
+  checkBreakerOrFail();
   const opts = parseArgs(process.argv.slice(2));
   const brief = readBrief(opts);
   if (!brief.trim()) fail("empty brief (pass --brief <file> or pipe the brief on stdin)");

@@ -30,7 +30,7 @@ Match the model to the task, and pin it in an **agent definition** rather than a
 - `spec-auditor` (sonnet, medium) checks a finished implementation against its spec, and whether each test would actually fail without the behavior it claims to cover
 - `scout` (haiku, low) bulk mechanical lookup: call sites, which tests cover an area
 
-Never dispatch an opus or fable subagent from a skill, **except `implement-issue`**, which deliberately makes three such calls (an Opus plan drafter, a `fable`-model plan auditor, an Opus fresh-context code reviewer) precisely because each needs a different reasoning tier or a genuinely independent model family from whatever it's checking — see that skill's own "Why this shape" section. Every other skill, and every other unit of work inside `implement-issue` itself, still dispatches through a pinned `subagent_type`. Agent definitions load at **session start**, so a fresh pull needs a restart before new ones resolve.
+Never dispatch an opus subagent from a skill, **except `implement-issue`**, which deliberately makes three such calls (an Opus plan drafter, an Opus fresh-context plan auditor, an Opus fresh-context code reviewer) because each needs Opus-tier reasoning and a context independent of whatever it's checking — see that skill's own "Why this shape" section. Every other skill, and every other unit of work inside `implement-issue` itself, still dispatches through a pinned `subagent_type`. Fable is retired as of 2026-09-23: Opus 5.5 beats Fable 5.1 on coding benchmarks at 40% of the price, so never dispatch `model: "fable"`. Agent definitions load at **session start**, so a fresh pull needs a restart before new ones resolve.
 
 ### Worktree isolation
 

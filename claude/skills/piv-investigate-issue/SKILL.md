@@ -121,7 +121,7 @@ key, a retry or fallback branch, or a default deciding whether work happens at a
 "Files to Modify" and "Fix Strategy" sections; **when genuinely uncertain, run it.** Why this exists and the
 cheaper check doesn't cover it: the RCA's own Confidence field asks "how sure am I of the cause?", which is a
 different question from "what does this fix now let through?" — a HIGH-confidence RCA can carry a fix that turns
-structurally-broken cases green. Dispatch a **fresh** `Agent` carrying `/red-team`'s rubric (model `fable` or
+structurally-broken cases green. Dispatch a **fresh** `Agent` carrying `/red-team`'s rubric (model
 `opus`, effort matching the RCA's Complexity), given: the fix stated as a behaviour delta ("after this change, X
 will happen where Y happened before"), the guard's current code and tests, and **explicitly not the RCA's own
 argument for why the fix is right**. Require back: the must-stay-fatal list, the discriminator attack, the replay,

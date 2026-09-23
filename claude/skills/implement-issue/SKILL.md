@@ -1,6 +1,6 @@
 ---
 name: implement-issue
-description: Take a Linear task ID (or a free-text description, filing the ticket first) from ticket to an open PR in two phases separated by a hard approval gate. Phase plan: fetches every repo into fresh worktrees, classifies risk (Light/Standard/Heavy), drafts acceptance scenarios from the raw ticket in a fresh sub-agent context, drafts the plan via an Opus sub-agent, adversarially audits it with an independent fable-model sub-agent, gets an independent second design draft from Codex (via codex-delegate, read-only) on non-Light tickets, commits the plan, and stops for approval. Phase implement: reuses that worktree (with a staleness check before touching anything), dispatches model-matched implementer sub-agents per work unit (routing self-contained ones to Codex via codex-delegate's codex-feature lane), runs a Codex adversarial test pass, a spec-vs-test audit, and a two-model debate-review (Claude proposes, Codex challenges, Claude decides) with zero plan visibility, runs the real quality gates, derives the change's blast radius, QAs it in the browser, writes the durable QA artifact under docs/plans/qa/, commits, runs roborev, then gates on scope/secrets, rebases onto fresh dev, pushes, and opens the PR(s) — no server or Docker required, this is pure git/GitHub-API reusing gates already run. Ends by recommending /ship-work to confirm the push is rebased and locally gate-clean; never merges, and never waits on CI itself (neither skill does — CI-watching and merging are a human's later, separate call). Headlessly takes --phase plan or --phase implement so autopilot can run the two phases hours apart with a human's approval in between; --phase implement now pushes and opens PRs headlessly too. Supersedes /plan-issue and /implement-plan as the single main path. Use when the user says "implement ENG-123", hands you a Linear id or free-text description to take from ticket to an open PR, or on /implement-issue. Do NOT use to merge — nothing in this chain merges autonomously.
+description: Take a Linear task ID (or a free-text description, filing the ticket first) from ticket to an open PR in two phases separated by a hard approval gate. Phase plan: fetches every repo into fresh worktrees, classifies risk (Light/Standard/Heavy), drafts acceptance scenarios from the raw ticket in a fresh sub-agent context, drafts the plan via an Opus sub-agent, adversarially audits it with a fresh-context Opus plan-critic sub-agent, gets an independent second design draft from Codex (via codex-delegate, read-only) on non-Light tickets, commits the plan, and stops for approval. Phase implement: reuses that worktree (with a staleness check before touching anything), dispatches model-matched implementer sub-agents per work unit (routing self-contained ones to Codex via codex-delegate's codex-feature lane), runs a Codex adversarial test pass, a spec-vs-test audit, and a two-model debate-review (Claude proposes, Codex challenges, Claude decides) with zero plan visibility, runs the real quality gates, derives the change's blast radius, QAs it in the browser, writes the durable QA artifact under docs/plans/qa/, commits, runs roborev, then gates on scope/secrets, rebases onto fresh dev, pushes, and opens the PR(s) — no server or Docker required, this is pure git/GitHub-API reusing gates already run. Ends by recommending /ship-work to confirm the push is rebased and locally gate-clean; never merges, and never waits on CI itself (neither skill does — CI-watching and merging are a human's later, separate call). Headlessly takes --phase plan or --phase implement so autopilot can run the two phases hours apart with a human's approval in between; --phase implement now pushes and opens PRs headlessly too. Supersedes /plan-issue and /implement-plan as the single main path. Use when the user says "implement ENG-123", hands you a Linear id or free-text description to take from ticket to an open PR, or on /implement-issue. Do NOT use to merge — nothing in this chain merges autonomously.
 ---
 
 # implement-issue
@@ -51,12 +51,15 @@ the reading and the building. Two rules are not negotiable:
   like. Ordinary work dispatches by `subagent_type`: `explorer` and
   `plan-critic` (sonnet, medium), `scout` (haiku, low), `implementer`
   (sonnet, medium). This skill is the **one deliberate exception** to "never
-  spawn an opus or fable subagent from a skill" — the plan drafter (step 5)
-  is a raw `Agent(model: "opus", ...)` call, and the plan auditor (step 7) is
-  `plan-critic` overridden to `model: "fable"`, on purpose, because the whole
-  point of each is a different reasoning tier or a genuinely independent
-  model family from whatever drafted the thing it's checking. Every other
-  unit of work still goes through a pinned `subagent_type`.
+  spawn an opus subagent from a skill" — the plan drafter (step 5) is a raw
+  `Agent(model: "opus", ...)` call, and the plan auditor (step 7) is
+  `plan-critic` overridden to `model: "opus"`, on purpose, because each needs
+  a stronger reasoning tier than sonnet. The auditor's independence comes from
+  a fresh context that never sees the drafter's rationale, not from a
+  different model. (Fable was used here until 2026-09-23, when it was retired:
+  Opus 5.5 outscores Fable 5.1 on FrontierCode, Terminal-Bench and the Vals
+  index at 40% of the price.) Every other unit of work still goes through a
+  pinned `subagent_type`.
 
   **Codex is the other cross-model layer, via `delegate-skills`/`review-skills`,
   not the Agent tool.** Four lanes (`~/.config/delegate-skills/config.json`,
@@ -327,21 +330,22 @@ not assume; fold answers into the plan.
 
 ### 7. Audit the plan, then commit it once
 
-Dispatch `Agent(subagent_type: "plan-critic", model: "fable")` — check that
+Dispatch `Agent(subagent_type: "plan-critic", model: "opus")` — check that
 the explicit `model` override actually supersedes `plan-critic.md`'s own
 pinned-sonnet frontmatter (the Agent tool's own docs say an explicit `model`
 takes precedence); if it doesn't compose for any reason, fall back to a raw
-`Agent(model: "fable", effort: <tier>)` call carrying `plan-critic.md`'s
-operating rules and exact output schema as prompt text instead of
-`subagent_type`. Either way, this is **one** dispatch, not two separate
-audits: fable's independent model family (genuinely distinct reasoning from
-the Opus drafter in step 5) applying `plan-critic`'s structured rubric —
+`Agent(model: "opus")` call carrying `plan-critic.md`'s operating rules and
+exact output schema as prompt text instead of `subagent_type`. Either way,
+this is **one** dispatch, not two separate audits: a fresh Opus context that
+has never seen the step-5 drafter's reasoning, applying `plan-critic`'s
+structured rubric —
 per-claim `VERIFIED`/`WRONG`/`MISSING` labeling, spot-checking every cited
 `path:line`/function/field/lookup key against the real repo, probing every
 assumption for whether it's actually verified in code, and an overall
-`SOUND` / `SOUND WITH FIXES` / `DO NOT IMPLEMENT` verdict. Effort scales with
-tier: **max** for Standard/Heavy, **high** for Light — never skipped
-outright, even for a small-looking change.
+`SOUND` / `SOUND WITH FIXES` / `DO NOT IMPLEMENT` verdict. Effort comes from
+`plan-critic.md`'s frontmatter (medium), since the Agent tool can't set it.
+Medium is enough: on FrontierCode v1.1, Opus 5.5 scores the same at medium as
+at max. Never skipped outright, even for a small-looking change.
 
 Fold every finding into the plan, or record an explicit one-line reason it
 doesn't apply. Populate the plan's **Design review** section with the
@@ -376,8 +380,7 @@ which no answer from a user can unblock. The shipped fix (by someone else, in
 parallel) kept those two fatal. Nothing in a claims-verification rubric would
 have caught that.
 
-Dispatch a **fresh** `Agent` carrying `/red-team`'s rubric — model `fable` or
-`opus`, effort matching tier — given the plan's behaviour delta, the current
+Dispatch a **fresh** `Agent` carrying `/red-team`'s rubric — model `opus` — given the plan's behaviour delta, the current
 code and tests for the guard being changed, and **not** the plan's argument for
 why the change is right. Require back:
 

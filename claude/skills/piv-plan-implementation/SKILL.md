@@ -535,13 +535,13 @@ with, what (if anything) got grafted into this plan and why, what got rejected a
 - <ISO date> — <what changed and why, e.g. "scope cut: deferred bulk-import to a follow-up ticket after AC review">
 ```
 
-### Phase 5b: Independent audit — a genuinely different model family from the drafter
+### Phase 5b: Independent audit — a fresh context that never saw the drafter's reasoning
 
-**Model: `Agent(subagent_type: "plan-critic", model: "fable")`** (this project's `plan-critic` agent is pinned to
-sonnet by default; the explicit `model` override here is deliberate — `fable` is a different reasoning lineage
-from the opus that drafted the plan in Phase 4, which is the entire point of this step. Skipping the override and
-running the audit on the same family that drafted the plan defeats it — a model rarely catches its own blind
-spots.) Give it the plan file, nothing else — it re-derives the claims by reading the actual repo, not by trusting
+**Model: `Agent(subagent_type: "plan-critic", model: "opus")`** (this project's `plan-critic` agent is pinned to
+sonnet by default; the explicit `model` override here is deliberate — the audit needs Opus-tier reasoning. The
+audit's independence comes from a fresh context with none of the Phase 4 drafter's rationale. Fable was used here
+until 2026-09-23, when it was retired: Opus 5.5 outscores Fable 5.1 on FrontierCode, Terminal-Bench and the Vals
+index at 40% of the price.) Give it the plan file, nothing else — it re-derives the claims by reading the actual repo, not by trusting
 the plan's own reasoning. It returns per-claim `VERIFIED`/`WRONG`/`MISSING` labels, gaps the plan doesn't mention,
 and an overall `SOUND` / `SOUND WITH FIXES` / `DO NOT IMPLEMENT` verdict.
 
@@ -549,7 +549,7 @@ Fold every finding into the plan, or record an explicit one-line reason it doesn
 AUDIT** section with the verdict, what changed, and what was rejected and why. A `DO NOT IMPLEMENT` verdict means
 rework and re-audit once before handing this plan off — never paper over it or proceed anyway.
 
-This step specifically calls for Claude's own cross-model tier (`fable`), not Codex — Codex's own review commands
+This step specifically calls for a Claude sub-agent (`opus`), not Codex — Codex's own review commands
 (`/codex:review`, `/codex:adversarial-review`) are deliberately gated to require a human typing them directly
 (`disable-model-invocation: true` in their own definitions), so a skill's instructions can't invoke them
 automatically, and cross-model research (arXiv:2607.21656) found Codex *reviewing* Claude-drafted work is the
@@ -620,7 +620,7 @@ claim was independently verified and correct and the plan was still wrong. Phase
 does not cover it either: Codex proposes an *alternative approach*, it does not attack the chosen one's blast
 radius.
 
-Dispatch a **fresh** `Agent` carrying `/red-team`'s rubric (model `fable` or `opus`, effort matching Phase 1's
+Dispatch a **fresh** `Agent` carrying `/red-team`'s rubric (model `opus`, effort matching Phase 1's
 Estimated Complexity), given: the change stated as a behaviour delta (`/red-team` §0: *"after this change, X
 will happen where Y happened before"*), the guard's current code and tests, and **explicitly not the plan's
 own argument for why the change is right**. Require back the same five items `implement-issue`'s step 7b
@@ -777,10 +777,10 @@ because the `piv-draft-review` gate exists.** If a future change ever auto-appro
 mapping must be revisited.
 
 **Phase 5b and 5c run headlessly, unchanged.** Both are read-only sub-agent dispatches with no human ask point
-of their own — 5b is an `Agent(subagent_type: "plan-critic", model: "fable")` call; 5c is
+of their own — 5b is an `Agent(subagent_type: "plan-critic", model: "opus")` call; 5c is
 `node "<codex-delegate skill-dir>/scripts/relay.mjs" --brief brief.txt --cd <repo> --lane plan-debate
---read-only`, which writes nothing. Keep the `fable` model override on 5b (running the audit on the family
-that drafted the plan defeats it) and keep 5c's read-only mode. Two headless-specific rules: **(a)** run 5c as
+--read-only`, which writes nothing. Keep the `opus` model override and the fresh context on 5b (an audit
+that sees the drafter's rationale ends up agreeing with it) and keep 5c's read-only mode. Two headless-specific rules: **(a)** run 5c as
 a **blocking foreground** command despite `codex-delegate`'s usual background advice — backgrounding across a
 turn boundary is fatal under the protocol's never-background rule, and 5c at `effort: max` can run 10-20
 minutes; **(b)** `Bash(node *)` is required and is added by Phase 1's permissions task — a denial means

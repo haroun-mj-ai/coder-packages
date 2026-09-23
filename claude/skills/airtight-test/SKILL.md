@@ -158,6 +158,40 @@ never leave the disposable test surface.
 
 ## Reporting
 
-Report findings in chat as you go and at the end. Don't auto-file a ticket
-or build an artifact — if the user wants a written proposal out of this,
-that's a separate, explicit ask.
+Report findings in chat as you go. At the end, **always publish an Artifact**
+that leaves no doubt about what was and wasn't verified — this is the
+deliverable, not an optional add-on, and it stands on its own even if the
+chat scrolls away or gets summarized. This is a deliberate exception to the
+general "don't build an artifact unless asked" default: a claim this skill
+exists to verify is exactly the kind of thing a reader will later ask "are
+you sure?" about, and the artifact is the answer.
+
+The artifact must include, for every claim pinned down in step 1:
+
+- The exact scenario built (seed data, accounts, marker files, whatever made
+  the outcome controllable) — specific enough that someone else could
+  reproduce it.
+- Every real request/response, command, or state check that produced
+  evidence — exact status codes, exact response bodies or field values,
+  exact log lines, exact timestamps. Not a paraphrase.
+- **Screenshots, embedded inline, whenever the claim touches anything a
+  human would look at** — a UI, a settings page, a dashboard, a chat
+  message landing in a real channel. A claim that never touches a UI (a
+  pure API/backend verification) doesn't need screenshots to be complete,
+  but a claim that does is not fully verified without one. Save every
+  screenshot to disk as it's taken (never just glance at a preview) and
+  bring each one into the artifact — don't describe a screenshot in prose
+  when the image itself is the evidence.
+- Bugs or false claims found ALONG THE WAY that are not the claim under
+  test — a seed-data mistake is not a finding, but a real discrepancy in
+  the system under test is, even if the original claim being verified
+  still turns out to hold. Say which is which.
+- The PASS / FAIL / UNCLEAR verdict per claim (step 8), plus what was not
+  exercised and why.
+- What was cleaned up afterward (throwaway accounts, seed data, branches)
+  so a reader knows nothing was left behind.
+
+Don't auto-file a ticket from this — if the user wants a written proposal
+or a filed issue out of the findings, that's a separate, explicit ask. The
+artifact is the verification record; a ticket is a different document with
+a different audience.

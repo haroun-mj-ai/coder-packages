@@ -44,27 +44,70 @@ the full setup writeup and both host-script variants.
 
 ## Selecting the right browser/profile
 
-Two Chrome instances may show up as connected
-(`mcp__claude-in-chrome__list_connected_browsers`). Confirm which is which by
-navigating to `https://myaccount.google.com/` and reading the signed-in
-account before assuming — don't guess from display name alone, since "Browser
-1"/"Browser 2" labels aren't stable across reconnects. Known accounts as of
-this setup:
+Almost always only one Chrome instance is connected — no need to verify its
+identity via a Google-account check before proceeding. If
+`mcp__claude-in-chrome__list_connected_browsers` ever shows more than one
+(this has happened rarely), ask the user which one to use rather than
+guessing from display name alone ("Browser 1"/"Browser 2" labels aren't
+stable across reconnects) — known accounts as of this setup:
 - `harountrabelsi12@gmail.com` — personal profile
 - `haroun@meetjourney.ai` — work profile
 
-Pick whichever the task actually needs; when unclear, ask.
+## Testing philosophy: hunt for breakage, don't just confirm the render
+
+**Default posture is adversarial, not confirmatory.** The point of a real,
+logged-in browser is that it can reach data states a clean fixture never
+would — so use it for that. Checking that a DOM node's `aria-label` matches
+the string you just read in the component's source is necessary but not
+sufficient, and on its own it under-tests the actual risk: a real user never
+hits one field in isolation, they hit combinations that accumulate over time
+(a rep with data in an unusual shape, two features touching the same row,
+an edge state nobody wrote a fixture for). "Does the code render what the
+code says" is a weak claim — "does a plausible real state make this feature
+lie to the user, show contradictory information, or produce a wrong number"
+is the one worth spending a real browser on.
+
+**Concrete case this was learned from (ENG-1377, 2026-09-20):** a first pass
+confirmed a book-health ring's `aria-label` matched the seeded value — PASS,
+technically correct, and it missed a real bug. A second, adversarial pass
+looked at the WHOLE card instead of just the one element the diff touched,
+and found the same card also rendered a second, contradictory line ("100%
+short of quota") sourced from a completely different, un-updated function
+reading a different set of fields on the *same row*. The bug only existed
+in the combination — reading either field in isolation looked fine.
+
+**How to apply this, concretely, every run:**
+- Before opening the browser, ask "what real combination of fields/states
+  could this row/page be in that a single happy-path fixture wouldn't
+  produce?" — a rep with partial data, two features that both render off
+  the same underlying row, a value at a rounding/currency/timezone boundary,
+  a permission edge (can this user actually see this, or reach this via a
+  URL they shouldn't guess), a state left over from a previous action.
+  Write these down as the scenario list (per step 4 below) BEFORE clicking
+  anything — don't wing it turn by turn.
+- When you land on a page, read the WHOLE surface the change touches, not
+  just the one element the diff added — an adjacent, unrelated-looking
+  label can be quietly wrong even when the thing you changed is right.
+- Prefer constructing a real, plausible adversarial data state over reading
+  the happy path off a pre-seeded fixture — seed it yourself via Mongo/API
+  the same way you would for `/airtight-test`, then revert it after.
+- A screenshot you only glance at and move past is not the same as reading
+  every line of text on it. Extract full card/section text (not just one
+  `aria-label`) and actually read it for internal contradictions before
+  calling a scenario PASS.
 
 ## Steps
 
 1. **Load tools if deferred**:
    `ToolSearch("select:mcp__claude-in-chrome__tabs_context_mcp,mcp__claude-in-chrome__navigate,mcp__claude-in-chrome__computer,mcp__claude-in-chrome__read_page,mcp__claude-in-chrome__get_page_text,mcp__claude-in-chrome__tabs_create_mcp,mcp__claude-in-chrome__read_console_messages,mcp__claude-in-chrome__list_connected_browsers,mcp__claude-in-chrome__select_browser")`
-2. **Confirm/select the browser** per above before doing anything else.
-3. **Establish a tab**: `tabs_context_mcp` with `createIfEmpty: true`.
-4. **Navigate to the feature under test** and exercise the golden path, edge
-   cases, and adjacent surfaces the change could affect — same scenario
-   discipline as `/browser-verify`: name the scenario list up front rather
-   than winging it turn by turn.
+2. **Establish a tab**: `tabs_context_mcp` with `createIfEmpty: true` — no
+   browser-identity check needed first (see above).
+3. **Name the scenario list up front**, per the philosophy above — golden
+   path, plausible adversarial combinations, adjacent surfaces the change
+   could affect — before touching anything. Don't wing it turn by turn.
+4. **Navigate to the feature under test and drive every scenario on the
+   list**, reading each surface in full (see above) — not just the field
+   the diff touched.
 5. **Check the console** via `read_console_messages` for new
    errors/warnings.
 6. **Screenshot proof of each state — with `save_to_disk: true`.** Every
@@ -74,8 +117,9 @@ Pick whichever the task actually needs; when unclear, ask.
    them. A verdict claimed without an on-disk screenshot behind it is not
    evidence.
 7. **Report a strict verdict** — PASS only if the golden path and every
-   listed scenario actually passed with zero new console errors; otherwise
-   FAIL or BLOCKED, naming exactly what failed.
+   listed scenario actually passed with zero new console errors and no
+   internal contradictions anywhere on the surface; otherwise FAIL or
+   BLOCKED, naming exactly what failed.
 8. **Publish the evidence artifact — every run, not on request.** Build an
    HTML page (load the `artifact-design` skill first, then the Artifact
    tool) containing:
@@ -102,4 +146,6 @@ Pick whichever the task actually needs; when unclear, ask.
   `bridge-host-windows.js` likely died — ask the user to check both
   terminals before retrying.
 - `select_browser` after a Chrome restart may need re-picking even if
-  deviceId looks stable — verify via the Google account check, don't assume.
+  deviceId looks stable. Only worth an identity re-check (Google account) if
+  more than one browser is actually listed as connected — the normal case is
+  one, and no check is needed.

@@ -18,13 +18,13 @@ The supported path from ticket to staging is two skills in `.claude/skills/`. Us
 
 `implement-issue` supersedes the now-retired `plan-issue`/`implement-plan` — one skill, two phases separated by a hard approval gate, rather than two separate invocations.
 
-Expensive inference goes up front on design; execution runs on a cheap model. The expensive model's job is judgement: reading subagent reports, choosing the approach, deciding whether a flagged problem changes the plan.
+Expensive inference goes up front on design; execution runs on pinned agent definitions. The expensive model's job is judgement: reading subagent reports, choosing the approach, deciding whether a flagged problem changes the plan.
 
 ### Model selection
 
 Match the model to the task, and pin it in an **agent definition** rather than an inline override. The Agent tool accepts `model` but **not** `effort`, so `Agent(model: "sonnet")` still runs at the session's effort level and costs far more than it looks like it does. The definitions in `.claude/agents/` exist for this:
 
-- `implementer` (sonnet, medium) executes a settled spec plus its tests
+- `implementer-opus` (opus, medium) executes a settled spec plus its tests. It's a personal variant symlinked from coder-packages. The team's `implementer` (sonnet, medium) still exists, but skills default to the Opus one.
 - `explorer` (sonnet, medium) traces one code path or hunts prior art, read-only
 - `plan-critic` (sonnet, medium) dry-runs a written plan against the real code
 - `spec-auditor` (sonnet, medium) checks a finished implementation against its spec, and whether each test would actually fail without the behavior it claims to cover

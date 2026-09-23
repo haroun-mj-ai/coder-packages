@@ -1,6 +1,7 @@
 ---
 name: challenge
 description: Stress-test a claim, number, dataset, or conclusion BEFORE acting on it or publishing it — interrogate where the data came from, whether the instrument that produced it is trustworthy, whether the measurement window is clean, and whether the thing counted means what it is assumed to mean. Runs the interrogation in a fresh sub-agent that never sees the reasoning behind the claim, so it cannot rubber-stamp it. Use before filing a ticket off an analysis, before quoting a figure to someone, before sizing work off a metric, or whenever a number is about to become a decision. Do NOT use to review code for bugs (that is /code-review) or to attack a proposed fix (that is /red-team).
+effort: high
 ---
 
 # challenge

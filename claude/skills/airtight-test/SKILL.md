@@ -1,7 +1,10 @@
 ---
 name: airtight-test
 description: Verify a claim about how something actually behaves — a vendor's pricing/feature-gating claim, an AI support agent's answer, an assumption about your own backend code — by building a real scenario that could have come out either way and watching what actually happens, instead of reasoning from documentation or settings pages. Use before recommending a third-party tool/service to the team, or to verify your own backend-only change end to end when there's no UI to click through. Do NOT use to review code for bugs (code-review), attack a proposed design (red-team), or judge whether a data/metrics claim is true (challenge) — this skill is about observed behavior, not code quality or numbers.
+context: fork
 ---
+
+> **Runs forked (`context: fork`).** This skill runs as a separate agent so screenshots and page dumps stay out of the caller's context. You can't ask the user anything mid-run. Wherever this file says to ask the user, stop and return the question as your result, together with what you've verified so far.
 
 # airtight-test
 

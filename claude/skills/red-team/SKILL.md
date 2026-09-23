@@ -1,6 +1,7 @@
 ---
 name: red-team
 description: Attack a proposed solution, fix, plan, or design BEFORE it is built — enumerate what the guard being changed was catching, what the change wrongly permits, whether the discriminator survives an adversary, what the blast radius is, and whether the thing is even needed. Replays the proposal against real historical data rather than reasoning about its reach. Runs the attack in a fresh sub-agent that never sees the argument for the proposal, so it cannot be persuaded by it. Use before implementing a fix, before approving a plan, and especially when relaxing a validation, verifier, gate, or cap. Do NOT use to review code already written (that is /code-review) or to check whether a claim is true (that is /challenge).
+effort: high
 ---
 
 # red-team

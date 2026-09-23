@@ -49,19 +49,18 @@ content there is a prior run's unfinished work, not junk — stop and ask rather
 
 ## Execution Instructions
 
-**Model for task execution: sonnet, medium effort by default** — this project's `implementer` agent type is
-pinned exactly for this: "execution half of a two-phase workflow, cheap and fast, once the design is settled."
-The expensive reasoning already happened in `piv-plan-implementation` Phase 4 (opus); re-running that tier here
-just to write code the plan already specified burns budget for no benefit. Default: dispatch each independent
-task (or a small batch of dependent ones) via `Agent(subagent_type: "implementer")` rather than running every
+**Model for task execution: opus, medium effort by default**, via the personal `implementer-opus` agent type (the
+execution half of a two-phase workflow, once the design is settled). Opus 5.5 at medium outscores Sonnet 5 at any
+effort, and review-fix rework was the costliest step in the 2026-09 spend audit, so execution runs on Opus too. Default: dispatch each independent
+task (or a small batch of dependent ones) via `Agent(subagent_type: "implementer-opus")` rather than running every
 task inline in the current session — same "cheap does the reading/writing, you do the judging" split as the rest
 of this pipeline.
 
-**Route self-contained/mechanical tasks to `codex-delegate` instead** (the `codex-feature` lane), not `implementer`
+**Route self-contained/mechanical tasks to `codex-delegate` instead** (the `codex-feature` lane), not `implementer-opus`
 — a real, meaningful share of implementation work, not just Codex-side supplementary checks. A task qualifies
 when it's bounded and clearly gated by the plan's own `VALIDATE` command, and doesn't ride on security,
 concurrency, migration, or unstated domain knowledge the plan didn't spell out (the same bar `codex-delegate`'s
-own docs use for "good delegation target" — if you're unsure whether a task qualifies, keep it on `implementer`).
+own docs use for "good delegation target" — if you're unsure whether a task qualifies, keep it on `implementer-opus`).
 Write the brief per `writing-the-brief.md`'s four-block shape (task / verification_loop naming this task's real
 `VALIDATE` command / action_safety — no commit / structured_output_contract), dispatch:
 
@@ -76,13 +75,13 @@ PR) — delegating the writing doesn't change how it gets checked.
 
 **Escalate rather than let the cheap model improvise**, the uncommon case only: if a task's own report says the
 spec is wrong, a referenced hook/field doesn't exist, or the change doesn't fit as written — stop, don't let
-`implementer` guess around it. Either fix it yourself with the plan in hand, or for something genuinely stuck
+`implementer-opus` guess around it. Either fix it yourself with the plan in hand, or for something genuinely stuck
 (not just "the spec was slightly off"), get an independent diagnosis via `codex-delegate --read-only` (the
 `review-debate` lane): a brief naming what's stuck, what was tried, and what's unclear, same shape as
 `piv-investigate-issue`'s "can't pin the root cause" recipe — no diff to review, just a second model's read on
 the blocker. Rote/mechanical/boilerplate sub-tasks (e.g.
 scaffolding a test file's structure) may go to a raw `Agent(model: "haiku")` call instead — this is a layer on
-top of the `implementer` default, not a replacement of it; most tasks stay on `implementer`.
+top of the `implementer-opus` default, not a replacement of it; most tasks stay on `implementer-opus`.
 
 ### 1. Read and Understand
 

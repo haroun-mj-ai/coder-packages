@@ -67,7 +67,7 @@ Before making changes:
 
 ### 3. Implement the Fix
 
-**Model: sonnet, medium effort by default** (`Agent(subagent_type: "implementer")` if delegating rather than
+**Model: opus, medium effort by default** (`Agent(subagent_type: "implementer-opus")` if delegating rather than
 implementing inline) — the RCA already did the expensive reasoning; this step turns a settled fix strategy into
 code. **Scale up using the RCA's own Assessment table**, which already scored this: Complexity **High** → escalate
 to a raw `Agent(model: "opus", effort: "high")` instead (a fix strategy touching several integration points

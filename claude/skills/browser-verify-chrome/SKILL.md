@@ -1,7 +1,10 @@
 ---
 name: browser-verify-chrome
 description: Personal variant of /browser-verify that drives your real, logged-in Chrome (via claude-in-chrome, bridged from this Coder workspace to your local machine) instead of Playwright's isolated Chromium. Use when you specifically need real session state — actual SSO logins, saved passwords, extensions, a specific Google account profile — that a clean Playwright profile won't have. Personal-only: depends on a bridge that only exists on this machine, so it is not the shared team default. If the bridge is down, this reports BLOCKED with revival steps rather than silently falling back to Playwright.
+context: fork
 ---
+
+> **Runs forked (`context: fork`).** This skill runs as a separate agent so screenshots and page dumps stay out of the caller's context. You can't ask the user anything mid-run. Wherever this file says to ask the user, stop and return the question as your result, together with what you've verified so far.
 
 # Browser Verify (claude-in-chrome)
 

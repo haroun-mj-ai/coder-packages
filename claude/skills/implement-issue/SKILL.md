@@ -49,8 +49,8 @@ the reading and the building. Two rules are not negotiable:
   The Agent tool accepts `model` but not `effort`, so `Agent(model:
   "sonnet")` inherits this session's effort and costs far more than it looks
   like. Ordinary work dispatches by `subagent_type`: `explorer` and
-  `plan-critic` (sonnet, medium), `scout` (haiku, low), `implementer`
-  (sonnet, medium). This skill is the **one deliberate exception** to "never
+  `plan-critic` (sonnet, medium), `scout` (haiku, low), `implementer-opus`
+  (opus, medium). This skill is the **one deliberate exception** to "never
   spawn an opus subagent from a skill" — the plan drafter (step 5) is a raw
   `Agent(model: "opus", ...)` call, and the plan auditor (step 7) is
   `plan-critic` overridden to `model: "opus"`, on purpose, because each needs
@@ -621,7 +621,7 @@ repo** (two agents editing the same checkout fight); **concurrent across
 repos** (backend/frontend are separate git repos, send first units in one
 message with multiple `Agent` calls).
 
-Default every unit to `subagent_type: "implementer"` (pinned sonnet,
+Default every unit to `subagent_type: "implementer-opus"` (pinned opus,
 medium effort) — self-contained prompts carrying: the unit's spec verbatim
 including its test requirement and "done when," the absolute repo path,
 the exact file list (no scope widening), the commands to run (`npm run
@@ -637,14 +637,14 @@ same prompt rather than as separate steps.
 flagging genuinely correctness-critical or architectural complexity escalates
 to a raw `Agent(model: "opus")` call instead of a stop; rote/mechanical/
 boilerplate work may go to a raw `Agent(model: "haiku")` call. This is a
-layer on top of the pinned-`implementer` default above, not a replacement of
-it — most units stay on `implementer`.
+layer on top of the pinned-`implementer-opus` default above, not a replacement of
+it — most units stay on `implementer-opus`.
 
-**Route self-contained/mechanical units to `codex-delegate` instead of `implementer`** (the `codex-feature`
+**Route self-contained/mechanical units to `codex-delegate` instead of `implementer-opus`** (the `codex-feature`
 lane) — real implementation work, not just a supplementary check. A unit qualifies when it's bounded and
 clearly gated by its own "done when," and doesn't ride on security, concurrency, migration, or unstated domain
 knowledge the plan didn't spell out (the same bar `codex-delegate`'s own docs use — if unsure, keep it on
-`implementer`). Write the brief per `writing-the-brief.md`'s four-block shape and dispatch:
+`implementer-opus`). Write the brief per `writing-the-brief.md`'s four-block shape and dispatch:
 ```bash
 node "<codex-delegate skill-dir>/scripts/relay.mjs" --brief brief.txt --cd <abs repo path> --lane codex-feature
 ```

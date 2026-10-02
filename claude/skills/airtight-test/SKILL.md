@@ -1,6 +1,6 @@
 ---
 name: airtight-test
-description: Verify a claim about how something actually behaves — a vendor's pricing/feature-gating claim, an AI support agent's answer, an assumption about your own backend code — by building a real scenario that could have come out either way and watching what actually happens, instead of reasoning from documentation or settings pages. Use before recommending a third-party tool/service to the team, or to verify your own backend-only change end to end when there's no UI to click through. Do NOT use to review code for bugs (code-review), attack a proposed design (red-team), or judge whether a data/metrics claim is true (challenge) — this skill is about observed behavior, not code quality or numbers.
+description: Verify a claim about how something actually behaves — a vendor's pricing/feature-gating claim, an AI support agent's answer, an assumption about your own backend code — by building a real scenario that could have come out either way and watching what actually happens, instead of reasoning from documentation or settings pages. Use before recommending a third-party tool/service to the team, to verify your own backend-only change end to end, or to QA your own UI change in the real app via claude-in-chrome — screenshots of every state plus a deliberate attempt to break it. Do NOT use to review code for bugs (code-review), attack a proposed design (red-team), or judge whether a data/metrics claim is true (challenge) — this skill is about observed behavior, not code quality or numbers.
 context: fork
 ---
 
@@ -23,8 +23,10 @@ actually includes — and only running the real thing settled it.
   feature actually work the way the marketing/docs say, what's the real
   cost/gating model, do the integrations actually fire.
 - Verifying your own backend-only change end to end when there's no UI to
-  click through — pairs with `/browser-verify` or `/test-issue` for
-  anything with a UI, this is the no-UI equivalent.
+  click through.
+- QA-ing your own UI change in the real app before it ships: screenshots
+  of every state, driven through claude-in-chrome, plus a deliberate
+  attempt to break it (see "For your own UI changes").
 
 ## Not this skill's job
 
@@ -146,6 +148,49 @@ with no gaps listed hasn't actually checked whether there are any.
 - If the change touches an external integration, exercise the real sandbox
   integration rather than mocking it, wherever that's available at zero
   cost/risk.
+
+## For your own UI changes
+
+A UI change is verified in the real running app, by looking at it, and by
+trying to break it. A rendered component tree or green vitest run is not
+that. A pre-push QA pass is exactly this case, so this skill covers it
+rather than deferring to `/browser-verify`.
+
+- **Drive the real UI with claude-in-chrome** (the user's real, logged-in
+  Chrome over the Windows bridge; see `/browser-verify-chrome` for the
+  bridge check and revival steps). Run the changed frontend against a real
+  local backend on the default port ladder (8000+/5173+, `--host 0.0.0.0`).
+  If the bridge is down, report BLOCKED with the revival steps. Don't
+  silently fall back to "it looked fine in the unit tests."
+- **Screenshot every state you claim**, saved to disk as you go: before,
+  after, and each failure mode. Record a GIF (`gif_creator`) for any
+  multi-step flow.
+- **Baseline vs changed.** Where it's cheap, show the bug on the
+  unchanged code (`origin/dev`) first, then the fix on the branch. A fix
+  you never saw broken is a fix you can't prove you fixed.
+- **Make each outcome controllable.** Use real viewer roles (a rep with no
+  reports vs a manager with reports, real seed accounts) and real data
+  shapes. Force each server response the change branches on (403, 500,
+  network down, slow, empty, populated). Do this at the real request
+  boundary, either by intercepting `fetch`/XHR in the page with
+  `javascript_tool` or by flipping the seed state. Never by editing the
+  component.
+- **Then try to break it, adversarially.** Hunt for the case the change
+  gets wrong rather than confirming the happy path:
+  - every other error class the branch could swallow (e.g. does the 403
+    handling also hide a 401, 404 or 500 it shouldn't?);
+  - the loading → error and error → retry/refetch transitions;
+  - switching between items fast, so a stale response lands on the wrong
+    item;
+  - a different viewer role or org flag on the same screen;
+  - dark mode, narrow/mobile width, and the screen-reader role and copy
+    (an `role="alert"` that should or shouldn't be there);
+  - contradictory copy elsewhere on the same screen.
+
+  Each break attempt gets its own PASS/FAIL line and screenshot, and so
+  does a break you could *not* make happen.
+- Read the console and network panels for every state (`read_console_messages`,
+  `read_network_requests`). Quote the exact status codes in the report.
 
 ## Permission boundary
 

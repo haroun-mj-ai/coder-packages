@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+# hrun — run a long command in a visible herdr pane instead of a hidden
+# background shell. Panes live in a "runs" tab of the caller's workspace, never
+# take focus, and stay open afterwards so the output can be read.
+#
+# Usage:
+#   hrun [--label L] [--cwd DIR] [--wait] [--timeout MS] [--lines N] [--notify|--no-notify] -- <command...>
+#   hrun --list            list run panes in this workspace's runs tab
+#   hrun --clean           close run panes that are back at an idle prompt
+#
+#   --wait      block until the command finishes, print its last --lines (default
+#               80) of output, and exit with the command's own exit code
+#               (124 on timeout — the command keeps running in its pane).
+#   --notify    herdr notification when it finishes. Default: only when it fails
+#               or ran 60s+. --no-notify silences it entirely.
+#
+# Exits 3 when not inside a herdr pane, so callers can fall back to an ordinary
+# background shell.
+
+RUNS_LABEL="runs"
+MAX_PANES=4
+SHELLS=" bash zsh sh fish dash "
+BUSY_DIR="${XDG_RUNTIME_DIR:-/tmp}/hrun-$(id -u)"
+
+die() { echo "hrun: $1" >&2; exit "${2:-1}"; }
+
+[[ "${HERDR_ENV:-}" == 1 && -n "${HERDR_WORKSPACE_ID:-}" ]] \
+  || die "not inside a herdr pane (HERDR_ENV unset) — run it another way" 3
+
+WS="$HERDR_WORKSPACE_ID"
+LABEL="" CWD="$PWD" WAIT=false TIMEOUT="" LINES=80 NOTIFY=auto MODE=run
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --label) LABEL="$2"; shift 2 ;;
+    --cwd) CWD="$2"; shift 2 ;;
+    --wait) WAIT=true; shift ;;
+    --timeout) TIMEOUT="$2"; shift 2 ;;
+    --lines) LINES="$2"; shift 2 ;;
+    --notify) NOTIFY=always; shift ;;
+    --no-notify) NOTIFY=never; shift ;;
+    --list) MODE=list; shift ;;
+    --clean) MODE=clean; shift ;;
+    -h|--help) sed -n '4,22p' "$0"; exit 0 ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+
+runs_tab() {
+  herdr tab list --workspace "$WS" \
+    | jq -r --arg l "$RUNS_LABEL" '.result.tabs[] | select(.label == $l) | .tab_id' | head -1
+}
+
+tab_panes() {
+  herdr pane list --workspace "$WS" | jq -r --arg t "$1" '.result.panes[] | select(.tab_id == $t) | .pane_id'
+}
+
+busy_file() { printf '%s/%s.busy' "$BUSY_DIR" "${1//:/_}"; }
+
+pane_idle() {
+  # idle = no hrun command in flight (busy marker, set before the command is
+  # typed and removed by the command line itself when it ends) AND every
+  # foreground process is a plain shell (nothing else running at the prompt)
+  [[ -e "$(busy_file "$1")" ]] && return 1
+  local names
+  names="$(herdr pane process-info --pane "$1" 2>/dev/null \
+    | jq -r '.result.process_info.foreground_processes[].name' 2>/dev/null)" || return 1
+  [[ -n "$names" ]] || return 1
+  while IFS= read -r n; do [[ "$SHELLS" == *" $n "* ]] || return 1; done <<<"$names"
+}
+
+wait_idle() {
+  for _ in $(seq 1 50); do pane_idle "$1" && return 0; sleep 0.1; done
+  return 1
+}
+
+TAB="$(runs_tab)"
+
+if [[ "$MODE" == list ]]; then
+  [[ -n "$TAB" ]] || { echo "no runs tab in $WS"; exit 0; }
+  herdr pane list --workspace "$WS" | jq -r --arg t "$TAB" \
+    '.result.panes[] | select(.tab_id == $t) | "\(.pane_id)\t\(.label // "-")"'
+  exit 0
+fi
+
+if [[ "$MODE" == clean ]]; then
+  [[ -n "$TAB" ]] || exit 0
+  mapfile -t panes < <(tab_panes "$TAB")
+  left=${#panes[@]}
+  # a run aborted with Ctrl-C never reaches its own `rm`, leaving a stale busy
+  # marker; drop markers on panes that are back at a bare shell prompt
+  for p in "${panes[@]}"; do
+    f="$(busy_file "$p")"
+    [[ -e "$f" ]] && { rm -f "$f"; pane_idle "$p" || touch "$f"; }
+  done
+  for p in "${panes[@]}"; do
+    # always keep one pane so the tab itself survives for the next run
+    [[ $left -gt 1 ]] || break
+    if pane_idle "$p"; then
+      herdr pane close "$p" >/dev/null && { echo "closed $p"; left=$((left - 1)); }
+    fi
+  done
+  exit 0
+fi
+
+[[ $# -gt 0 ]] || die "no command given (hrun -- <command>)" 2
+CMD="$*"
+[[ -n "$LABEL" ]] || LABEL="$(printf '%s' "$CMD" | cut -c1-40)"
+
+# --- pick a pane: idle one in the runs tab, else split, else create the tab ---
+PANE=""
+if [[ -z "$TAB" ]]; then
+  out="$(herdr tab create --workspace "$WS" --label "$RUNS_LABEL" --cwd "$CWD" --no-focus)" \
+    || die "could not create the runs tab"
+  TAB="$(jq -r '.result.tab.tab_id' <<<"$out")"
+  PANE="$(jq -r '.result.root_pane.pane_id' <<<"$out")"
+else
+  mapfile -t panes < <(tab_panes "$TAB")
+  for p in "${panes[@]}"; do pane_idle "$p" && { PANE="$p"; break; }; done
+  if [[ -z "$PANE" ]]; then
+    [[ ${#panes[@]} -lt $MAX_PANES ]] \
+      || die "runs tab already has $MAX_PANES busy panes — wait, or hrun --clean" 4
+    last="${panes[-1]}"
+    width="$(herdr pane layout --pane "$last" | jq -r --arg p "$last" \
+      '.result.layout.panes[] | select(.pane_id == $p) | .rect.width')"
+    dir=down; [[ "${width:-0}" -ge 120 ]] && dir=right
+    out="$(herdr pane split --pane "$last" --direction "$dir" --cwd "$CWD" --no-focus)" \
+      || die "could not split a pane in the runs tab"
+    PANE="$(jq -r '.result.pane.pane_id' <<<"$out")"
+  fi
+fi
+
+mkdir -p "$BUSY_DIR"; rm -f "$(busy_file "$PANE")"
+wait_idle "$PANE" || die "pane $PANE never reached an idle shell prompt"
+herdr pane rename "$PANE" "run: $LABEL" >/dev/null 2>&1 || true
+
+# The end marker is assembled by printf from two pieces, so the typed command
+# line itself never contains the full marker and cannot satisfy wait-output.
+ID="$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+q() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+case "$NOTIFY" in
+  always) NOTE='true' ;;
+  never) NOTE='false' ;;
+  *) NOTE='[ "$__e" -ne 0 ] || [ $((SECONDS - __s)) -ge 60 ]' ;;
+esac
+LINE="printf '[%s%s]\\n' HRUN_BEGIN_ $ID; __s=\$SECONDS; cd $(q "$CWD") && ( $CMD ); __e=\$?; printf '\\n[%s%s] exit=%s (%ss)\\n' HRUN_END_ $ID \"\$__e\" \$((SECONDS - __s)); if $NOTE; then herdr notification show $(q "run done: $LABEL") --body \"exit \$__e\" --sound \$([ \"\$__e\" -eq 0 ] && echo done || echo request) >/dev/null 2>&1; fi"
+
+BUSY="$(busy_file "$PANE")"
+LINE="$LINE; rm -f $(q "$BUSY")"
+touch "$BUSY"
+herdr pane run "$PANE" "$LINE" >/dev/null || { rm -f "$BUSY"; die "could not start the command in $PANE"; }
+echo "hrun: running in pane $PANE (tab $RUNS_LABEL) — $LABEL"
+
+$WAIT || exit 0
+
+wait_args=(--regex "\\[HRUN_END_${ID}\\] exit=[0-9]+" --source recent-unwrapped --lines 20000)
+[[ -n "$TIMEOUT" ]] && wait_args+=(--timeout "$TIMEOUT")
+if ! herdr pane wait-output "$PANE" "${wait_args[@]}" >/dev/null 2>&1; then
+  echo "hrun: timed out — still running in $PANE (read it with: herdr pane read $PANE --source recent-unwrapped)" >&2
+  exit 124
+fi
+
+output="$(herdr pane read "$PANE" --source recent-unwrapped --lines "$((LINES + 200))")"
+# print only this run: lines between its begin and end markers
+printf '%s\n' "$output" | awk -v b="[HRUN_BEGIN_${ID}]" -v e="[HRUN_END_${ID}]" \
+  'index($0, e) { print; exit } on { print } index($0, b) == 1 { on = 1 }' | tail -n "$LINES"
+code="$(printf '%s\n' "$output" | grep -oE "\[HRUN_END_${ID}\] exit=[0-9]+" | tail -1 | grep -oE '[0-9]+$')"
+exit "${code:-1}"

@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+# graphify-refresh — rebuild a repo's graphify code graph out-of-tree, safely.
+#
+# Called from git hooks (post-commit / post-checkout / post-merge) and by hand.
+# Only repos listed in MAP get a graph; anything else is a silent no-op, so the
+# shared hooks dir can call this from every repo that points at it.
+#
+# Usage:
+#   graphify-refresh [--hook NAME] [--fg] [REPO_DIR]
+#   graphify-refresh --status          show graphs, last log lines, running rebuilds
+#
+# Safety rails (graphify once hit 35 GB RSS on nested worktrees here):
+#   - code-only extraction: local tree-sitter, never an LLM or network call
+#   - output under ~/.graphify/journey/<name>, never inside the repo
+#   - ulimit -v 8 GB, timeout 600s, nice 10
+#   - flock per repo: if a rebuild is already running, it reruns once more at the end (max 3 passes)
+#   - skipped in linked worktrees, mid-rebase/merge/cherry-pick, or with
+#     GRAPHIFY_SKIP_HOOK=1
+#   - refuses to run if an unexcluded nested wt-* worktree is visible to git
+#
+# Hooks run it detached (--fg not passed), so git returns immediately.
+# Log: ~/.cache/graphify-refresh.log
+
+GRAPH_ROOT="${GRAPHIFY_JOURNEY_ROOT:-$HOME/.graphify/journey}"
+LOG="${HOME}/.cache/graphify-refresh.log"
+MEM_KB="${GRAPHIFY_REFRESH_MEM_KB:-8000000}"
+TIMEOUT_S="${GRAPHIFY_REFRESH_TIMEOUT:-600}"
+
+# repo toplevel -> graph name
+declare -A MAP=(
+  ["$HOME/root-for-local/backend"]=backend
+  ["$HOME/root-for-local/frontend"]=frontend
+)
+
+log() { printf '%s [%s] %s\n' "$(date '+%F %T')" "${NAME:-?}" "$*" >>"$LOG"; }
+
+if [[ "${1:-}" == "--status" ]]; then
+  for n in "${MAP[@]}"; do
+    g="$GRAPH_ROOT/$n/graphify-out/graph.json"
+    if [[ -f "$g" ]]; then
+      printf '%-9s %s  %s\n' "$n" "$(date -r "$g" '+%F %T')" "$(du -h "$g" | cut -f1)"
+    else
+      printf '%-9s (no graph)\n' "$n"
+    fi
+  done
+  echo "-- running:"; pgrep -af 'graphify extract' || echo "(none)"
+  echo "-- log tail:"; tail -n 8 "$LOG" 2>/dev/null || echo "(no log)"
+  exit 0
+fi
+
+HOOK=manual FG=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --hook) HOOK="$2"; shift 2 ;;
+    --fg) FG=1; shift ;;
+    *) break ;;
+  esac
+done
+DIR="${1:-$PWD}"
+
+[[ "${GRAPHIFY_SKIP_HOOK:-0}" == "1" ]] && exit 0
+command -v graphify >/dev/null 2>&1 || exit 0
+
+TOP=$(git -C "$DIR" rev-parse --show-toplevel 2>/dev/null) || exit 0
+NAME="${MAP[$TOP]:-}"
+[[ -z "$NAME" ]] && exit 0
+
+# Linked worktree: git-dir differs from the common dir. The graph tracks the
+# primary checkout only; 60+ backend worktrees would otherwise each trigger one.
+GITDIR=$(cd "$(git -C "$TOP" rev-parse --git-dir)" && pwd)
+COMMON=$(cd "$(git -C "$TOP" rev-parse --git-common-dir)" && pwd)
+[[ "$GITDIR" != "$COMMON" ]] && exit 0
+
+if [[ "$HOOK" != manual ]]; then
+  [[ -d "$GITDIR/rebase-merge" || -d "$GITDIR/rebase-apply" ]] && exit 0
+  [[ -f "$GITDIR/MERGE_HEAD" || -f "$GITDIR/CHERRY_PICK_HEAD" ]] && exit 0
+fi
+
+mkdir -p "$(dirname "$LOG")" "$GRAPH_ROOT/$NAME"
+
+# A nested worktree that git doesn't ignore is what blew memory up last time.
+UNEXCLUDED=$(git -C "$TOP" ls-files --others --exclude-standard --directory 2>/dev/null | grep -E '^wt-[^/]*/$' | head -3)
+if [[ -n "$UNEXCLUDED" ]]; then
+  log "SKIP ($HOOK): unexcluded nested worktree(s): $(echo $UNEXCLUDED) — add /wt-*/ to $(git -C "$TOP" rev-parse --git-path info/exclude)"
+  exit 0
+fi
+
+run() {
+  exec 9>"$GRAPH_ROOT/$NAME/.refresh.lock"
+  local pending="$GRAPH_ROOT/$NAME/.refresh.pending"
+  if ! flock -n 9; then
+    # The running rebuild may have read the tree before this change landed;
+    # flag it so that rebuild does one more pass instead of going stale.
+    touch "$pending"
+    log "queued ($HOOK): rebuild already running, will rerun once"
+    return 0
+  fi
+  local pass=0 out rc
+  while :; do
+    rm -f "$pending"
+    pass=$((pass + 1))
+    log "start ($HOOK pass $pass) $(git -C "$TOP" rev-parse --short HEAD 2>/dev/null)"
+    SECONDS=0
+    out=$(cd "$TOP" && ulimit -v "$MEM_KB" && PYTHONHASHSEED=0 timeout "$TIMEOUT_S" nice -n 10 \
+          graphify extract . --code-only --out "$GRAPH_ROOT/$NAME" 2>&1)
+    rc=$?
+    log "done ($HOOK pass $pass) rc=$rc ${SECONDS}s: $(printf '%s\n' "$out" | grep -E 'wrote .*graph.json|incremental summary|rror' | sed 's/^\[graphify extract\] //' | tr '\n' ' ')"
+    # Cap at 3 passes so a burst of commits can't keep it running indefinitely.
+    [[ -f "$pending" && $pass -lt 3 ]] || break
+  done
+  rm -f "$pending"
+}
+
+if [[ "$FG" == 1 ]]; then
+  run
+else
+  # Detach fully so the git command returns at once and nothing is tied to the
+  # calling terminal.
+  export -f run log
+  export TOP NAME HOOK GRAPH_ROOT LOG MEM_KB TIMEOUT_S
+  setsid bash -c run </dev/null >/dev/null 2>&1 &
+fi
+exit 0

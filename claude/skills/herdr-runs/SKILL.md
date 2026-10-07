@@ -2,7 +2,7 @@
 name: herdr-runs
 description: >-
   Run long or background shell commands (dev servers, test suites, builds, watchers, delegate relays
-  like pi-delegate/claude-delegate, anything you would otherwise start with run_in_background) in a
+  like omp-delegate/claude-delegate, anything you would otherwise start with run_in_background) in a
   visible herdr pane via `hrun`, so the user can watch them live. Use this BY DEFAULT whenever
   HERDR_ENV=1 and a command will run longer than ~20s or in the background — the user has given
   standing permission for this; it does not need to mention herdr. Skip it for quick commands.
@@ -52,8 +52,8 @@ hrun --clean    # close run panes back at an idle prompt (keeps one, so the tab 
 To make a delegate visible without changing the delegate skills, launch its relay through `hrun`:
 
 ```bash
-hrun --label pi-cheap-impl --notify --wait --timeout 3600000 -- \
-  'node <skill-dir>/scripts/relay.mjs --brief /abs/path/brief.txt --cd /abs/repo --provider lunaroute --model glm-5.3 --timeout 1h'
+hrun --label omp-cheap-impl --notify --wait --timeout 3600000 -- \
+  'node <omp-delegate skill-dir>/scripts/relay.mjs --brief /abs/path/brief.txt --cd /abs/repo --lane cheap-impl'
 ```
 
 Use absolute paths. Everything after that (read result.json, review the diff, re-run the gates,

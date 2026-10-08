@@ -109,8 +109,8 @@ Answer all of these, plus any similar question the window raises, from
 ## Where that leaves the health number
 > So, in terms of health: <metric in plain words>
 > - was **X%** before I started,
-> - is **about Y%** with what's live today (<a out of n>),
-> - and should reach **about Z%** once the rest ships (<b out of n>).
+> - is **Y%** with what's live today (<a out of n>),
+> - and should reach **Z%** once the rest ships (<b out of n>).
 >
 > <one honest caveat>
 
@@ -175,7 +175,8 @@ The order inside each workstream is fixed: the points, then what's next,
 - **First person, past then present:** "I noticed… so I changed… and now…". Every point names the before and the after.
 - **Explain through what the rep or customer experiences**, not through code. "The follow-up never got drafted", not "the floor skipped the contract branch".
 - **No** file names, function names, ticket numbers, PR numbers, flags or internal step names in the spoken text. One concrete real-world example per point is welcome (e.g. "Petaluma PD showing up under Modesto").
-- **Percentages** are rounded and spoken ("about 50%"), with the raw count in brackets. Don't fake precision on small samples.
+- **Real numbers, always** (Haroun, 2026-10-08): state the measured value exactly, e.g. "68.2% (58 of 85)", "$0.0042 a call", "15 s". No "about", no rounding to a spoken figure. Keep the raw count next to every percentage so a small sample is visible on its face. Estimates are still called estimates.
+- **Link the artifacts:** any artifact page, dashboard or write-up made for the work goes in the doc next to the point it supports, by URL.
 - **Keep it short:** each point is 2 to 3 sentences, and each workstream can be read in about 90 seconds.
 - **Be honest about status:** "in review" is not "done", "merged" is not "live", and estimates are called estimates.
 
@@ -196,5 +197,5 @@ The order inside each workstream is fixed: the points, then what's next,
 
 Paste the 20-second version into the chat, ready to say, along with the
 three most notable live numbers (anything surprising first) and the
-Questions for Ryan headlines. Give the gist link. Don't repeat the whole
+Questions for Ryan headlines. Give the gist link and any artifact links. Don't repeat the whole
 script in the chat.

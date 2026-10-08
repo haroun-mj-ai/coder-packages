@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# n8n-up — personal n8n (workflow automation) container for this Coder workspace.
+#
+#   n8n-up            create/start it (idempotent)
+#   n8n-up --status   container state, resource use, URL
+#   n8n-up --upgrade  recreate on N8N_VERSION below (data volume is kept)
+#   n8n-up --stop     stop it (data kept; `n8n-up` starts it again)
+#
+# Why Docker and not npm: n8n 2.x needs Node >= 24 (workspace has 22), and there is
+# no user systemd here, so a container with --restart is what keeps it alive.
+#
+# Network: the workspace container uses host networking, so publishing on the
+# host's 127.0.0.1:8009 makes it http://localhost:8009 here AND in the local
+# browser via the permanent 8000-8009 tunnel. Not 0.0.0.0: the host is shared.
+# Other workspaces on this host share that loopback, so the n8n owner login is
+# the real gate.
+#
+# GLM: an "OpenAI" credential named "LunaRoute GLM" with base URL
+# https://gw.lunaroute.com/v1 (created by `n8n-glm-credential`, key never printed).
+
+NAME=n8n-haroun
+N8N_VERSION="${N8N_VERSION:-2.42.5}"
+IMAGE="docker.n8n.io/n8nio/n8n:${N8N_VERSION}"
+PORT=8009
+VOLUME=n8n-haroun-data
+
+exists() { docker inspect "$NAME" >/dev/null 2>&1; }
+
+case "${1:-}" in
+  --status)
+    if exists; then
+      docker ps -a --filter "name=^${NAME}$" --format '{{.Names}}  {{.Status}}  {{.Image}}'
+      docker stats --no-stream --format '{{.Name}}  cpu {{.CPUPerc}}  mem {{.MemUsage}}' "$NAME" 2>/dev/null || true
+      echo "UI: http://localhost:${PORT}"
+    else
+      echo "not created (run: n8n-up)"
+    fi
+    exit 0 ;;
+  --stop) docker stop "$NAME" >/dev/null && echo stopped; exit 0 ;;
+  --upgrade) exists && docker rm -f "$NAME" >/dev/null ;;
+  "") ;;
+  *) echo "usage: n8n-up [--status|--stop|--upgrade]" >&2; exit 2 ;;
+esac
+
+if exists; then
+  docker start "$NAME" >/dev/null
+else
+  docker run -d --name "$NAME" \
+    --restart unless-stopped \
+    --memory 1536m --cpus 2 \
+    -p "127.0.0.1:${PORT}:5678" \
+    -v "${VOLUME}:/home/node/.n8n" \
+    -e N8N_HOST=localhost -e N8N_PORT=5678 -e N8N_PROTOCOL=http \
+    -e WEBHOOK_URL="http://localhost:${PORT}/" \
+    -e N8N_EDITOR_BASE_URL="http://localhost:${PORT}/" \
+    -e GENERIC_TIMEZONE=UTC -e TZ=UTC \
+    -e N8N_DIAGNOSTICS_ENABLED=false \
+    -e N8N_VERSION_NOTIFICATIONS_ENABLED=false \
+    -e N8N_PERSONALIZATION_ENABLED=false \
+    -e N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true \
+    -e EXECUTIONS_DATA_PRUNE=true -e EXECUTIONS_DATA_MAX_AGE=336 \
+    "$IMAGE" >/dev/null
+fi
+
+for _ in $(seq 1 60); do
+  curl -fsS -o /dev/null "http://localhost:${PORT}/healthz" 2>/dev/null && { echo "n8n ${N8N_VERSION} up: http://localhost:${PORT}"; exit 0; }
+  sleep 2
+done
+echo "n8n did not become healthy in 120s; logs: docker logs --tail 50 ${NAME}" >&2
+exit 1

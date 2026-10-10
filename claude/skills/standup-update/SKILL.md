@@ -35,7 +35,7 @@ Collect only what's needed, for the window only:
   - **Todo or Backlog:** "next".
 
   A Done or Staging ticket is not proof that the change is live.
-- **Health metric:** use the workstream's own number. That can come from an artifact, the previous gist, the parent ticket or, for P4, today's `~/.p4-nightly-check/reports/<date>.md`. Keep the shape **before → live today → once the rest ships**. Never invent a number. A replay estimate must be called an estimate. A live reading that contradicts an earlier claim must be said plainly.
+- **Health metric:** use the workstream's own number. That can come from an artifact, the previous gist, the parent ticket, or today's live prod probe (section 1b). Keep the shape **before → live today → once the rest ships**. Never invent a number. A replay estimate must be called an estimate. A live reading that contradicts an earlier claim must be said plainly.
 - **Surprises:** anything that overturned an earlier claim, including one made in the previous version of this gist.
 
 ## 1b. Live ops numbers from prod (always)

@@ -1,0 +1,5 @@
+symbolPreset: nerd
+composer:
+  shape: claude
+colorBlindMode: true
+setupVersion: 2

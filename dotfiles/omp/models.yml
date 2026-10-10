@@ -1,0 +1,41 @@
+# LunaRoute (OpenAI-compatible) for omp. Mirrors ~/.pi/agent/models.json.
+# apiKey is a command: omp runs `lunaroute key` per request, so the key never
+# lands in this file and rotating it needs no config change.
+providers:
+  lunaroute:
+    baseUrl: https://gw.lunaroute.com/v1
+    api: openai-completions
+    apiKey: "!lunaroute key"
+    models:
+      - id: glm-5.3
+        name: glm-5.3
+        reasoning: true
+        input: [text, image]
+        contextWindow: 524288
+        maxTokens: 131072
+        thinking:
+          mode: effort
+          efforts: [low, medium, high, max]
+          effortMap: { medium: high, xhigh: max }
+        compat: { maxTokensField: max_tokens, supportsReasoningEffort: true, thinkingFormat: zai }
+      - id: glm-5.3-flash
+        name: glm-5.3-flash
+        reasoning: true
+        input: [text, image]
+        contextWindow: 524288
+        maxTokens: 163840
+        thinking:
+          mode: effort
+          efforts: [low, medium, high]
+          effortMap: { medium: high }
+        compat: { maxTokensField: max_tokens, supportsReasoningEffort: true, thinkingFormat: zai }
+      - id: deepseek-4.1-flash
+        name: deepseek-4.1-flash
+        reasoning: true
+        input: [text, image]
+        contextWindow: 1048576
+        maxTokens: 262144
+        thinking:
+          mode: effort
+          efforts: [low, medium, high]
+        compat: { maxTokensField: max_tokens, supportsReasoningEffort: true, thinkingFormat: openai }

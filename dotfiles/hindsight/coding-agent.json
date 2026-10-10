@@ -1,0 +1,47 @@
+{
+  "serverMode": "daemon",
+  "mapPathToBank": {
+    "/home/coder/root-for-local": "journeyai",
+    "/home/coder/journey": "journeyai",
+    "/home/coder/claude-docs": "journeyai"
+  },
+  "banks": {
+    "coding-agent::root-for-local": {
+      "bank": "journeyai"
+    },
+    "coding-agent::journeyai-backend": {
+      "bank": "journeyai"
+    },
+    "coding-agent::assistants": {
+      "bank": "journeyai"
+    },
+    "coding-agent::triage-service": {
+      "bank": "journeyai"
+    },
+    "coding-agent::observability": {
+      "bank": "journeyai"
+    },
+    "coding-agent::infrastructure": {
+      "bank": "journeyai"
+    },
+    "coding-agent::claude-docs": {
+      "bank": "journeyai"
+    },
+    "coding-agent::frontend": {
+      "bank": "journeyai"
+    },
+    "coding-agent::backend": {
+      "bank": "journeyai"
+    },
+    "coding-agent::coder": {
+      "disabled": true
+    },
+    "coding-agent::coder-packages": {
+      "disabled": true
+    },
+    "coding-agent::test-permissions": {
+      "disabled": true
+    }
+  },
+  "autoInject": "pages"
+}

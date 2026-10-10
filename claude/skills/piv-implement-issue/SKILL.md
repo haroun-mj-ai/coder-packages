@@ -67,13 +67,18 @@ Before making changes:
 
 ### 3. Implement the Fix
 
-**Model: opus, medium effort by default** (`Agent(subagent_type: "implementer-opus")` if delegating rather than
+**Model: sonnet, medium effort by default** (`Agent(subagent_type: "implementer")` if delegating rather than
 implementing inline) — the RCA already did the expensive reasoning; this step turns a settled fix strategy into
-code. **Scale up using the RCA's own Assessment table**, which already scored this: Complexity **High** → escalate
-to a raw `Agent(model: "opus", effort: "high")` instead (a fix strategy touching several integration points
-deserves the higher tier); Confidence **Low** → don't implement from this RCA at all without confirming the root
-cause first (this is what step 2's drift-check and `piv-investigate-issue`'s Codex-corroboration edge case are
-for) — a low-confidence RCA implemented at any model tier is still building on a guess.
+code, which is mechanical enough that sonnet does it as well as opus for less. **Scale up using the RCA's own
+Assessment table**, which already scored this: Complexity **High** → escalate to a raw `Agent(model: "opus",
+effort: "high")` instead (a fix strategy touching several integration points deserves the higher tier); Confidence
+**Low** → don't implement from this RCA at all without confirming the root cause first (this is what step 2's
+drift-check and `piv-investigate-issue`'s Codex-corroboration edge case are for) — a low-confidence RCA
+implemented at any model tier is still building on a guess.
+
+If `implementer` returns a `## Escalation` block (`spec-ambiguous`/`test-design`/`assumption-false`) mid-fix even
+on a Complexity-scored-Low RCA, don't let it guess: dispatch `implementer-opus` scoped to just that block to
+resolve the one point, fold the decision back in, and re-dispatch `implementer` to finish.
 
 Following the "Proposed Fix" section of the RCA:
 

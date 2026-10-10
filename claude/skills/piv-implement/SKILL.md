@@ -49,18 +49,44 @@ content there is a prior run's unfinished work, not junk — stop and ask rather
 
 ## Execution Instructions
 
-**Model for task execution: opus, medium effort by default**, via the personal `implementer-opus` agent type (the
-execution half of a two-phase workflow, once the design is settled). Opus 5.5 at medium outscores Sonnet 5 at any
-effort, and review-fix rework was the costliest step in the 2026-09 spend audit, so execution runs on Opus too. Default: dispatch each independent
-task (or a small batch of dependent ones) via `Agent(subagent_type: "implementer-opus")` rather than running every
-task inline in the current session — same "cheap does the reading/writing, you do the judging" split as the rest
-of this pipeline.
+**Model for task execution: GLM 5.3 via omp, by default (owner's call, 2026-10-05; pi → omp 2026-10-07)** — the `cheap-impl` lane
+(omp / oh-my-pi on LunaRoute, `glm-5.3`, from `~/.config/delegate-skills/config.json`). Claude Code subagents can only run
+Claude models, so "the implementer is GLM" means routing each task through the `omp-delegate` relay rather than
+the `implementer` agent type. Write the brief per `omp-delegate`'s brief shape (task / the task's own `VALIDATE`
+command as the verification loop / no commit, no push / a structured report), then dispatch:
 
-**Route self-contained/mechanical tasks to `codex-delegate` instead** (the `codex-feature` lane), not `implementer-opus`
+```bash
+node "<omp-delegate skill-dir>/scripts/relay.mjs" --brief brief.txt --cd <repo path> --lane cheap-impl
+```
+
+Run it in the background and review the result exactly as you would `implementer`'s: read the whole diff, check
+`touchedFiles` is within the task's file list, re-run the task's `VALIDATE` yourself (never trust the reported
+output), and check line endings were preserved. GLM gets no `## Escalation` contract, so its report saying the plan
+is wrong or ambiguous is handled as the escalation below.
+
+**Fallback to `Agent(subagent_type: "implementer")` (sonnet, medium)** when: the relay fails or omp/LunaRoute is
+unavailable; the GLM diff fails review twice for the same task; or the task rides on security, concurrency, a data
+migration, or unstated domain knowledge the plan didn't spell out. Record every fallback in the implementation
+report. Retire the GLM default if more than about a third of tasks need the fallback.
+
+The rest of this section describes the `implementer` fallback path and the Opus escalation, which still apply.
+
+`implementer`'s contract has it stop on three specific judgment calls rather than guess: a `## Escalation` block
+tagged `spec-ambiguous` (the plan is unclear or wrong in a way that changes the outcome), `test-design` (it can't
+write a test that would actually fail if the behavior were removed), or `assumption-false` (running the code
+shows the plan's premise about the existing codebase is wrong). On any of those, dispatch the personal
+`implementer-opus` agent type scoped to just that block — the trigger, the question, the minimal context given —
+to resolve only that point, then fold the decision back into the task and re-dispatch `implementer` to finish.
+That's where the stronger, costlier tier (Opus 5.5 at medium outscores Sonnet 5 at any effort per the 2026-09
+benchmark review) actually earns its keep — the judgment call, not the surrounding transcription. A task known up
+front to be genuinely gnarly (ambiguous by nature, unfamiliar area, real architectural complexity) may still go
+straight to `implementer-opus` for the whole task instead of waiting for it to get stuck.
+
+**Route self-contained/mechanical tasks to `codex-delegate` instead** (the `codex-feature` lane), not `implementer`
 — a real, meaningful share of implementation work, not just Codex-side supplementary checks. A task qualifies
 when it's bounded and clearly gated by the plan's own `VALIDATE` command, and doesn't ride on security,
 concurrency, migration, or unstated domain knowledge the plan didn't spell out (the same bar `codex-delegate`'s
-own docs use for "good delegation target" — if you're unsure whether a task qualifies, keep it on `implementer-opus`).
+own docs use for "good delegation target" — if you're unsure whether a task qualifies, keep it on `implementer`).
 Write the brief per `writing-the-brief.md`'s four-block shape (task / verification_loop naming this task's real
 `VALIDATE` command / action_safety — no commit / structured_output_contract), dispatch:
 
@@ -73,15 +99,15 @@ spec-vs-plan check because Codex wrote it. `touchedFiles` should match the task'
 This work goes through the same downstream gates as everything else (`piv-review-changes`, `debate-review` on the
 PR) — delegating the writing doesn't change how it gets checked.
 
-**Escalate rather than let the cheap model improvise**, the uncommon case only: if a task's own report says the
-spec is wrong, a referenced hook/field doesn't exist, or the change doesn't fit as written — stop, don't let
-`implementer-opus` guess around it. Either fix it yourself with the plan in hand, or for something genuinely stuck
-(not just "the spec was slightly off"), get an independent diagnosis via `codex-delegate --read-only` (the
+**If even the `implementer-opus` escalation resolution (above) says the plan itself is wrong**, not just this one
+task — a referenced hook/field doesn't exist, or the change doesn't fit as written at the plan level — stop, don't
+let anything guess around it. Either fix the plan yourself with it in hand, or for something genuinely stuck (not
+just "the spec was slightly off"), get an independent diagnosis via `codex-delegate --read-only` (the
 `review-debate` lane): a brief naming what's stuck, what was tried, and what's unclear, same shape as
-`piv-investigate-issue`'s "can't pin the root cause" recipe — no diff to review, just a second model's read on
-the blocker. Rote/mechanical/boilerplate sub-tasks (e.g.
-scaffolding a test file's structure) may go to a raw `Agent(model: "haiku")` call instead — this is a layer on
-top of the `implementer-opus` default, not a replacement of it; most tasks stay on `implementer-opus`.
+`piv-investigate-issue`'s "can't pin the root cause" recipe — no diff to review, just a second model's read on the
+blocker. Rote/mechanical/boilerplate sub-tasks (e.g. scaffolding a test file's structure) may go to a raw
+`Agent(model: "haiku")` call instead — this is a layer on top of the `implementer` default, not a replacement of
+it; most tasks stay on `implementer`.
 
 ### 1. Read and Understand
 
@@ -261,7 +287,7 @@ retry re-implements work that already landed.
 | **Branch selection heuristics** (`:41-48`) — `On the base branch, clean → git checkout -b feature/<plan-slug>` | **overridden entirely**: reuse the worktree and branch the design act created (`haroun/eng-<id>-<slug>`); if missing, create it the same way rather than falling through to the interactive heuristics. **Never `feature/<plan-slug>`** — it does not match `Bash(git push -u origin haroun/*)` and would be denied at the last step of the act, the exact trap Phase 1 catalogued for `fix/issue-<id>-<slug>`. | `history` event on a re-create |
 | **Dirty reused worktree** (`:37-39`) — `uncommitted content there is a prior run's unfinished work, not junk — stop and ask rather than recreating it` | **`FAILED`**, `detail` = `git -C <worktree> status --porcelain`. Same reasoning as the row above; the skill's own instinct (don't destroy it) is right, and `FAILED` is the shape that preserves it. Note the interaction with the idempotency rule: a worktree that is *clean* but whose branch carries a `Part of ENG-<id>` commit is the **normal** retry case and takes the skip-to-create-pr path, not this one. | `detail` |
 | **Stale worktree** (`:39`) — `rev-list --count HEAD..origin/dev must be 0 after a fetch && rebase` | documented default: run the `fetch && rebase`. A **rebase conflict** → `FAILED`, `detail` = the conflicting file list (terminal git work, not an `ap reply` answer). A clean rebase → proceed, no record needed. | `detail` on conflict |
-| **Escalation ladder** (`:77-85`) — a task's own report says the spec is wrong, a referenced hook/field doesn't exist, or the change doesn't fit | **Walk the skill's own two-pronged fallback in order, then park.** (i) Fix it yourself with the plan in hand. (ii) If that does not resolve it, get the independent read-only diagnosis: `node "<codex-delegate skill-dir>/scripts/relay.mjs" --brief brief.txt --cd <repo> --lane review-debate --read-only`, blocking foreground, brief naming what's stuck / what was tried / what's unclear. (iii) If the diagnosis does not unblock it → **`NEEDS_HUMAN`**. This is the feature fork's analogue of the bug fork's drift-check park, and it is this skill's primary park point. **Never let `implementer` improvise past it** — that instruction is the whole point of the ladder and it survives headlessly unchanged. | `question` = the blocker, what was tried, and Codex's read verbatim; kata `needs-human` + `work.attention_msg` |
+| **Escalation ladder** (`:87-93`) — even the `implementer-opus` resolution says the plan itself is wrong, a referenced hook/field doesn't exist, or the change doesn't fit | **Walk the skill's own two-pronged fallback in order, then park.** (i) Fix it yourself with the plan in hand. (ii) If that does not resolve it, get the independent read-only diagnosis: `node "<codex-delegate skill-dir>/scripts/relay.mjs" --brief brief.txt --cd <repo> --lane review-debate --read-only`, blocking foreground, brief naming what's stuck / what was tried / what's unclear. (iii) If the diagnosis does not unblock it → **`NEEDS_HUMAN`**. This is the feature fork's analogue of the bug fork's drift-check park, and it is this skill's primary park point. **Never let `implementer` improvise past it** — that instruction is the whole point of the ladder and it survives headlessly unchanged. | `question` = the blocker, what was tried, and Codex's read verbatim; kata `needs-human` + `work.attention_msg` |
 | **Validation loop** (`:176-179`) — `Fix the issue / Re-run / Continue only when it passes` | **bounded**: after **two** full failing cycles → `NEEDS_HUMAN` with the failing command and its output. Unbounded headlessly is an act that burns a build slot until the harness kills it. Mirrors Phase 1's identical bound for `piv-implement-issue:171-175`. | `question` on escalation |
 | Codex adversarial test pass (`:125-166`) | unchanged: a bonus check. `status: failed` / `codex_unavailable` / permission-denied → note in `detail` and move on. A genuine failing test means the implementation is incomplete → fix it and keep the test, still inside this act. `touchedFiles` wider than the one test file is scope creep: discard and re-dispatch tighter, exactly as `:159-161` says. | `detail` |
 | **Scope gate** — a changed file outside the plan's own task file list | **`NEEDS_HUMAN`**, the file list quoted in `question`. **Ported from `implement-issue/SKILL.md:1269`**, not invented: the legacy feature path has had this gate headlessly since it existed, and dropping it in the cutover would be a silent regression. It is also the enforcement of `piv-commit`'s own "nothing else — an out-of-plan file becomes an out-of-scope finding in the very next phase's review". | `question` |

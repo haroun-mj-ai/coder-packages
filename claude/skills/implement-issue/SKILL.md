@@ -48,9 +48,11 @@ the reading and the building. Two rules are not negotiable:
 - **Cheap means a pinned agent definition, not an inline model override.**
   The Agent tool accepts `model` but not `effort`, so `Agent(model:
   "sonnet")` inherits this session's effort and costs far more than it looks
-  like. Ordinary work dispatches by `subagent_type`: `explorer` and
-  `plan-critic` (sonnet, medium), `scout` (haiku, low), `implementer-opus`
-  (opus, medium). This skill is the **one deliberate exception** to "never
+  like. Ordinary work dispatches by `subagent_type`: `explorer`,
+  `plan-critic`, and `implementer` (sonnet, medium), `scout` (haiku, low).
+  `implementer-opus` (opus, medium) is not the default — it resolves a
+  flagged `## Escalation` (step 3) or, opt-in, takes a whole unit known up
+  front to be genuinely gnarly. This skill is the **one deliberate exception** to "never
   spawn an opus subagent from a skill" — the plan drafter (step 5) is a raw
   `Agent(model: "opus", ...)` call, and the plan auditor (step 7) is
   `plan-critic` overridden to `model: "opus"`, on purpose, because each needs
@@ -621,7 +623,7 @@ repo** (two agents editing the same checkout fight); **concurrent across
 repos** (backend/frontend are separate git repos, send first units in one
 message with multiple `Agent` calls).
 
-Default every unit to `subagent_type: "implementer-opus"` (pinned opus,
+Default every unit to `subagent_type: "implementer"` (pinned sonnet,
 medium effort) — self-contained prompts carrying: the unit's spec verbatim
 including its test requirement and "done when," the absolute repo path,
 the exact file list (no scope widening), the commands to run (`npm run
@@ -631,20 +633,24 @@ rediscovering (below), that it must **not** commit/push/open a PR, and house
 conventions (singular PascalCase Mongo collections, hidden-scrollbar
 `DialogContent` classes, no `ENG-###` in comments). Fold unit test *and* e2e
 test writing (grounded in Phase A step 4's acceptance scenarios) into the
-same prompt rather than as separate steps.
+same prompt rather than as separate steps. `implementer`'s own contract has
+it stop and return a typed `## Escalation` block (`spec-ambiguous` /
+`test-design` / `assumption-false`) rather than guess past those three
+specific judgment calls — see step 4 for what to do with one.
 
-**Escalate by task, not by habit, for the uncommon case only**: a report
-flagging genuinely correctness-critical or architectural complexity escalates
-to a raw `Agent(model: "opus")` call instead of a stop; rote/mechanical/
-boilerplate work may go to a raw `Agent(model: "haiku")` call. This is a
-layer on top of the pinned-`implementer-opus` default above, not a replacement of
-it — most units stay on `implementer-opus`.
+**Escalate by task, not by habit, for the uncommon case only**: a unit known
+up front to be genuinely gnarly (ambiguous by nature, unfamiliar area,
+architectural complexity) may go straight to `subagent_type:
+"implementer-opus"` instead of `implementer`; rote/mechanical/boilerplate
+work may go to a raw `Agent(model: "haiku")` call. This is a layer on top of
+the `implementer` default above, not a replacement of it — most units stay
+on `implementer`.
 
-**Route self-contained/mechanical units to `codex-delegate` instead of `implementer-opus`** (the `codex-feature`
+**Route self-contained/mechanical units to `codex-delegate` instead of `implementer`** (the `codex-feature`
 lane) — real implementation work, not just a supplementary check. A unit qualifies when it's bounded and
 clearly gated by its own "done when," and doesn't ride on security, concurrency, migration, or unstated domain
 knowledge the plan didn't spell out (the same bar `codex-delegate`'s own docs use — if unsure, keep it on
-`implementer-opus`). Write the brief per `writing-the-brief.md`'s four-block shape and dispatch:
+`implementer`). Write the brief per `writing-the-brief.md`'s four-block shape and dispatch:
 ```bash
 node "<codex-delegate skill-dir>/scripts/relay.mjs" --brief brief.txt --cd <abs repo path> --lane codex-feature
 ```
@@ -657,20 +663,31 @@ Trust a passing report — the agent ran the tests and quoted the output; do
 not re-read every changed file to double-check what a passing test already
 covers.
 
-But when a report says the spec is wrong, a hook doesn't exist, or the
-change doesn't fit: **stop that repo's chain and bring it here.** Before
-stopping, optionally enrich the diagnosis with an independent read —
-`codex-delegate --read-only` (`review-debate` lane), a brief naming what's
-stuck, what was tried, and what's unclear, same shape as `piv-investigate-issue`'s
-"can't pin the root cause" recipe. This works identically headless (it's a
-shell command and a file read, no live human needed) — fold its finding into
-the question/report either way. Decide
-yourself whether the plan changes, amend the plan file if it does, record
-the change in Design review. This is exactly the kind of stop step 1's kata
-rule covers — signal `work.attention` before doing anything else, so a
-coordinator or the human sees it without reading the transcript. An
-implementer improvising around a bad spec is the exact failure this
-two-phase split exists to prevent.
+**A `## Escalation` block (`spec-ambiguous`/`test-design`/`assumption-false`)
+gets the narrow opus resolver, not a guess and not your own read yet.**
+Dispatch `implementer-opus` with just that block — the trigger, the exact
+question, the minimal context `implementer` gave — and instruct it to
+resolve only that point and report the decision, not to touch the rest of
+the unit. Fold the resolution into the unit's spec and re-dispatch
+`implementer` (sonnet) to finish. This is the "better model for the judgment
+call, not the transcription" split: most of a unit stays cheap, the three
+places that actually need it get the stronger tier, scoped tight so it
+doesn't turn into a second full-price implementation.
+
+But when even that resolution says the spec is wrong, a hook doesn't exist,
+or the change doesn't fit as a plan-level matter (not just this one unit):
+**stop that repo's chain and bring it here.** Before stopping, optionally
+enrich the diagnosis with an independent read — `codex-delegate --read-only`
+(`review-debate` lane), a brief naming what's stuck, what was tried, and
+what's unclear, same shape as `piv-investigate-issue`'s "can't pin the root
+cause" recipe. This works identically headless (it's a shell command and a
+file read, no live human needed) — fold its finding into the question/report
+either way. Decide yourself whether the plan changes, amend the plan file if
+it does, record the change in Design review. This is exactly the kind of
+stop step 1's kata rule covers — signal `work.attention` before doing
+anything else, so a coordinator or the human sees it without reading the
+transcript. An implementer improvising around a bad spec is the exact
+failure this two-phase split exists to prevent.
 
 ### 4b. Adversarial test pass — Codex tries to break it
 

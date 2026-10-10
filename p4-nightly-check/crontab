@@ -1,0 +1,4 @@
+# Interpreted in America/New_York (ensure.sh starts supercronic with TZ set).
+# 08:40 ET daily: after the 03:04 B1 pass, the 05:47 catch-up, the
+# 09:19/09:29 UTC sweeps and the 08:05 morning monitor.
+40 8 * * * $HOME/coder-packages/p4-nightly-check/run.sh
